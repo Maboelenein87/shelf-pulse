@@ -186,15 +186,38 @@ async function visitUpdate(id, patch){
   await updateDoc(doc(db, 'visits', id), patch);
 }
 
+/* ============================= ROLE / ACCESS CONTROL ============================= */
+const SUPERVISOR_PASSWORDS = {
+  'shahd-sup1': 'احمد عصام فتحى امين محمد',
+  'shahd-sup2': 'السيد سعد محمود النشيلي',
+  'shahd-sup3': 'حسام حسن محمد حسن',
+  'shahd-sup4': 'سحر دسوقى ابراهيم محمد',
+};
+const ROLES = {
+  merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
+  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','team','scorecard'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard'] },
+  commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard'] },
+};
+function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
+function identityLabel(){
+  if(State.role==='merchandiser' || State.role==='supervisor') return State.name || 'Unnamed';
+  return roleConf().label;
+}
+function bi(en, ar){ return `${en} <span dir="rtl" lang="ar" style="opacity:.68">/ ${ar}</span>`; }
+function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) || 'team'; }
+
 /* ============================= APP STATE ============================= */
 const State = {
-  role: 'merchandiser', name: '', tab: 'home',
+  role: null, name: '', tab: 'home', navContext: 'field',
   skus: [], accounts: [], visits: [], loaded: false,
   draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photo:null, geo:null, capturedAt:null },
   toast: null,
   accountSearch: '',
   dashSub: 'overview',
   expandedCategory: null,
+  loginRole: null, loginPassword: '', loginError: '',
 };
 function todayStr(){ return new Date().toISOString().slice(0,10); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -266,7 +289,7 @@ function scoreFor(a){
 async function loadAll(){
   if(!isConfigured){ State.loaded = true; return; }
   const me = localStorage.getItem('shelfpulse_me');
-  if(me){ try{ const p = JSON.parse(me); State.role = p.role || 'merchandiser'; State.name = p.name || ''; }catch(e){} }
+  if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.navContext = roleConf().contexts[0]; } }catch(e){} }
 
   const skusDoc = await refGet('skus');
   if(!skusDoc || skusDoc.version !== REF_DATA_VERSION){
@@ -289,6 +312,32 @@ async function loadAll(){
   State.loaded = true;
 }
 function saveMe(){ localStorage.setItem('shelfpulse_me', JSON.stringify({role:State.role, name:State.name})); }
+function logout(){ State.role=null; State.name=''; State.tab='home'; localStorage.removeItem('shelfpulse_me'); render(); }
+function selectLoginRole(key){ State.loginRole = key; State.loginPassword=''; State.loginError=''; render(); }
+function backToLoginMenu(){ State.loginRole = null; State.loginError=''; render(); }
+function attemptMerchandiserLogin(name){
+  if(!name) return;
+  State.role='merchandiser'; State.name=name; State.tab='home'; State.navContext='field';
+  saveMe(); render();
+}
+function attemptPasswordLogin(){
+  const key = State.loginRole;
+  const pw = State.loginPassword.trim();
+  if(key==='supervisor'){
+    const matchedName = SUPERVISOR_PASSWORDS[pw];
+    if(matchedName){
+      State.role='supervisor'; State.name=matchedName; State.tab='home'; State.navContext='field';
+      State.loginRole=null; State.loginPassword=''; saveMe(); render();
+    } else { State.loginError='Incorrect password for Supervisor.'; render(); }
+    return;
+  }
+  const conf = ROLES[key];
+  if(conf && conf.password === pw){
+    State.role=key; State.name=''; State.tab = conf.contexts[0]==='field' ? 'home' : firstManageTab(conf);
+    State.navContext = conf.contexts[0];
+    State.loginRole=null; State.loginPassword=''; saveMe(); render();
+  } else { State.loginError='Incorrect password.'; render(); }
+}
 async function saveSkus(){ await refSet('skus', State.skus, REF_DATA_VERSION); SKU_MAP={}; State.skus.forEach(s=>SKU_MAP[s.id]=s); }
 
 async function submitVisit(){
@@ -307,7 +356,7 @@ async function submitVisit(){
     id: uid(),
     accountId: d.accountId, accountName: d.accountName, branch: d.branch,
     channel: d.channel || '', region: d.region || '',
-    date: d.date, auditor: State.name || 'Unnamed',
+    date: d.date, auditor: identityLabel(),
     status: 'pending', items: d.items,
     photo: d.photo || null, geo: d.geo || null, capturedAt: d.capturedAt || null,
     submittedAt: Date.now(),
@@ -320,7 +369,7 @@ async function submitVisit(){
   render();
 }
 async function setVisitStatus(id, status, note){
-  const patch = { status, reviewedAt: Date.now(), reviewedBy: State.name || 'Supervisor' };
+  const patch = { status, reviewedAt: Date.now(), reviewedBy: identityLabel() };
   if(note) patch.reviewNote = note;
   await visitUpdate(id, patch);
 }
@@ -395,12 +444,57 @@ function targetForMerch(name){
 function achievedForMerch(name){
   return State.visits.filter(v=>v.auditor===name).length;
 }
-function nameOptions(){
-  if(State.role==='merchandiser'){
-    return [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))].sort();
+/* ============================= LOGIN SCREEN ============================= */
+function screenLogin(){
+  if(State.loginRole){
+    const label = ROLES[State.loginRole].label;
+    return `<div class="screen" style="padding-top:60px">
+      <div class="card" style="text-align:center">
+        <div class="brand-mark" style="background:var(--red);color:#fff;margin:0 auto 14px;width:48px;height:48px;font-size:16px;">C3A</div>
+        <h1 style="margin-bottom:4px">${label}</h1>
+        <p class="lede">Enter the access password.</p>
+        <input type="password" placeholder="Password" value="${State.loginPassword}" oninput="setLoginPassword(this.value)" style="text-align:center;font-size:16px;margin-bottom:10px" onkeydown="if(event.key==='Enter')attemptPasswordLogin()"/>
+        ${State.loginError ? `<p style="color:var(--red);font-size:12px;margin-bottom:10px">${State.loginError}</p>` : ''}
+        <button class="btn btn-primary" onclick="attemptPasswordLogin()">Enter</button>
+        <button class="btn btn-ghost" style="margin-top:8px" onclick="backToLoginMenu()">Back</button>
+      </div>
+    </div>`;
   }
-  return [...new Set(State.accounts.map(a=>a.sup).filter(Boolean))].sort();
+  const merchNames = [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))].sort();
+  return `<div class="screen" style="padding-top:40px">
+    <div style="text-align:center;margin-bottom:20px">
+      <div class="brand-mark" style="background:var(--red);color:#fff;margin:0 auto 12px;width:52px;height:52px;font-size:18px;">C3A</div>
+      <h1 style="margin-bottom:2px">Shelf Pulse</h1>
+      <p class="lede">Select your role to continue.</p>
+    </div>
+    <div class="card">
+      <h3>Merchandiser</h3>
+      <label>Your name</label>
+      <select onchange="attemptMerchandiserLogin(this.value)">
+        <option value="">Select your name…</option>
+        ${merchNames.map(n=>`<option value="${n}">${n}</option>`).join('')}
+      </select>
+      <p class="hint" style="margin-top:8px">No password needed.</p>
+    </div>
+    <div class="card" style="cursor:pointer" onclick="selectLoginRole('supervisor')">
+      <div class="visit-row" style="border:none;padding:0"><div class="visit-main">Supervisor</div><div>🔒</div></div>
+      <p class="hint">Field + approvals, dashboard, team, scorecard</p>
+    </div>
+    <div class="card" style="cursor:pointer" onclick="selectLoginRole('merch_head')">
+      <div class="visit-row" style="border:none;padding:0"><div class="visit-main">Merchandising Head</div><div>🔒</div></div>
+      <p class="hint">Field + Supervisor access, can edit SKUs</p>
+    </div>
+    <div class="card" style="cursor:pointer" onclick="selectLoginRole('trade_marketing')">
+      <div class="visit-row" style="border:none;padding:0"><div class="visit-main">Trade Marketing &amp; MD</div><div>🔒</div></div>
+      <p class="hint">Full access, full edit rights</p>
+    </div>
+    <div class="card" style="cursor:pointer" onclick="selectLoginRole('commercial')">
+      <div class="visit-row" style="border:none;padding:0"><div class="visit-main">Commercial Dashboard</div><div>🔒</div></div>
+      <p class="hint">View-only analytics — no editing</p>
+    </div>
+  </div>`;
 }
+function setLoginPassword(v){ State.loginPassword = v; }
 
 /* ============================= SCREENS ============================= */
 function screenHome(){
@@ -408,18 +502,18 @@ function screenHome(){
   const approved = State.visits.filter(v=>v.status==='approved');
   const aggs = approved.map(v=>visitAggregate(v));
 
-  if(State.role === 'merchandiser'){
-    const mine = State.visits.filter(v=>v.auditor===(State.name||'Unnamed'));
+  if(State.navContext === 'field'){
+    const mine = State.visits.filter(v=>v.auditor===identityLabel());
     const target = targetForMerch(State.name);
     const achieved = mine.length;
     return `<div class="screen">
-      <h1>Hi ${State.name || 'there'} 👋</h1>
+      <h1>Hi ${identityLabel()} 👋</h1>
       <p class="lede">Log today's shelf audit — everything auto-calculates.</p>
       <div class="kpi-grid">
-        <div class="kpi accent"><div class="num">${achieved}${target?'/'+target:''}</div><div class="lbl">Visits done${target?' vs target':''}</div></div>
-        <div class="kpi"><div class="num">${mine.filter(v=>v.status==='pending').length}</div><div class="lbl">Awaiting review</div></div>
+        <div class="kpi accent"><div class="num">${achieved}${target?'/'+target:''}</div><div class="lbl">Visits done / الزيارات المنجزة${target?' vs target':''}</div></div>
+        <div class="kpi"><div class="num">${mine.filter(v=>v.status==='pending').length}</div><div class="lbl">Awaiting review / بانتظار المراجعة</div></div>
       </div>
-      ${!target ? `<p class="hint" style="margin-bottom:12px">No route-plan target matched for "${State.name}" — check your name matches the route plan spelling.</p>` : ''}
+      ${(State.role==='merchandiser'||State.role==='supervisor') && !target ? `<p class="hint" style="margin-bottom:12px">No route-plan target matched for "${State.name}" — check your name matches the route plan spelling.</p>` : ''}
       <button class="btn btn-primary" onclick="go('newvisit')">＋ Start new visit</button>
       <div class="sectitle">My recent visits</div>
       ${mine.slice(0,5).map(visitRowHtml).join('') || emptyState('📋','No visits yet','Tap "Start new visit" to log your first audit.')}
@@ -431,10 +525,10 @@ function screenHome(){
     <p class="lede">Live view across all merchandisers and accounts.</p>
     <div class="card">${gauge(overallScore, 'Overall scorecard', 78)}</div>
     <div class="kpi-grid">
-      <div class="kpi accent"><div class="num">${pendingCount}</div><div class="lbl">Pending approval</div></div>
-      <div class="kpi"><div class="num">${approved.length}</div><div class="lbl">Approved visits</div></div>
-      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.reduce((s,a)=>s+a.avgSfr,0)/aggs.length:0)}%</div><div class="lbl">Avg shelf fill</div></div>
-      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100:0)}%</div><div class="lbl">Visits verified</div></div>
+      <div class="kpi accent"><div class="num">${pendingCount}</div><div class="lbl">Pending approval / بانتظار الموافقة</div></div>
+      <div class="kpi"><div class="num">${approved.length}</div><div class="lbl">Approved visits / الزيارات المعتمدة</div></div>
+      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.reduce((s,a)=>s+a.avgSfr,0)/aggs.length:0)}%</div><div class="lbl">Avg shelf fill / متوسط تعبئة الرف</div></div>
+      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100:0)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
     </div>
     ${pendingCount>0 ? `<button class="btn btn-primary" onclick="go('approvals')">Review ${pendingCount} pending visit${pendingCount>1?'s':''}</button>` : ''}
     <div class="sectitle">Latest activity</div>
@@ -461,10 +555,10 @@ function screenNewVisit(){
   const d = State.draft;
   const hasAccount = !!d.accountName;
   return `<div class="screen">
-    <h1>New visit</h1>
+    <h1>New visit / زيارة جديدة</h1>
     <p class="lede">Search an account, capture the shelf, snap a photo.</p>
     <div class="card">
-      <h3>Account</h3>
+      <h3>Account / الحساب</h3>
       ${hasAccount ? `
         <div style="display:flex;justify-content:space-between;align-items:center">
           <div><div class="sr-main">${d.accountName}</div><div class="sr-sub">${d.branch} · ${d.channel} · ${d.region}</div></div>
@@ -479,24 +573,24 @@ function screenNewVisit(){
           </select>
         `}
       `}
-      <label>Date</label>
+      <label>Date / التاريخ</label>
       <input type="date" value="${d.date}" oninput="d('date',this.value)"/>
     </div>
 
     <div class="card">
-      <h3>Visit photo &amp; location <span class="hint" style="text-transform:none;font-weight:400">(optional — skip if not allowed at this account)</span></h3>
+      <h3>Visit photo &amp; location / صورة الزيارة والموقع <span class="hint" style="text-transform:none;font-weight:400">(optional — skip if not allowed / اختياري)</span></h3>
       ${d.photo ? `
         <img class="photo-preview" src="${d.photo}"/>
         <div class="verify-row">
-          ${d.geo ? statusChip('on','📍 Location captured') : statusChip('off','⚠️ No location')}
+          ${d.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location / لا يوجد موقع')}
           ${d.capturedAt ? statusChip('neutral', new Date(d.capturedAt).toLocaleTimeString()) : ''}
         </div>
-        <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removePhoto()">Retake</button>
+        <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removePhoto()">Retake / إعادة التصوير</button>
       ` : `
         <div class="photo-box">
           <div style="font-size:26px;margin-bottom:6px">📷</div>
           <p class="hint" style="margin-bottom:10px">Proves this is a real, on-the-ground visit — captures time and GPS automatically.</p>
-          <button class="btn btn-primary btn-sm" onclick="capturePhoto()">Take photo</button>
+          <button class="btn btn-primary btn-sm" onclick="capturePhoto()">Take photo / التقاط صورة</button>
         </div>
       `}
     </div>
@@ -504,7 +598,7 @@ function screenNewVisit(){
     <div class="sectitle">SKU checklist — all ${d.items.length} required (${d.items.filter(isItemComplete).length}/${d.items.length} complete)</div>
     ${d.items.map((it,idx)=>skuLineHtml(it,idx)).join('') || `<p class="hint">Select an account above to load its SKU checklist.</p>`}
     <div style="height:14px"></div>
-    <button class="btn btn-primary" onclick="submitVisit()">Submit visit for approval</button>
+    <button class="btn btn-primary" onclick="submitVisit()">Submit visit for approval / إرسال الزيارة للموافقة</button>
   </div>`;
 }
 function accountResultsHtml(){
@@ -529,33 +623,33 @@ function skuLineHtml(it, idx){
         <div class="sku-line-meta">${sku.category||''} · Stock ${fmt(c.actualShelfStock)} · Vel ${fmt(c.velocity,1)}/d</div>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
-        ${complete ? statusChip('on','✓ Done') : statusChip('watch','Incomplete')}
+        ${complete ? statusChip('on','✓ Done / مكتمل') : statusChip('watch','Incomplete / غير مكتمل')}
       </div>
     </div>
     ${open ? `
     <div class="sku-line-body">
       <p class="hint" style="margin:0 0 8px">Not carried at this account? Enter 0 in each field below — don't leave blank.</p>
       <div class="row3">
-        <div><label>Opening stock</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="lineField(${idx},'opening',this.value)"/></div>
-        <div><label>Deliveries</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="lineField(${idx},'deliveries',this.value)"/></div>
-        <div><label>Actual shelf stock (closing)</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)"/></div>
+        <div><label>Opening stock / رصيد أول المدة</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="lineField(${idx},'opening',this.value)"/></div>
+        <div><label>Deliveries / التوريدات</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="lineField(${idx},'deliveries',this.value)"/></div>
+        <div><label>Actual shelf stock (closing) / الرصيد الفعلي على الرف</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf capacity filled (facings)</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="lineField(${idx},'actualCapacity',this.value)"/></div>
-        <div><label>POG facings (planogram)</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)"/></div>
+        <div><label>Shelf capacity filled (facings) / الواجهات المعروضة فعليا</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="lineField(${idx},'actualCapacity',this.value)"/></div>
+        <div><label>POG facings (planogram) / واجهات المخطط</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)"/></div>
       </div>
       <div class="row2">
-        <div><label>Shahd facings</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)"/></div>
-        <div><label>Category facings (total)</label><input type="number" inputmode="decimal" value="${it.catFacings}" oninput="lineField(${idx},'catFacings',this.value)"/></div>
+        <div><label>Shahd facings / واجهات شهد</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)"/></div>
+        <div><label>Category facings (total) / إجمالي واجهات الفئة</label><input type="number" inputmode="decimal" value="${it.catFacings}" oninput="lineField(${idx},'catFacings',this.value)"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf price (EGP) — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)"/></div>
-        <div><label>Days since last visit</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)"/></div>
+        <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)"/></div>
+        <div><label>Days since last visit / عدد الأيام منذ آخر زيارة</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)"/></div>
       </div>
       ${it.actualCapacity!=='' || it.pogFacings!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
-        ${statusChip('neutral', 'SFR '+fmt(c.sfr)+'%')}
-        ${statusChip('neutral', 'SOS '+fmt(c.sos)+'%')}
-        ${statusChip(c.osa==='Y'?'on':'off', 'OSA '+c.osa)}
+        ${statusChip('neutral', 'SFR / تعبئة الرف '+fmt(c.sfr)+'%')}
+        ${statusChip('neutral', 'SOS / حصة الرف '+fmt(c.sos)+'%')}
+        ${statusChip(c.osa==='Y'?'on':'off', 'OSA / التوافر '+c.osa)}
         ${statusChip(c.priceStatus, c.priceLbl)}
       </div>` : ''}
     </div>` : ''}
@@ -564,13 +658,13 @@ function skuLineHtml(it, idx){
 
 function screenMyVisits(){
   const mine = State.visits.filter(v=>v.auditor===(State.name||'Unnamed'));
-  return `<div class="screen"><h1>My visits</h1><p class="lede">Everything you've submitted, with live status.</p>
+  return `<div class="screen"><h1>My visits / زياراتي</h1><p class="lede">Everything you've submitted, with live status.</p>
   ${mine.map(visitRowHtml).join('') || emptyState('📋','Nothing submitted yet','Your submitted visits will appear here.')}</div>`;
 }
 
 function screenApprovals(){
   const pending = State.visits.filter(v=>v.status==='pending');
-  return `<div class="screen"><h1>Approvals</h1><p class="lede">Review and approve incoming field audits.</p>
+  return `<div class="screen"><h1>Approvals / الموافقات</h1><p class="lede">Review and approve incoming field audits.</p>
   ${pending.map(v=>approvalCardHtml(v)).join('') || emptyState('✅','All caught up','No visits waiting for review.')}</div>`;
 }
 function approvalCardHtml(v){
@@ -582,8 +676,8 @@ function approvalCardHtml(v){
       <span class="status-badge status-pending">pending</span>
     </div>
     <div class="verify-row" style="margin-bottom:8px">
-      ${verified ? statusChip('on','📍 Verified visit') : statusChip('off','⚠️ Unverified — no photo/GPS')}
-      ${statusChip(agg.visitDonePct>=95?'on':'watch', fmt(agg.visitDonePct)+'% data complete')}
+      ${verified ? statusChip('on','📍 Verified visit / زيارة موثقة') : statusChip('off','⚠️ Unverified / غير موثقة')}
+      ${statusChip(agg.visitDonePct>=95?'on':'watch', fmt(agg.visitDonePct)+'% data complete / اكتمال البيانات')}
     </div>
     ${v.photo ? `<img class="photo-preview" src="${v.photo}"/>` : ''}
     ${v.geo ? `<p class="hint">📍 ${v.geo.lat}, ${v.geo.lng} (±${v.geo.accuracy}m) · ${v.capturedAt?new Date(v.capturedAt).toLocaleString():''}</p>` : ''}
@@ -592,8 +686,10 @@ function approvalCardHtml(v){
       ${agg.items.map(it=>`<tr><td>${(SKU_MAP[it.skuId]||{}).name||'—'}</td><td>${fmt(it.calc.actualShelfStock)}</td><td>${fmt(it.calc.velocity,1)}/d</td><td>${statusChip(it.calc.priceStatus,it.calc.priceLbl)}</td></tr>`).join('')}
     </table>
     <div style="display:flex;gap:8px;margin-top:12px">
-      <button class="btn btn-green btn-sm" style="flex:1" onclick="setVisitStatus('${v.id}','approved')">Approve</button>
-      <button class="btn btn-danger btn-sm" style="flex:1" onclick="rejectPrompt('${v.id}')">Reject</button>
+      ${roleConf().canApprove ? `
+      <button class="btn btn-green btn-sm" style="flex:1" onclick="setVisitStatus('${v.id}','approved')">Approve / اعتماد</button>
+      <button class="btn btn-danger btn-sm" style="flex:1" onclick="rejectPrompt('${v.id}')">Reject / رفض</button>
+      ` : `<p class="hint">View-only — you don't have approval rights.</p>`}
     </div>
   </div>`;
 }
@@ -602,15 +698,15 @@ function approvalCardHtml(v){
 function screenDashboard(){
   const approved = State.visits.filter(v=>v.status==='approved');
   if(approved.length===0){
-    return `<div class="screen"><h1>Dashboard</h1><p class="lede">Live KPIs from approved visits.</p>${emptyState('📊','No approved data yet','Approve some visits to see the dashboard fill in.')}</div>`;
+    return `<div class="screen"><h1>Dashboard / لوحة التحكم</h1><p class="lede">Live KPIs from approved visits.</p>${emptyState('📊','No approved data yet','Approve some visits to see the dashboard fill in.')}</div>`;
   }
   return `<div class="screen">
-    <h1>Dashboard</h1>
+    <h1>Dashboard / لوحة التحكم</h1>
     <p class="lede">Auto-rolled up from ${approved.length} approved visit${approved.length>1?'s':''}.</p>
     <div class="pillrow">
-      <button class="${State.dashSub==='overview'?'active':''}" onclick="setDashSub('overview')">Overview</button>
-      <button class="${State.dashSub==='category'?'active':''}" onclick="setDashSub('category')">By Category → Branch</button>
-      <button class="${State.dashSub==='sku'?'active':''}" onclick="setDashSub('sku')">By Category/SKU</button>
+      <button class="${State.dashSub==='overview'?'active':''}" onclick="setDashSub('overview')">Overview / نظرة عامة</button>
+      <button class="${State.dashSub==='category'?'active':''}" onclick="setDashSub('category')">By Category → Branch / حسب الفئة والفرع</button>
+      <button class="${State.dashSub==='sku'?'active':''}" onclick="setDashSub('sku')">By Category/SKU / حسب الفئة والمنتج</button>
     </div>
     ${State.dashSub==='overview' ? dashOverview(approved) : State.dashSub==='category' ? dashByCategoryBranch(approved) : dashBySku(approved)}
   </div>`;
@@ -619,12 +715,12 @@ function dashOverview(approved){
   const aggs = approved.map(v=>visitAggregate(v));
   const avg = f => aggs.reduce((s,a)=>s+f(a),0)/aggs.length;
   return `<div class="kpi-grid">
-    <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf fill (SFR)</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.osaPct))}%</div><div class="lbl">On-shelf availability</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.priceOkPct))}%</div><div class="lbl">Price matching RSP</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.avgCoverage),1)}d</div><div class="lbl">Avg stock coverage</div></div>
-    <div class="kpi"><div class="num">${fmt(aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100)}%</div><div class="lbl">Visits verified</div></div>
+    <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf fill (SFR) / متوسط تعبئة الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avg(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf (SOS) / متوسط حصة الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avg(a=>a.osaPct))}%</div><div class="lbl">On-shelf availability (OSA) / التوافر على الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avg(a=>a.priceOkPct))}%</div><div class="lbl">Price matching RSP / مطابقة السعر</div></div>
+    <div class="kpi"><div class="num">${fmt(avg(a=>a.avgCoverage),1)}d</div><div class="lbl">Avg stock coverage / تغطية المخزون</div></div>
+    <div class="kpi"><div class="num">${fmt(aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
   </div>`;
 }
 function dashByCategoryBranch(approved){
@@ -675,7 +771,7 @@ function dashBySku(approved){
   const rows = Object.values(bySku).sort((a,b)=>a.category.localeCompare(b.category)||a.name.localeCompare(b.name));
   if(rows.length===0) return emptyState('📦','No SKU data yet','');
   return `<div class="card"><table class="mini">
-    <tr><th>SKU</th><th>Vel/d</th><th>SFR</th><th>SOS</th><th>Price OK</th></tr>
+    <tr><th>SKU</th><th>Vel/المعدل</th><th>SFR</th><th>SOS</th><th>Price OK/السعر</th></tr>
     ${rows.map(r=>`<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${fmt(r.velSum/r.n,1)}</td><td>${fmt(r.sfrSum/r.n)}%</td><td>${fmt(r.sosSum/r.n)}%</td><td>${fmt(r.priceOk/r.n*100)}%</td></tr>`).join('')}
   </table></div>`;
 }
@@ -683,7 +779,7 @@ function dashBySku(approved){
 /* ---- Team ---- */
 function screenTeam(){
   const names = [...new Set(State.visits.map(v=>v.auditor))];
-  if(names.length===0) return `<div class="screen"><h1>Team</h1><p class="lede">Merchandiser performance vs targets.</p>${emptyState('👥','No visits yet','')}</div>`;
+  if(names.length===0) return `<div class="screen"><h1>Team / الفريق</h1><p class="lede">Merchandiser performance vs targets.</p>${emptyState('👥','No visits yet','')}</div>`;
   const rows = names.map(name=>{
     const mine = State.visits.filter(v=>v.auditor===name);
     const approved = mine.filter(v=>v.status==='approved');
@@ -694,7 +790,7 @@ function screenTeam(){
     return { name, achieved: mine.length, target, avgSfr: avg(a=>a.avgSfr), avgSos: avg(a=>a.avgSos), dataCompletion: avg(a=>a.visitDonePct), verifiedPct: mine.length ? verified/mine.length*100 : 0 };
   }).sort((a,b)=> (b.achieved/(b.target||1)) - (a.achieved/(a.target||1)));
   return `<div class="screen">
-    <h1>Team</h1>
+    <h1>Team / الفريق</h1>
     <p class="lede">Visits, SOS/SFR, data completion &amp; verification per merchandiser.</p>
     ${rows.map(r=>`
       <div class="card">
@@ -703,10 +799,10 @@ function screenTeam(){
           <div style="font-weight:800;color:${r.target?barColor(r.achieved/r.target*100):'var(--ink-soft)'}">${r.achieved}${r.target?'/'+r.target:''}</div>
         </div>
         <div class="verify-row">
-          ${statusChip('neutral','SFR '+fmt(r.avgSfr)+'%')}
-          ${statusChip('neutral','SOS '+fmt(r.avgSos)+'%')}
-          ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete')}
-          ${statusChip(r.verifiedPct>=90?'on':'off', fmt(r.verifiedPct)+'% verified')}
+          ${statusChip('neutral','SFR / تعبئة الرف '+fmt(r.avgSfr)+'%')}
+          ${statusChip('neutral','SOS / حصة الرف '+fmt(r.avgSos)+'%')}
+          ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete / اكتمال')}
+          ${statusChip(r.verifiedPct>=90?'on':'off', fmt(r.verifiedPct)+'% verified / موثق')}
         </div>
       </div>`).join('')}
   </div>`;
@@ -726,9 +822,9 @@ function screenScorecard(){
     const a = { avgSfr: avg(x=>x.avgSfr), avgSos: avg(x=>x.avgSos), osaPct: avg(x=>x.osaPct), priceOkPct: avg(x=>x.priceOkPct), visitDonePct: avg(x=>x.visitDonePct), visitAchievedPct: targetSum ? Math.min(100, achievedSum/targetSum*100) : 100 };
     return { branch, visits: visits.length, score: scoreFor(a), ...a };
   }).sort((a,b)=>b.score-a.score);
-  if(rows.length===0) return `<div class="screen"><h1>Scorecard</h1><p class="lede">Weighted score by branch.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
+  if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1><p class="lede">Weighted score by branch.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
   return `<div class="screen">
-    <h1>Scorecard</h1>
+    <h1>Scorecard / بطاقة الأداء</h1>
     <p class="lede">SFR 25% · OSA 15% · Price 20% · SOS 15% · Visit compliance 15% · Data completion 10%.</p>
     ${rows.map(r=>`
       <div class="card">
@@ -744,15 +840,15 @@ function screenScorecard(){
 
 function screenSkus(){
   return `<div class="screen">
-    <h1>Manage SKUs</h1>
+    <h1>Manage SKUs / إدارة المنتجات</h1>
     <p class="lede">Edit the reference list merchandisers audit against. (${State.accounts.length} accounts loaded from route plan — ask me to add more.)</p>
     ${State.skus.map((s,idx)=>`
       <div class="card">
         <div class="row2">
-          <div><label>SKU name</label><input type="text" value="${s.name}" oninput="skuField(${idx},'name',this.value)"/></div>
-          <div><label>Category</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
+          <div><label>SKU name / اسم المنتج</label><input type="text" value="${s.name}" oninput="skuField(${idx},'name',this.value)"/></div>
+          <div><label>Category / الفئة</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
         </div>
-        <label>RSP (EGP)</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/>
+        <label>RSP (EGP) / السعر الموصى به</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/>
         <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removeSku(${idx})">Remove SKU</button>
       </div>`).join('')}
     <button class="btn btn-line" onclick="addSku()">＋ Add SKU</button>
@@ -761,8 +857,6 @@ function screenSkus(){
 
 /* ============================= EVENT HANDLERS ============================= */
 function go(tab){ State.tab = tab; render(); window.scrollTo(0,0); }
-function setRole(r){ State.role = r; State.tab='home'; if(!nameOptions().includes(State.name)) State.name=''; saveMe(); render(); }
-function setName(v){ State.name = v; saveMe(); }
 function d(field,val){ State.draft[field]=val; }
 function setDashSub(s){ State.dashSub = s; render(); }
 function toggleCategory(cat){ State.expandedCategory = State.expandedCategory===cat ? null : cat; render(); }
@@ -785,28 +879,31 @@ function openVisit(id){
   const agg = visitAggregate(v);
   alert(`${v.accountName} · ${v.branch}\n${v.date} · ${v.auditor}\nStatus: ${v.status}\n\nAvg SFR ${fmt(agg.avgSfr)}% · Avg SOS ${fmt(agg.avgSos)}%\nOSA ${fmt(agg.osaPct)}% · Price OK ${fmt(agg.priceOkPct)}%\nData complete ${fmt(agg.visitDonePct)}%` + (v.reviewNote ? `\nNote: ${v.reviewNote}` : ''));
 }
-function skuField(idx,field,val){ State.skus[idx][field] = val; saveSkus(); }
-function addSku(){ State.skus.push({id:'sku_'+uid(), name:'New SKU', category:'', rsp:0}); saveSkus(); render(); }
-function removeSku(idx){ State.skus.splice(idx,1); saveSkus(); render(); }
+function skuField(idx,field,val){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus[idx][field] = val; saveSkus(); }
+function addSku(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.push({id:'sku_'+uid(), name:'New SKU', category:'', rsp:0}); saveSkus(); render(); }
+function removeSku(idx){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.splice(idx,1); saveSkus(); render(); }
 
 let renderTimer=null;
 function renderPartial(){ if(renderTimer) clearTimeout(renderTimer); renderTimer=setTimeout(render, 250); }
 
 /* ============================= NAV ============================= */
+function setNavContext(ctx){ State.navContext = ctx; State.tab = ctx==='field' ? 'home' : firstManageTab(roleConf()); render(); }
+
 function navHtml(){
-  const merchTabs = [
-    {id:'home', ico:'🏠', lbl:'Home'},
-    {id:'newvisit', ico:'➕', lbl:'New visit'},
-    {id:'myvisits', ico:'📋', lbl:'My visits'},
+  const conf = roleConf();
+  const fieldTabs = [
+    {id:'home', ico:'🏠', lbl:bi('Home','الرئيسية')},
+    {id:'newvisit', ico:'➕', lbl:bi('New visit','زيارة جديدة')},
+    {id:'myvisits', ico:'📋', lbl:bi('My visits','زياراتي')},
   ];
-  const supTabs = [
-    {id:'home', ico:'🏠', lbl:'Home'},
-    {id:'approvals', ico:'✅', lbl:'Approvals', badge: State.visits.filter(v=>v.status==='pending').length},
-    {id:'dashboard', ico:'📊', lbl:'Dashboard'},
-    {id:'team', ico:'👥', lbl:'Team'},
-    {id:'scorecard', ico:'🏆', lbl:'Scorecard'},
-  ];
-  const tabs = State.role==='merchandiser' ? merchTabs : supTabs;
+  const manageTabDefs = {
+    approvals: {id:'approvals', ico:'✅', lbl:bi('Approvals','الموافقات'), badge: State.visits.filter(v=>v.status==='pending').length},
+    dashboard: {id:'dashboard', ico:'📊', lbl:bi('Dashboard','لوحة التحكم')},
+    team: {id:'team', ico:'👥', lbl:bi('Team','الفريق')},
+    scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
+  };
+  const manageTabs = (conf.manageTabs||[]).map(k=>manageTabDefs[k]);
+  const tabs = State.navContext==='field' ? fieldTabs : manageTabs;
   return `<div class="navbar">${tabs.map(t=>`
     <div class="navbtn-wrap">
       <button class="navbtn ${State.tab===t.id?'active':''}" onclick="go('${t.id}')">
@@ -820,38 +917,37 @@ function navHtml(){
 function render(){
   const app = document.getElementById('app');
   if(!State.loaded){ app.innerHTML = `<div class="loading">Loading Shelf Pulse…</div>`; return; }
+  if(!State.role){ app.innerHTML = screenLogin(); return; }
+
+  const conf = roleConf();
   let body = '';
-  if(State.role==='merchandiser'){
-    if(State.tab==='newvisit') body = screenNewVisit();
-    else if(State.tab==='myvisits') body = screenMyVisits();
-    else body = screenHome();
-  } else {
-    if(State.tab==='approvals') body = screenApprovals();
-    else if(State.tab==='dashboard') body = screenDashboard();
-    else if(State.tab==='team') body = screenTeam();
-    else if(State.tab==='scorecard') body = screenScorecard();
-    else if(State.tab==='skus') body = screenSkus();
-    else body = screenHome();
-  }
+  if(State.tab==='newvisit') body = screenNewVisit();
+  else if(State.tab==='myvisits') body = screenMyVisits();
+  else if(State.tab==='approvals') body = screenApprovals();
+  else if(State.tab==='dashboard') body = screenDashboard();
+  else if(State.tab==='team') body = screenTeam();
+  else if(State.tab==='scorecard') body = screenScorecard();
+  else if(State.tab==='skus') body = screenSkus();
+  else body = screenHome();
+
+  const showContextPill = conf.contexts.length > 1;
   app.innerHTML = `
     <div class="topbar">
       <div class="topbar-row">
         <div class="brand">
           <div class="brand-mark">C3A</div>
-          <div><div class="brand-name">Shelf Pulse</div><div class="brand-sub">Live merchandising tracker</div></div>
+          <div><div class="brand-name">Shelf Pulse</div><div class="brand-sub">${conf.label}${identityLabel() && identityLabel()!==conf.label ? ' · '+identityLabel() : ''}</div></div>
         </div>
-        <div class="role-pill">
-          <button class="${State.role==='merchandiser'?'active':''}" onclick="setRole('merchandiser')">Field</button>
-          <button class="${State.role==='supervisor'?'active':''}" onclick="setRole('supervisor')">Supervisor</button>
-        </div>
+        <button class="btn-sm" style="background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:9px;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer" onclick="logout()">Switch role</button>
       </div>
+      ${showContextPill ? `
       <div class="who-row">
-        <select class="who-input" onchange="setName(this.value)" style="appearance:none;-webkit-appearance:none;">
-          <option value="" ${!State.name?'selected':''} style="color:#000">Select your name…</option>
-          ${nameOptions().map(n=>`<option value="${n}" ${State.name===n?'selected':''} style="color:#000">${n}</option>`).join('')}
-        </select>
-      </div>
-      ${State.role==='supervisor' ? `<div style="margin-top:8px;position:relative;z-index:1"><button class="btn-sm" style="background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:9px;padding:6px 12px;font-size:11.5px;font-weight:700;cursor:pointer" onclick="go('skus')">⚙ Manage SKUs</button></div>` : ''}
+        <div class="role-pill" style="background:rgba(255,255,255,.16)">
+          <button class="${State.navContext==='field'?'active':''}" onclick="setNavContext('field')">Field</button>
+          <button class="${State.navContext==='manage'?'active':''}" onclick="setNavContext('manage')">Management</button>
+        </div>
+      </div>` : ''}
+      ${conf.canEditRef ? `<div style="margin-top:8px;position:relative;z-index:1"><button class="btn-sm" style="background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:9px;padding:6px 12px;font-size:11.5px;font-weight:700;cursor:pointer" onclick="go('skus')">⚙ Manage SKUs</button></div>` : ''}
     </div>
     ${body}
     ${navHtml()}
@@ -861,7 +957,8 @@ function render(){
 
 /* ============================= EXPOSE HANDLERS ============================= */
 Object.assign(window, {
-  go, setRole, setName, d, setDashSub, toggleCategory, onAccountSearch, pickAccount, clearAccount,
+  go, setNavContext, logout, selectLoginRole, backToLoginMenu, attemptMerchandiserLogin, attemptPasswordLogin, setLoginPassword,
+  d, setDashSub, toggleCategory, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhoto
 });
