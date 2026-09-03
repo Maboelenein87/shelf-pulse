@@ -185,6 +185,10 @@ async function refSet(name, list, version){
   const { doc, setDoc } = firestoreFns;
   await setDoc(doc(db, 'meta', name), { list, version });
 }
+function isTypingNow(){
+  const el = document.activeElement;
+  return !!(el && (el.tagName==='INPUT' || el.tagName==='TEXTAREA'));
+}
 function watchVisits(){
   if(!isConfigured) return;
   const { collection, onSnapshot, query, orderBy } = firestoreFns;
@@ -193,7 +197,9 @@ function watchVisits(){
     const visits = [];
     snap.forEach(d => visits.push({ id: d.id, ...d.data() }));
     State.visits = visits;
-    render();
+    // Never yank the screen out from under someone mid-keystroke — the data is still updated,
+    // it just waits to redraw until they blur the field or take their next action.
+    if(!isTypingNow()) render();
   });
 }
 async function visitCreate(visit){
@@ -516,7 +522,7 @@ async function setVisitStatus(id, status, note){
   if(note) patch.reviewNote = note;
   await visitUpdate(id, patch);
 }
-function showToast(msg){ State.toast = msg; render(); setTimeout(()=>{ State.toast = null; render(); }, 2200); }
+function showToast(msg){ State.toast = msg; if(!isTypingNow()) render(); setTimeout(()=>{ State.toast = null; if(!isTypingNow()) render(); }, 2200); }
 
 /* ============================= PHOTO + GEO CAPTURE (multi-photo, 1-10) ============================= */
 const MAX_PHOTOS = 10;
