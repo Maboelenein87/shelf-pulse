@@ -250,7 +250,8 @@ function openVisitEditor(id){
   State.tab = 'editvisit';
   render();
 }
-function editLineField(idx, field, val){ State.editDraft.items[idx][field] = val; renderPartial(); }
+function editLineField(idx, field, val){ State.editDraft.items[idx][field] = val; }
+function editLineFieldBlur(){ render(); }
 function toggleEditLine(idx){ State.editDraft.items[idx]._open = !State.editDraft.items[idx]._open; render(); }
 async function saveVisitEdit(){
   if(!State.editingVisitId) return;
@@ -740,13 +741,7 @@ function screenNewVisit(){
           <button class="btn btn-ghost btn-sm" onclick="clearAccount()">Change</button>
         </div>` : `
         <input type="text" placeholder="Search account or branch…" value="${State.accountSearch}" oninput="onAccountSearch(this.value)"/>
-        ${State.accountSearch.length>1 ? accountResultsHtml() : `
-          <p class="hint">Type at least 2 letters to search, or pick from the full list:</p>
-          <select onchange="if(this.value)pickAccount(this.value)">
-            <option value="">Browse all ${myAccounts().length} accounts…</option>
-            ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}</option>`).join('')}
-          </select>
-        `}
+        <div id="account-search-area">${accountSearchAreaHtml()}</div>
       `}
       <label>Date / التاريخ</label>
       <input type="date" value="${d.date}" oninput="d('date',this.value)"/>
@@ -779,7 +774,7 @@ function screenNewVisit(){
     <div class="card">
       <h3>Category shelf facings (total, all brands) / إجمالي واجهات الفئة</h3>
       <p class="hint" style="margin:0 0 8px">Enter this once for the whole visit — count every brand's facings for this category on the shelf, not just Shahd.</p>
-      <input type="number" inputmode="decimal" placeholder="e.g. 100" value="${d.catFacingsTotal}" oninput="setCatFacingsTotal(this.value)"/>
+      <input type="number" inputmode="decimal" placeholder="e.g. 100" value="${d.catFacingsTotal}" oninput="setCatFacingsTotal(this.value)" onblur="catFacingsBlur()"/>
       ${(() => {
         const shahdTotal = d.items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
         const catTotal = parseFloat(d.catFacingsTotal) || 0;
@@ -812,6 +807,14 @@ function accountResultsHtml(){
       <div class="sr-sub">${a.target||0} visits/wk</div>
     </div>`).join('')}</div>`;
 }
+function accountSearchAreaHtml(){
+  if(State.accountSearch.length>1) return accountResultsHtml();
+  return `<p class="hint">Type at least 2 letters to search, or pick from the full list:</p>
+    <select onchange="if(this.value)pickAccount(this.value)">
+      <option value="">Browse all ${myAccounts().length} accounts…</option>
+      ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}</option>`).join('')}
+    </select>`;
+}
 function skuLineHtml(it, idx){
   const sku = SKU_MAP[it.skuId] || {};
   const c = computeItem({...it, catFacings: State.draft.catFacingsTotal}); // preview SOS live using the visit-level category total
@@ -831,20 +834,20 @@ function skuLineHtml(it, idx){
     <div class="sku-line-body">
       <p class="hint" style="margin:0 0 8px">Not carried at this account? Enter 0 in each field below — don't leave blank.</p>
       <div class="row3">
-        <div><label>Opening stock / رصيد أول المدة</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="lineField(${idx},'opening',this.value)"/></div>
-        <div><label>Deliveries / التوريدات</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="lineField(${idx},'deliveries',this.value)"/></div>
-        <div><label>Actual shelf stock (closing) / الرصيد الفعلي على الرف</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)"/></div>
+        <div><label>Opening stock / رصيد أول المدة</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="lineField(${idx},'opening',this.value)" onblur="lineFieldBlur()"/></div>
+        <div><label>Deliveries / التوريدات</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="lineField(${idx},'deliveries',this.value)" onblur="lineFieldBlur()"/></div>
+        <div><label>Actual shelf stock (closing) / الرصيد الفعلي على الرف</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf capacity filled (facings) / الواجهات المعروضة فعليا</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'actualCapacity',this.value)"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
-        <div><label>POG facings (planogram) / واجهات المخطط</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)"/></div>
+        <div><label>Shelf capacity filled (facings) / الواجهات المعروضة فعليا</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
+        <div><label>POG facings (planogram) / واجهات المخطط</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)"/></div>
-        <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point / تحقق من الفاصلة العشرية</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP) — please double-check / تحقق من السعر</p>` : ''}</div>
+        <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
+        <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)" onblur="lineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point / تحقق من الفاصلة العشرية</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP) — please double-check / تحقق من السعر</p>` : ''}</div>
       </div>
       <div class="row2">
-        <div><label>Days since last visit / عدد الأيام منذ آخر زيارة</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)"/></div>
+        <div><label>Days since last visit / عدد الأيام منذ آخر زيارة</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       ${it.actualCapacity!=='' || it.pogFacings!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
         ${statusChip('neutral', 'SFR / تعبئة الرف '+fmt(c.sfr)+'%')}
@@ -1629,14 +1632,10 @@ function screenScorecard(){
 }
 
 /* ---- All Visits (browse + edit, control roles only) ---- */
-function screenAllVisits(){
+function visitListResultsHtml(){
   const q = State.visitSearch.toLowerCase();
   const list = State.visits.filter(v => !q || (v.accountName+' '+v.branch+' '+v.auditor).toLowerCase().includes(q));
-  return `<div class="screen">
-    <h1>All visits / كل الزيارات</h1>
-    <p class="lede">Browse and correct any submitted visit — ${State.visits.length} total.</p>
-    <input type="text" placeholder="Search account, branch, or auditor…" value="${State.visitSearch}" oninput="onVisitSearch(this.value)" style="margin-bottom:12px"/>
-    ${list.slice(0,60).map(v=>{
+  return `${list.slice(0,60).map(v=>{
       const agg = visitAggregate(v);
       return `<div class="card" style="padding:12px 14px">
         <div class="visit-row" style="border:none;padding:0">
@@ -1649,10 +1648,21 @@ function screenAllVisits(){
         <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="openVisitEditor('${v.id}')">✎ Edit this visit</button>
       </div>`;
     }).join('') || emptyState('📋','No visits found','')}
-    ${list.length>60 ? `<p class="hint">Showing first 60 of ${list.length} matches — search to narrow down.</p>` : ''}
+    ${list.length>60 ? `<p class="hint">Showing first 60 of ${list.length} matches — search to narrow down.</p>` : ''}`;
+}
+function screenAllVisits(){
+  return `<div class="screen">
+    <h1>All visits / كل الزيارات</h1>
+    <p class="lede">Browse and correct any submitted visit — ${State.visits.length} total.</p>
+    <input type="text" placeholder="Search account, branch, or auditor…" value="${State.visitSearch}" oninput="onVisitSearch(this.value)" style="margin-bottom:12px"/>
+    <div id="visit-search-results">${visitListResultsHtml()}</div>
   </div>`;
 }
-function onVisitSearch(v){ State.visitSearch = v; renderPartial(); }
+function onVisitSearch(v){
+  State.visitSearch = v;
+  const el = document.getElementById('visit-search-results');
+  if(el) el.innerHTML = visitListResultsHtml(); // targeted update — leaves the input untouched
+}
 
 /* ---- Edit Visit ---- */
 function screenEditVisit(){
@@ -1686,21 +1696,21 @@ function editLineHtml(it, idx){
     ${open ? `
     <div class="sku-line-body">
       <div class="row3">
-        <div><label>Opening stock</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="editLineField(${idx},'opening',this.value)"/></div>
-        <div><label>Deliveries</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="editLineField(${idx},'deliveries',this.value)"/></div>
-        <div><label>Actual shelf stock (closing)</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="editLineField(${idx},'closing',this.value)"/></div>
+        <div><label>Opening stock</label><input type="number" inputmode="decimal" value="${it.opening}" oninput="editLineField(${idx},'opening',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>Deliveries</label><input type="number" inputmode="decimal" value="${it.deliveries}" oninput="editLineField(${idx},'deliveries',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>Actual shelf stock (closing)</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="editLineField(${idx},'closing',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf capacity filled (facings)</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="editLineField(${idx},'actualCapacity',this.value)"/></div>
-        <div><label>POG facings</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="editLineField(${idx},'pogFacings',this.value)"/></div>
+        <div><label>Shelf capacity filled (facings)</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="editLineField(${idx},'actualCapacity',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>POG facings</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="editLineField(${idx},'pogFacings',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shahd facings</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="editLineField(${idx},'shahdFacings',this.value)"/></div>
-        <div><label>Category facings</label><input type="number" inputmode="decimal" value="${it.catFacings}" oninput="editLineField(${idx},'catFacings',this.value)"/></div>
+        <div><label>Shahd facings</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="editLineField(${idx},'shahdFacings',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>Category facings</label><input type="number" inputmode="decimal" value="${it.catFacings}" oninput="editLineField(${idx},'catFacings',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf price (EGP) — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
-        <div><label>Days since last visit</label><input type="number" inputmode="decimal" value="${it.days}" oninput="editLineField(${idx},'days',this.value)"/></div>
+        <div><label>Shelf price (EGP) — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editLineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
+        <div><label>Days since last visit</label><input type="number" inputmode="decimal" value="${it.days}" oninput="editLineField(${idx},'days',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
     </div>` : ''}
   </div>`;
@@ -1755,11 +1765,16 @@ function screenSkus(){
 /* ============================= EVENT HANDLERS ============================= */
 function go(tab){ State.tab = tab; render(); window.scrollTo(0,0); }
 function d(field,val){ State.draft[field]=val; }
-function setCatFacingsTotal(v){ State.draft.catFacingsTotal = v; saveDraftLocal(); renderPartial(); }
+function setCatFacingsTotal(v){ State.draft.catFacingsTotal = v; saveDraftLocal(); }
+function catFacingsBlur(){ render(); }
 function setDashSub(s){ State.dashSub = s; render(); }
 function toggleCategory(cat){ State.expandedCategory = State.expandedCategory===cat ? null : cat; render(); }
 function toggleBranchRow(key){ State.expandedBranch = State.expandedBranch===key ? null : key; render(); }
-function onAccountSearch(v){ State.accountSearch = v; renderPartial(); }
+function onAccountSearch(v){
+  State.accountSearch = v;
+  const el = document.getElementById('account-search-area');
+  if(el) el.innerHTML = accountSearchAreaHtml(); // targeted update — leaves the input itself untouched so the keyboard never closes
+}
 function monthKeyOf(dateStr){ return (dateStr || todayStr()).slice(0,7); }
 function getMonthlyCapacity(accountId, skuId, monthKey){
   for(const v of State.visits){
@@ -1786,7 +1801,8 @@ function pickAccount(id){
 }
 function clearAccount(){ State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.accountSearch=''; clearDraftLocal(); render(); }
 function toggleLine(idx){ State.draft.items[idx]._open = !State.draft.items[idx]._open; render(); }
-function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); renderPartial(); }
+function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); }
+function lineFieldBlur(){ render(); }
 function rejectPrompt(id){ const note = prompt('Reason for rejection (optional):') || ''; setVisitStatus(id,'rejected',note); }
 function openVisit(id){
   const v = State.visits.find(v=>v.id===id); if(!v) return;
@@ -1876,9 +1892,9 @@ function render(){
 Object.assign(window, {
   go, setNavContext, logout, selectLoginRole, backToLoginMenu, attemptMerchandiserLogin, attemptMerchEmpidLogin, cancelMerchLogin, attemptPasswordLogin, setLoginPassword,
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
-  toggleLine, lineField, rejectPrompt, openVisit, skuField, addSku, removeSku,
+  toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur
 });
 
 /* ============================= INIT ============================= */
