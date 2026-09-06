@@ -899,6 +899,45 @@ function findSuspiciousPrices(){
   });
   return candidates.sort((a,b)=>b.original-a.original);
 }
+function findSuspiciousCapacity(){
+  const candidates = [];
+  State.visits.forEach(v=>{
+    (v.items||[]).forEach(it=>{
+      const sku = SKU_MAP[it.skuId]; if(!sku) return;
+      const capacity = parseFloat(it.actualCapacity);
+      const closing = parseFloat(it.closing);
+      const pog = parseFloat(it.pogFacings);
+      if(isNaN(capacity) || isNaN(closing)) return;
+      if(capacity <= closing) return; // fine — facings filled can't exceed units actually on the shelf
+      // Likely cause: the merchandiser typed the Full Shelf Utilization (POG) target into this field by mistake,
+      // rather than what was actually filled — worth flagging separately since the fix here isn't just "cap to closing".
+      const looksLikeFieldMixup = !isNaN(pog) && pog>0 && Math.abs(capacity-pog) < 0.01;
+      candidates.push({ visitId:v.id, skuId:it.skuId, skuName:sku.name, account:v.accountName, branch:v.branch, date:v.date, capacity, closing, pog, looksLikeFieldMixup });
+    });
+  });
+  return candidates.sort((a,b)=>(b.capacity-b.closing)-(a.capacity-a.closing));
+}
+async function applyCapacityFix(c){
+  const visit = State.visits.find(v=>v.id===c.visitId); if(!visit) return;
+  const newItems = (visit.items||[]).map(it => it.skuId===c.skuId ? {...it, actualCapacity: String(c.closing)} : it);
+  await visitUpdate(c.visitId, { items: newItems });
+}
+async function applyAllCapacityFixes(){
+  const candidates = findSuspiciousCapacity();
+  if(candidates.length===0){ showToast('No capacity issues found'); return; }
+  if(!confirm(`Reduce actual capacity down to match closing stock for ${candidates.length} record(s)? This can't be undone.`)) return;
+  showToast('Applying fixes…');
+  for(const c of candidates){ try{ await applyCapacityFix(c); }catch(e){ console.error(e); } }
+  showToast('Fixes applied ✓');
+  render();
+}
+async function applyOneCapacityFix(idx){
+  const candidates = findSuspiciousCapacity();
+  const c = candidates[idx]; if(!c) return;
+  await applyCapacityFix(c);
+  showToast('Fixed ✓');
+  render();
+}
 async function applyPriceFix(c){
   const visit = State.visits.find(v=>v.id===c.visitId); if(!visit) return;
   const newItems = (visit.items||[]).map(it => it.skuId===c.skuId ? {...it, actualPrice: String(c.corrected)} : it);
@@ -1274,9 +1313,15 @@ function captureGeo(){
 function removePhotoAt(idx){ (State.draft.photos||[]).splice(idx,1); saveDraftLocal(); render(); }
 
 /* ============================= RENDER HELPERS ============================= */
-function fmt(n, d=0){ n = isFinite(n) ? n : 0; return n.toFixed(d); }
+function fmt(n, d=0){
+  if(Array.isArray(n)) n = n.length ? n[0] : 0; // defensive: some upstream field occasionally arrives as a 1-item array instead of a plain number
+  n = Number(n);
+  n = isFinite(n) ? n : 0;
+  return n.toFixed(d);
+}
 function visitPhotos(v){ return (v.photos && v.photos.length) ? v.photos : (v.photo ? [v.photo] : []); }
 function fmtCoverage(days){
+  if(Array.isArray(days)) days = days.length ? days[0] : 0;
   if(days === Infinity) return '∞'; // in stock, but zero sales recorded — technically never runs out
   if(!days || days<=0) return '—'; // no stock / no reading
   return fmt(days,1)+'d';
@@ -1414,7 +1459,7 @@ function screenHome(){
     <div class="kpi-grid">
       <div class="kpi accent"><div class="num">${pendingCount}</div><div class="lbl">Pending approval / بانتظار الموافقة</div></div>
       <div class="kpi"><div class="num">${approved.length}</div><div class="lbl">Approved visits / الزيارات المعتمدة</div></div>
-      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.reduce((s,a)=>s+a.avgSfr,0)/aggs.length:0)}%</div><div class="lbl">Avg shelf fill / متوسط تعبئة الرف</div></div>
+      <div class="kpi"><div class="num">${fmt(aggs.length?aggs.reduce((s,a)=>s+a.avgSfr,0)/aggs.length:0)}%</div><div class="lbl">Avg shelf utilization / متوسط تعبئة الرف</div></div>
       <div class="kpi"><div class="num">${fmt(aggs.length?aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100:0)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
     </div>
     ${pendingCount>0 ? `<button class="btn btn-primary" onclick="go('approvals')">Review ${pendingCount} pending visit${pendingCount>1?'s':''}</button>` : ''}
@@ -1551,8 +1596,8 @@ function skuLineHtml(it, idx){
         <div><label>Actual shelf stock (closing) / الرصيد الفعلي على الرف</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
-        <div><label>POG Facings / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/></div>
+        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing}) — a facing can't hold stock that isn't there / تحقق من الكمية</p>` : ''}</div>
+        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
         <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
@@ -1562,7 +1607,7 @@ function skuLineHtml(it, idx){
         <div><label>Days since last visit / عدد الأيام منذ آخر زيارة</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       ${it.actualCapacity!=='' || it.pogFacings!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
-        ${statusChip('neutral', 'SFR / تعبئة الرف '+fmt(c.sfr)+'%')}
+        ${statusChip('neutral', 'SUC / تعبئة الرف '+fmt(c.sfr)+'%')}
         ${statusChip('neutral', 'SOS / حصة الرف '+fmt(c.sos)+'%')}
         ${statusChip(c.osa==='Y'?'on':'off', 'OSA / التوافر '+c.osa)}
         ${statusChip(c.priceStatus, c.priceLbl)}
@@ -1643,7 +1688,7 @@ function dashOverview(approved){
   const avg = f => aggs.reduce((s,a)=>s+f(a),0)/aggs.length;
   const stockSummary = computeNetworkStockSummary(approved);
   return `<div class="kpi-grid">
-    <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf fill (SFR) / متوسط تعبئة الرف</div></div>
+    <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf utilization (SUC) / متوسط تعبئة الرف</div></div>
     <div class="kpi"><div class="num">${fmt(avg(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf (SOS) / متوسط حصة الرف</div></div>
     <div class="kpi"><div class="num">${fmt(avg(a=>a.osaPct))}%</div><div class="lbl">On-shelf availability (OSA) / التوافر على الرف</div></div>
     <div class="kpi"><div class="num">${fmt(avg(a=>a.priceOkPct))}%</div><div class="lbl">Price matching RSP / مطابقة السعر</div></div>
@@ -1658,35 +1703,41 @@ function computeCustomerAnalysis(approved){
   const byCustomer = {};
   const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0)); // process oldest→newest so "latest" tracking below stays correct
   sorted.forEach(v=>{
+   try{
     const agg = visitAggregate(v);
     byCustomer[v.accountName] = byCustomer[v.accountName] || { name:v.accountName, branches:{}, skuStats:{}, photos:[] };
     const c = byCustomer[v.accountName];
-    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, sfrSum:0, sosSum:0, osaSum:0, priceOk:0, priceN:0, visits:0, skuStats:{} };
+    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, sfrSum:0, sosSum:0, osaSum:0, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null };
     const b = c.branches[v.branch];
     b.visits++; b.sfrSum += agg.avgSfr; b.sosSum += agg.avgSos; b.osaSum += agg.osaPct;
+    b.lastVisitDate = v.date; // overwritten each pass — ends on the most recent visit's date
     visitPhotos(v).forEach(p=>c.photos.push({photo:p, branch:v.branch, date:v.date}));
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const priceVal = parseFloat(it.actualPrice);
-      c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, n:0, oosCount:0, priceOk:0, priceN:0, priceSum:0, priceValN:0, branchesCarrying:new Set() };
+      c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, n:0, oosCount:0, priceOk:0, priceN:0, latestPrice:0, branchesCarrying:new Set() };
       const s = c.skuStats[sku.id];
       s.n++; s.sfrSum += it.calc.sfr; s.sosSum += it.calc.sos;
       if(it.calc.osa==='N') s.oosCount++; else s.branchesCarrying.add(v.branch);
       if(it.calc.velocity>0){ s.velSum += it.calc.velocity; s.velN++; }
-      if(!isNaN(priceVal) && priceVal>0){ s.priceSum += priceVal; s.priceValN++; }
+      if(!isNaN(priceVal) && priceVal>0){ s.latestPrice = priceVal; } // overwritten each pass — ends on the most recent visit's reading, not an average
       if(it.calc.priceStatus!=='neutral'){ s.priceN++; if(it.calc.priceStatus==='on') s.priceOk++; b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
 
-      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', priceSum:0, priceValN:0, latestStock:0 };
+      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestPog:0, latestSfr:0 };
       const bs = b.skuStats[sku.id];
       bs.n++; if(it.calc.osa==='N') bs.oosCount++;
       if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; }
-      if(!isNaN(priceVal) && priceVal>0){ bs.priceSum += priceVal; bs.priceValN++; bs.priceStatus = it.calc.priceStatus; }
+      if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // latest reading, not an average
       bs.latestStock = it.calc.actualShelfStock; // overwritten each pass — ends on the most recent visit's reading
+      bs.latestCapacity = parseFloat(it.actualCapacity) || 0; // facings actually on shelf, latest visit
+      bs.latestPog = parseFloat(it.pogFacings) || 0; // planogram target facings ("full capacity"), latest visit
+      bs.latestSfr = it.calc.sfr; // latest visit's SUC%, not an average — matches stock/price
     });
+   }catch(e){ console.error('Skipping malformed visit in customer analysis:', v && v.id, e); }
   });
   return Object.values(byCustomer).map(c=>{
     const branches = Object.values(c.branches).map(b=>({
-      branch:b.branch, sfr:b.sfrSum/b.visits, sos:b.sosSum/b.visits, osaPct:b.osaSum/b.visits,
+      branch:b.branch, sfr:b.sfrSum/b.visits, sos:b.sosSum/b.visits, osaPct:b.osaSum/b.visits, lastVisitDate:b.lastVisitDate,
       priceOkPct: b.priceN?b.priceOk/b.priceN*100:0, visits:b.visits,
       skuList: Object.entries(b.skuStats).map(([skuId,s])=>{
         const avgVel = s.velN?s.velSum/s.velN:0;
@@ -1695,9 +1746,10 @@ function computeCustomerAnalysis(approved){
         return {
           id:skuId, name:s.name, category:s.category, rsp:s.rsp,
           avgVel,
-          actualPrice: s.priceValN?s.priceSum/s.priceValN:0,
+          actualPrice: s.latestPrice||0,
           priceStatus: s.priceStatus, oosCount:s.oosCount, n:s.n,
           stock: s.latestStock, coverageDays,
+          capacity: s.latestCapacity, pog: s.latestPog, sfr: s.latestSfr,
         };
       }).sort((a,b2)=>b2.avgVel-a.avgVel),
     }));
@@ -1712,7 +1764,7 @@ function computeCustomerAnalysis(approved){
         avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
         sfr:s.sfrSum/s.n, osaPct: (s.n-s.oosCount)/s.n*100,
         priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
-        actualPrice: s.priceValN?s.priceSum/s.priceValN:0,
+        actualPrice: s.latestPrice||0,
         oosCount:s.oosCount, visits:s.n, coverage:s.branchesCarrying.size,
         totalStock: stockAcrossBranches, avgCoverageDays: coverageVals.length ? coverageVals.reduce((a,b2)=>a+b2,0)/coverageVals.length : (hasInfiniteCoverage ? Infinity : 0),
       };
@@ -1773,7 +1825,7 @@ function dashCustomers(approved){
     const open = State.expandedCategory === 'cust:'+r.name;
     return `<div class="card">
       <div class="branch-toggle" onclick="toggleCategory('cust:${r.name.replace(/'/g,"\\'")}')">
-        <div><div class="visit-main">${r.name}</div><div class="visit-sub">${r.branchCount} branch${r.branchCount>1?'es':''} · SFR ${fmt(r.avgSfr)}% · SOS ${fmt(r.avgSos)}%</div></div>
+        <div><div class="visit-main">${r.name}</div><div class="visit-sub">${r.branchCount} branch${r.branchCount>1?'es':''} · SUC ${fmt(r.avgSfr)}% · SOS ${fmt(r.avgSos)}%</div></div>
         <div style="font-size:16px">${open?'−':'+'}</div>
       </div>
       ${open ? `
@@ -1787,16 +1839,16 @@ function dashCustomers(approved){
           const bKey = 'br:'+r.name+'|'+b.branch;
           const bOpen = State.expandedBranch === bKey;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
-            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SFR ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div></div>
+            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}</div></div>
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
-          ${bOpen ? `<table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
-          </table>` : ''}`;
+          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (facings)</th><th>Full Shelf Utilization (Units)</th><th>Shelf Utilization Capacity%</th><th>Days cover</th></tr>
+            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+          </table></div>` : ''}`;
         }).join('')}
 
         <div class="sectitle">By category / حسب الفئة</div>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Category</th><th>SFR</th><th>Avg vel/store/d</th></tr>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Category</th><th>SUC</th><th>Avg vel/store/d</th></tr>
           ${r.categories.map(c=>`<tr><td>${c.category}</td><td>${fmt(c.avgSfr)}%</td><td>${fmt(c.avgVelPerStore,1)}</td></tr>`).join('')}
         </table></div>
 
@@ -1823,23 +1875,26 @@ function computeCategoryAnalysis(approved){
   const byCat = {}, bySku = {};
   const totalStores = new Set(approved.map(v=>v.accountName+' · '+v.branch)).size;
   approved.forEach(v=>{
+   try{
     const agg = visitAggregate(v);
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       byCat[sku.category] = byCat[sku.category] || { sfrSum:0, sosSum:0, n:0 };
       byCat[sku.category].sfrSum += it.calc.sfr; byCat[sku.category].sosSum += it.calc.sos; byCat[sku.category].n++;
-      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sosSum:0, velSum:0, velN:0, priceOk:0, priceN:0, n:0, storesCarrying:new Set() };
+      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sosSum:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
       const b = bySku[sku.id];
       b.sfrSum += it.calc.sfr; b.sosSum += it.calc.sos; b.n++;
       if(it.calc.osa==='Y') b.storesCarrying.add(v.accountName+' · '+v.branch);
       if(it.calc.velocity>0){ b.velSum += it.calc.velocity; b.velN++; }
-      if(it.calc.priceStatus!=='neutral'){ b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
+      if(it.calc.priceStatus!=='neutral'){ b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; if(it.calc.priceStatus==='watch') b.priceAbove++; }
     });
+   }catch(e){ console.error('Skipping malformed visit in category analysis:', v && v.id, e); }
   });
   const catRows = Object.entries(byCat).map(([cat,c])=>({category:cat, avgSfr:c.sfrSum/c.n, avgSos:c.sosSum/c.n})).sort((a,b)=>b.avgSfr-a.avgSfr);
   const skuRows = Object.values(bySku).map(s=>({
     ...s, avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
     avgSfr:s.sfrSum/s.n, avgSos:s.sosSum/s.n, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
+    aboveRspPct: s.priceN?s.priceAbove/s.priceN*100:0,
     coveragePct: totalStores ? s.storesCarrying.size/totalStores*100 : 0, coverageCount: s.storesCarrying.size,
   })).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
   return { catRows, skuRows, totalStores };
@@ -1850,7 +1905,7 @@ function dashCategories(approved){
   return `
   <div class="card">
     <h3>Category performance / أداء الفئات</h3>
-    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Category</th><th>SFR</th><th>SOS</th></tr>
+    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Category</th><th>SUC</th><th>SOS</th></tr>
     ${catRows.map(c=>`<tr><td>${c.category}</td><td>${fmt(c.avgSfr)}%</td><td>${fmt(c.avgSos)}%</td></tr>`).join('')}
     </table></div>
   </div>
@@ -1904,7 +1959,7 @@ function computeCustomerOpportunities(approved){
     const branches = c.branches.map(b=>{
       const issues = [];
       if(b.sos < 15) issues.push({type:'sos', text:`Low share of shelf — only ${fmt(b.sos)}% SOS. Worth negotiating more facings with the category buyer.`});
-      if(b.sfr < 70) issues.push({type:'sfr', text:`Low shelf fill — only ${fmt(b.sfr)}% SFR. Facing or replenishment gap.`});
+      if(b.sfr < 70) issues.push({type:'sfr', text:`Low shelf utilization — only ${fmt(b.sfr)}% SUC. Facing or replenishment gap.`});
       if(b.priceOkPct < 70) issues.push({type:'price', text:`Price compliance only ${fmt(b.priceOkPct)}% — audit shelf tags vs RSP.`});
       b.skuList.forEach(s=>{
         if(isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<3) issues.push({type:'lowstock', text:`${s.name} is critically low — ${fmt(s.coverageDays,1)} days of stock left (${fmt(s.stock)} units). Restock urgently.`});
@@ -1925,7 +1980,7 @@ function issueIcon(type){
 function dashOpportunities(approved){
   const rows = computeCustomerOpportunities(approved);
   if(rows.length===0) return emptyState('💡','No clear opportunities yet','Needs more approved visits to compare across branches.');
-  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch — low/high stock, weak SOS or SFR, cross-branch underperformance.</p>
+  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch — low/high stock, weak SOS or SUC, cross-branch underperformance.</p>
   ${rows.map(r=>{
     const open = State.expandedCategory === 'opp:'+r.name;
     return `<div class="card">
@@ -1936,7 +1991,7 @@ function dashOpportunities(approved){
       ${open ? r.branches.map(b=>`
         <div class="branch-toggle" style="border-top:1px solid var(--line);cursor:default">
           <div style="width:100%">
-            <div class="visit-sub" style="font-weight:700;color:var(--ink);margin-bottom:6px">${b.branch} <span class="hint">SFR ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%</span></div>
+            <div class="visit-sub" style="font-weight:700;color:var(--ink);margin-bottom:6px">${b.branch} <span class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%</span></div>
             ${b.issues.map(i=>`<p style="font-size:12px;margin:4px 0">${issueIcon(i.type)} ${i.text}</p>`).join('')}
           </div>
         </div>`).join('') : ''}
@@ -1995,7 +2050,7 @@ async function exportPpt(){
     s2.addText('Executive Summary', { x:0.5, y:0.35, w:12, h:0.55, fontSize:28, bold:true, color:DARK });
     s2.addText(`${new Date().toLocaleDateString('en-GB',{weekday:'long', year:'numeric', month:'long', day:'numeric'})}`, { x:0.5, y:0.9, w:12, h:0.35, fontSize:12, color:SOFT });
     const headline = [
-      ['SFR', fmt(avg(a=>a.avgSfr))+'%'], ['SOS', fmt(avg(a=>a.avgSos))+'%'],
+      ['SUC', fmt(avg(a=>a.avgSfr))+'%'], ['SOS', fmt(avg(a=>a.avgSos))+'%'],
       ['OSA', fmt(avg(a=>a.osaPct))+'%'], ['Price OK', fmt(avg(a=>a.priceOkPct))+'%'],
     ];
     headline.forEach((h,i)=>{
@@ -2006,7 +2061,7 @@ async function exportPpt(){
     s2.addShape('line', { x:0.5, y:2.75, w:12.3, h:0, line:{color:LINE, width:1} });
     s2.addText('Key wins', { x:0.5, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:GREEN });
     const wins = [];
-    if(bestCust) wins.push(`${bestCust.name} leads on shelf fill at ${fmt(bestCust.avgSfr)}% SFR.`);
+    if(bestCust) wins.push(`${bestCust.name} leads on shelf utilization at ${fmt(bestCust.avgSfr)}% SUC.`);
     const bestSku = skuRows[0];
     if(bestSku) wins.push(`${bestSku.name} is the network's top seller at ${fmt(bestSku.avgVelPerStore,1)} units/store/day.`);
     if(avg(a=>a.priceOkPct) >= 80) wins.push(`Price compliance is healthy across the network at ${fmt(avg(a=>a.priceOkPct))}%.`);
@@ -2014,7 +2069,7 @@ async function exportPpt(){
     s2.addText(wins.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:0.5, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
     s2.addText('Key risks', { x:6.9, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:RED });
     const risks = [];
-    if(worstCust && worstCust.name!==bestCust?.name) risks.push(`${worstCust.name} lags at ${fmt(worstCust.avgSfr)}% SFR — needs attention.`);
+    if(worstCust && worstCust.name!==bestCust?.name) risks.push(`${worstCust.name} lags at ${fmt(worstCust.avgSfr)}% SUC — needs attention.`);
     if(topOpp) risks.push(`${topOpp.sku} underperforms at ${topOpp.branch} vs ${topOpp.benchmarkBranch} — ~${fmt(topOpp.gap,1)} units/day recoverable.`);
     if(worstPriceSku) risks.push(`${worstPriceSku.name} has the weakest price compliance at ${fmt(worstPriceSku.priceOkPct)}%.`);
     if(risks.length<3) risks.push(`Monitor OOS trends as visit volume grows.`);
@@ -2031,7 +2086,7 @@ async function exportPpt(){
     const priceOffCount = skuRows.reduce((s,r)=>s+(r.priceN-r.priceOk),0);
     try{
       s3.addChart(pptx.ChartType.bar, [{
-        name:'Score', labels:['SFR','SOS','OSA','Price OK','Data Complete'],
+        name:'Score', labels:['SUC','SOS','OSA','Price OK','Data Complete'],
         values:[avg(a=>a.avgSfr), avg(a=>a.avgSos), avg(a=>a.osaPct), avg(a=>a.priceOkPct), avg(a=>a.visitDonePct)].map(v=>+v.toFixed(1)),
       }], { x:0.5, y:1.05, w:6.6, h:3.3, barDir:'bar', chartColors:[RED], showValue:true, dataLabelColor:DARK, dataLabelFontSize:10, catAxisLabelFontSize:11, valAxisMaxVal:100, showLegend:false, title:'Network KPIs (%)', titleFontSize:12, titleColor:DARK });
     }catch(e){ console.error('bar chart failed', e); }
@@ -2059,7 +2114,7 @@ async function exportPpt(){
         }).map(v=>+v.toFixed(1)),
       }], { x:0.6, y:1.1, w:6.2, h:5.6, chartColors:CHART_COLORS, showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', dataLabelFontSize:9, title:'Share of network units/day by category', titleFontSize:12, titleColor:DARK });
     }catch(e){ console.error('pie chart failed', e); }
-    const catTable = [[{text:'Category',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SFR%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SOS%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}}]];
+    const catTable = [[{text:'Category',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SUC%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SOS%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}}]];
     catRows.forEach((c,i)=>catTable.push([
       {text:c.category, options:{fill:{color:i%2?'F6F2EF':'FFFFFF'}}},
       {text:fmt(c.avgSfr), options:{fill:{color:i%2?'F6F2EF':'FFFFFF'}}},
@@ -2072,19 +2127,32 @@ async function exportPpt(){
 // ---------- Customer Analysis ----------
     try {
 
-    let s4 = pptx.addSlide();
-    s4.addText('Customer Analysis', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-    s4.addText('Top seller / Most OOS "vel" = avg units/day per store', { x:0.5, y:0.85, w:12, h:0.3, fontSize:10, italic:true, color:SOFT });
-    const custHeader = ['Customer','Branches','SFR%','SOS%','Stock','Days Cover','Top Seller (vel/store/d)','Most OOS','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-    const custRows = [custHeader];
-    customers.slice(0,10).forEach((c,i)=>{
-      const fillC = i%2?'F6F2EF':'FFFFFF';
-      custRows.push([c.name, String(c.branchCount), fmt(c.avgSfr), fmt(c.avgSos), fmt(c.totalStock), fmtCoverage(c.avgCoverageDays), `${c.topSkuName} (${fmt(c.topSkuVel,1)})`, c.oosSkuName, fmt(c.priceOkPct)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-    });
+    const custHeader = ['Customer','Branches','SUC%','SOS%','Stock','Days Cover','Top Seller (vel/store/d)','Most OOS','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+    const sortedCustomers = [...customers].sort((a,b)=>b.branchCount-a.branchCount);
+    const CUST_PER_PAGE = 18;
+    const custPages = [];
+    for(let i=0; i<sortedCustomers.length; i+=CUST_PER_PAGE) custPages.push(sortedCustomers.slice(i, i+CUST_PER_PAGE));
+    if(custPages.length===0) custPages.push([]);
     const totalStockAll = customers.reduce((s,c)=>s+c.totalStock,0);
-    custRows.push(['GRAND TOTAL','','','',fmt(totalStockAll),'','','',''].map(v=>({text:String(v), options:{bold:true, fill:{color:'FBEAEA'}}})));
-    s4.addTable(custRows, { x:0.5, y:1.2, w:12.3, fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.38 });
-    footer(s4, 'Customer Analysis');
+    custPages.forEach((page, pageIdx)=>{
+     try{
+      let s4 = pptx.addSlide();
+      s4.addText(custPages.length>1 ? `Customer Analysis (${pageIdx+1}/${custPages.length})` : 'Customer Analysis', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+      s4.addText(`${customers.length} customers network-wide · Top seller / Most OOS "vel" = avg units/day per store`, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10, italic:true, color:SOFT });
+      const custRows = [custHeader];
+      page.forEach((c,i)=>{
+       try{
+        const fillC = i%2?'F6F2EF':'FFFFFF';
+        custRows.push([c.name, String(c.branchCount), fmt(c.avgSfr), fmt(c.avgSos), fmt(c.totalStock), fmtCoverage(c.avgCoverageDays), `${c.topSkuName} (${fmt(c.topSkuVel,1)})`, c.oosSkuName, fmt(c.priceOkPct)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+       }catch(e){ console.error('Skipping customer row', c && c.name, e); }
+      });
+      if(pageIdx===custPages.length-1){
+        custRows.push(['GRAND TOTAL','','','',fmt(totalStockAll),'','','',''].map(v=>({text:String(v), options:{bold:true, fill:{color:'FBEAEA'}}})));
+      }
+      s4.addTable(custRows, { x:0.5, y:1.2, w:12.3, fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.38 });
+      footer(s4, 'Customer Analysis');
+     }catch(e){ console.error('Skipping Customer Analysis page', pageIdx, e); }
+    });
 
         } catch(e) { console.error('Customer Analysis slide failed', e); }
 // ---------- Category / SKU performance ----------
@@ -2107,6 +2175,31 @@ async function exportPpt(){
     footer(s5, 'SKU Performance');
 
         } catch(e) { console.error('Category / SKU performance slide failed', e); }
+// ---------- Best & Worst Performers ----------
+    try {
+
+    let s5b = pptx.addSlide();
+    s5b.addText('Best & Worst Performers', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+    s5b.addText('Network-wide, across every approved visit', { x:0.5, y:0.85, w:12, h:0.3, fontSize:11, italic:true, color:SOFT });
+    const bestByStoreVel = [...skuRows].filter(r=>r.avgVelPerStore>0).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore)[0];
+    const bestByNetworkVel = [...skuRows].filter(r=>r.totalVelNetwork>0).sort((a,b)=>b.totalVelNetwork-a.totalVelNetwork)[0];
+    const carried = skuRows.filter(r=>r.n>0);
+    const bestCoverage = [...carried].sort((a,b)=>b.coveragePct-a.coveragePct)[0];
+    const worstCoverage = [...carried].sort((a,b)=>a.coveragePct-b.coveragePct)[0];
+    const statCard = (x, y, w, h, label, skuName, skuCategory, bigValue, bigColor) => {
+      try{ s5b.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
+      s5b.addText(label, { x:x+0.25, y:y+0.15, w:w-0.5, h:0.3, fontSize:11, bold:true, color:SOFT });
+      s5b.addText(bigValue, { x:x+0.25, y:y+0.45, w:w-0.5, h:0.7, fontSize:32, bold:true, color:bigColor });
+      s5b.addText(skuName||'—', { x:x+0.25, y:y+1.15, w:w-0.5, h:0.35, fontSize:13, bold:true, color:DARK });
+      s5b.addText(skuCategory||'', { x:x+0.25, y:y+1.48, w:w-0.5, h:0.3, fontSize:10, color:SOFT });
+    };
+    statCard(0.5, 1.3, 5.95, 2.0, 'BEST SELLER — PER STORE/DAY', bestByStoreVel?.name, bestByStoreVel?.category, bestByStoreVel?fmt(bestByStoreVel.avgVelPerStore,1)+' units/store/d':'—', GREEN);
+    statCard(6.75, 1.3, 5.95, 2.0, 'BEST SELLER — TOTAL NETWORK VOLUME', bestByNetworkVel?.name, bestByNetworkVel?.category, bestByNetworkVel?fmt(bestByNetworkVel.totalVelNetwork,0)+' units/day': '—', GREEN);
+    statCard(0.5, 3.55, 5.95, 2.0, 'BEST COVERAGE — MOST STORES CARRYING IT', bestCoverage?.name, bestCoverage?.category, bestCoverage?fmt(bestCoverage.coveragePct)+'%':'—', GREEN);
+    statCard(6.75, 3.55, 5.95, 2.0, 'LEAST COVERAGE — FEWEST STORES CARRYING IT', worstCoverage?.name, worstCoverage?.category, worstCoverage?fmt(worstCoverage.coveragePct)+'%':'—', RED);
+    footer(s5b, 'Best & Worst Performers');
+
+        } catch(e) { console.error('Best & Worst Performers slide failed', e); }
 // ---------- Opportunities & Threats ----------
     try {
 
@@ -2129,29 +2222,63 @@ async function exportPpt(){
     footer(s6, 'Opportunities & Threats');
 
         } catch(e) { console.error('Opportunities & Threats slide failed', e); }
+// ---------- Branches Needing Attention (every flagged branch, network-wide) ----------
+    try {
+
+    const custOpps = computeCustomerOpportunities(approved);
+    const branchIssueRows = [];
+    custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchIssueRows.push({ customer:c.name, branch:b.branch, issues:b.issues.map(i=>i.text) }); }); });
+    const ATT_PER_PAGE = 8;
+    const attPages = [];
+    for(let i=0; i<branchIssueRows.length; i+=ATT_PER_PAGE) attPages.push(branchIssueRows.slice(i, i+ATT_PER_PAGE));
+    if(attPages.length===0) attPages.push([]);
+    attPages.forEach((page, pageIdx)=>{
+     try{
+      let s6b = pptx.addSlide();
+      s6b.addText(attPages.length>1 ? `Branches Needing Attention (${pageIdx+1}/${attPages.length})` : 'Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+      s6b.addText(`${branchIssueRows.length} branch(es) flagged network-wide — low/high stock, weak SOS or SUC, price compliance, cross-branch gaps.`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
+      if(page.length===0){
+        s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
+      } else {
+        const attHeader = ['Customer','Branch','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+        const attRows = [attHeader];
+        page.forEach((r,i)=>{
+          const fillC = i%2?'F6F2EF':'FFFFFF';
+          attRows.push([r.customer, r.branch, r.issues.map(t=>'• '+t).join('\n')].map(v=>({text:String(v), options:{fill:{color:fillC}, valign:'top'}})));
+        });
+        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.6,1.8,7.9], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, valign:'top' });
+      }
+      footer(s6b, 'Branches Needing Attention');
+     }catch(e){ console.error('Skipping Branches Needing Attention page', pageIdx, e); }
+    });
+
+        } catch(e) { console.error('Branches Needing Attention slide failed', e); }
 // ---------- Pricing vs RSP ----------
     try {
 
     let s7 = pptx.addSlide();
-    s7.addText('Pricing vs RSP', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-    const priceIssues = skuRows.filter(r=>r.priceOkPct < 80 && r.priceN > 0).sort((a,b)=>a.priceOkPct-b.priceOkPct);
+    s7.addText('Priced Above RSP', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+    s7.addText('Overpricing can be why a SKU isn\'t selling — this list is every SKU checked, not just top sellers.', { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
+    const aboveCount = skuRows.reduce((s,r)=>s+r.priceAbove,0);
+    const notAboveCount = skuRows.reduce((s,r)=>s+(r.priceN-r.priceAbove),0);
+    const aboveIssues = skuRows.filter(r=>r.aboveRspPct > 0 && r.priceN > 0).sort((a,b)=>b.aboveRspPct-a.aboveRspPct);
     try{
       s7.addChart(pptx.ChartType.doughnut, [{
-        name:'Price status', labels:['Matching RSP','Not matching RSP'], values:[priceOnCount, Math.max(0,priceOffCount)],
-      }], { x:0.5, y:1.0, w:5.5, h:4.0, chartColors:[GREEN, RED], showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', title:'Network Price Compliance', titleFontSize:12, titleColor:DARK });
+        name:'Price status', labels:['Priced Above RSP','At or Below RSP'], values:[aboveCount, Math.max(0,notAboveCount)],
+      }], { x:0.5, y:1.3, w:5.5, h:3.8, chartColors:[RED, GREEN], showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', title:'Network — Checks Priced Above RSP', titleFontSize:12, titleColor:DARK });
     }catch(e){ console.error('price doughnut failed', e); }
-    if(priceIssues.length===0){
-      s7.addText('No major pricing compliance issues detected.', { x:6.3, y:1.5, w:6.5, h:0.5, fontSize:13, color:SOFT });
+    if(aboveIssues.length===0){
+      s7.addText('No SKUs are being priced above RSP right now.', { x:6.3, y:1.5, w:6.5, h:0.5, fontSize:13, color:SOFT });
     } else {
-      const priceHeader = ['SKU','Category','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+      const priceHeader = ['SKU','Category','% checks above RSP','Vel/store/d'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
       const priceTable = [priceHeader];
-      priceIssues.slice(0,10).forEach((r,i)=>{
+      aboveIssues.slice(0,12).forEach((r,i)=>{
         const fillC = i%2?'F6F2EF':'FFFFFF';
-        priceTable.push([r.name, r.category, fmt(r.priceOkPct)+'%'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+        priceTable.push([r.name, r.category, fmt(r.aboveRspPct)+'%', r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
       });
-      s7.addTable(priceTable, { x:6.3, y:1.0, w:6.5, fontSize:11, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.4 });
+      s7.addTable(priceTable, { x:6.3, y:1.3, w:6.5, fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.36 });
     }
-    footer(s7, 'Pricing vs RSP');
+    footer(s7, 'Priced Above RSP');
 
         } catch(e) { console.error('Pricing vs RSP slide failed', e); }
 // ---------- Per-account insights & recommendations (top 8 by visit volume) ----------
@@ -2159,9 +2286,9 @@ async function exportPpt(){
 
     function generateAccountInsights(c, opps){
       const out = [];
-      if(c.avgSfr < 70) out.push(`Shelf fill is low at ${fmt(c.avgSfr)}% — recommend a facing audit vs the planogram to close the gap.`);
-      else if(c.avgSfr >= 90) out.push(`Shelf fill is strong at ${fmt(c.avgSfr)}% — maintain the current replenishment cadence.`);
-      else out.push(`Shelf fill is moderate at ${fmt(c.avgSfr)}% — room to tighten replenishment consistency.`);
+      if(c.avgSfr < 70) out.push(`Shelf utilization is low at ${fmt(c.avgSfr)}% — recommend a facing audit vs the planogram to close the gap.`);
+      else if(c.avgSfr >= 90) out.push(`Shelf utilization is strong at ${fmt(c.avgSfr)}% — maintain the current replenishment cadence.`);
+      else out.push(`Shelf utilization is moderate at ${fmt(c.avgSfr)}% — room to tighten replenishment consistency.`);
       if(c.avgSos < 20) out.push(`Share of shelf is only ${fmt(c.avgSos)}% — worth negotiating additional facings with the category buyer.`);
       else out.push(`Share of shelf holds at ${fmt(c.avgSos)}% — monitor competitor activity to defend this position.`);
       if(c.topSkuName!=='—') out.push(`${c.topSkuName} is the strongest seller here at ${fmt(c.topSkuVel,1)} units/store/day — consider expanding its facing allocation.`);
@@ -2173,12 +2300,13 @@ async function exportPpt(){
       if(myOpp) out.push(`${myOpp.sku} underperforms here vs ${myOpp.benchmarkBranch} — potential to recover ~${fmt(myOpp.gap,1)} units/day with a distribution or facing fix.`);
       return out.slice(0,6);
     }
-    const topAccountsForInsights = [...customers].sort((a,b)=>b.branchCount-a.branchCount).slice(0,8);
+    const topAccountsForInsights = [...customers].sort((a,b)=>b.branchCount-a.branchCount).slice(0,25);
     topAccountsForInsights.forEach(c=>{
+     try{
       const insights = generateAccountInsights(c, opps);
       let sa = pptx.addSlide();
       sa.addText(c.name, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
-      sa.addText(`${c.branchCount} branch(es) · SFR ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}% — Insights & Recommendations`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:12, color:SOFT });
+      sa.addText(`${c.branchCount} branch(es) · SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}% — Insights & Recommendations`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:12, color:SOFT });
       let y = 1.3;
       insights.forEach((ins,idx)=>{
         s_num_bg(sa, 0.5, y, 12.3, 0.5);
@@ -2186,23 +2314,27 @@ async function exportPpt(){
         sa.addText(ins, { x:1.15, y:y+0.04, w:11.4, h:0.42, fontSize:10.5, color:DARK, valign:'middle' });
         y += 0.56;
       });
-      // Top sellers for this customer — fixed position (safe below the worst case of 6 insights above),
-      // so reps can act on pricing immediately without digging further.
-      const topSellers = c.skuList.filter(s=>s.avgVelPerStore>0).slice(0,4);
-      if(topSellers.length){
-        const ty = 4.9;
-        sa.addText('Top Sellers — Act Now', { x:0.5, y:ty, w:12.3, h:0.32, fontSize:13, bold:true, color:RED });
-        const sellerHeader = ['SKU','Vel/store/d','Actual Price','RSP','Status'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+      // Priced above RSP at THIS customer — fixed position (safe below the worst case of 6 insights above).
+      // Matching/Below rows are deliberately excluded — the only actionable pricing issue here is overpricing.
+      const aboveHere = c.skuList
+        .filter(s=>s.rsp>0 && s.actualPrice>0 && ((s.actualPrice-s.rsp)/s.rsp)*100 > 4)
+        .map(s=>({...s, diffPct: ((s.actualPrice-s.rsp)/s.rsp)*100}))
+        .sort((a,b)=>b.diffPct-a.diffPct).slice(0,4);
+      const ty = 4.9;
+      sa.addText('Priced Above RSP — Act Now', { x:0.5, y:ty, w:12.3, h:0.32, fontSize:13, bold:true, color:RED });
+      if(aboveHere.length){
+        const sellerHeader = ['SKU','Actual Price','RSP','% Above','Vel/store/d'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
         const sellerRows = [sellerHeader];
-        topSellers.forEach((s,i)=>{
+        aboveHere.forEach((s,i)=>{
           const fillC = i%2?'F6F2EF':'FFFFFF';
-          const priceDiffPct = s.rsp>0 ? ((s.actualPrice - s.rsp) / s.rsp) * 100 : 0;
-          const statusLbl = (s.rsp<=0 || s.actualPrice<=0) ? '—' : (Math.abs(priceDiffPct)<=4 ? 'Matching RSP' : (priceDiffPct>4 ? 'Above RSP' : 'Below RSP'));
-          sellerRows.push([s.name, fmt(s.avgVelPerStore,1), s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—', s.rsp?fmt(s.rsp)+' EGP':'—', statusLbl].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+          sellerRows.push([s.name, fmt(s.actualPrice)+' EGP', fmt(s.rsp)+' EGP', '+'+fmt(s.diffPct)+'%', s.avgVel>0?fmt(s.avgVel,1):'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
         });
         sa.addTable(sellerRows, { x:0.5, y:ty+0.35, w:12.3, fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.32 });
+      } else {
+        sa.addText('No SKUs priced above RSP at this customer right now.', { x:0.5, y:ty+0.35, w:12.3, h:0.4, fontSize:11, italic:true, color:SOFT });
       }
       footer(sa, c.name);
+     }catch(e){ console.error('Skipping per-account slide for', c && c.name, e); }
     });
     function s_num_bg(slide, x, y, w, h){
       try{ slide.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
@@ -2262,7 +2394,7 @@ async function exportExcel(){
           'Category Facings': it.catFacings, 'Shahd Facings': it.shahdFacings,
           'Actual Price (EGP)': it.actualPrice, 'RSP (EGP)': sku.rsp||'', 'Price Status': c.priceLbl,
           'Units Sold': fmt(c.unitsSold), 'Velocity (units/store/day)': fmt(c.velocity,2),
-          'SFR %': fmt(c.sfr,1), 'SOS %': fmt(c.sos,1), 'OSA': c.osa,
+          'SUC %': fmt(c.sfr,1), 'SOS %': fmt(c.sos,1), 'OSA': c.osa,
           'Stock Coverage (days)': isFinite(c.stockCoverage)?fmt(c.stockCoverage,1):'',
           'Days Since Last Visit': it.days,
           'Photos Captured': visitPhotos(v).length, 'Geo Lat': v.geo?v.geo.lat:'', 'Geo Lng': v.geo?v.geo.lng:'',
@@ -2301,7 +2433,7 @@ function screenTeam(){
   }).sort((a,b)=> (b.achieved/(b.target||1)) - (a.achieved/(a.target||1)));
   return `<div class="screen">
     <h1>Team / الفريق</h1>
-    <p class="lede">Visits, SOS/SFR, data completion &amp; verification per merchandiser.</p>
+    <p class="lede">Visits, SOS/SUC, data completion &amp; verification per merchandiser.</p>
     ${rows.map(r=>`
       <div class="card">
         <div class="visit-row" style="border:none;padding:0 0 8px">
@@ -2309,7 +2441,7 @@ function screenTeam(){
           <div style="font-weight:800;color:${r.target?barColor(r.achieved/r.target*100):'var(--ink-soft)'}">${r.achieved}${r.target?'/'+r.target:''}</div>
         </div>
         <div class="verify-row">
-          ${statusChip('neutral','SFR / تعبئة الرف '+fmt(r.avgSfr)+'%')}
+          ${statusChip('neutral','SUC / تعبئة الرف '+fmt(r.avgSfr)+'%')}
           ${statusChip('neutral','SOS / حصة الرف '+fmt(r.avgSos)+'%')}
           ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete / اكتمال')}
           ${statusChip(r.verifiedPct>=90?'on':'off', fmt(r.verifiedPct)+'% verified / موثق')}
@@ -2340,7 +2472,7 @@ function screenScorecard(){
   if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1><p class="lede">Weighted score by merchandiser.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
   return `<div class="screen">
     <h1>Scorecard / بطاقة الأداء</h1>
-    <p class="lede">Weighted score by merchandiser — SFR 25% · OSA 15% · Price 20% · SOS 15% · Visit compliance 15% · Data completion 10%.</p>
+    <p class="lede">Weighted score by merchandiser — SUC 25% · OSA 15% · Price 20% · SOS 15% · Visit compliance 15% · Data completion 10%.</p>
     ${rows.map((r,idx)=>`
       <div class="card">
         <div class="visit-row" style="border:none;padding:0 0 8px">
@@ -2349,7 +2481,7 @@ function screenScorecard(){
         </div>
         <div class="bar-track" style="margin-bottom:8px"><div class="bar-fill" style="width:${Math.min(100,r.score)}%;background:${barColor(r.score)}"></div></div>
         <div class="verify-row">
-          ${statusChip('neutral','SFR '+fmt(r.avgSfr)+'%')}
+          ${statusChip('neutral','SUC '+fmt(r.avgSfr)+'%')}
           ${statusChip('neutral','SOS '+fmt(r.avgSos)+'%')}
           ${statusChip('neutral','OSA '+fmt(r.osaPct)+'%')}
           ${statusChip(r.priceOkPct>=80?'on':'watch','Price '+fmt(r.priceOkPct)+'%')}
@@ -2429,8 +2561,8 @@ function editLineHtml(it, idx){
         <div><label>Actual shelf stock (closing)</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="editLineField(${idx},'closing',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="editLineField(${idx},'actualCapacity',this.value)" onblur="editLineFieldBlur()"/></div>
-        <div><label>POG Facings / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="editLineField(${idx},'pogFacings',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="editLineField(${idx},'actualCapacity',this.value)" onblur="editLineFieldBlur()"/>${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing})</p>` : ''}</div>
+        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="editLineField(${idx},'pogFacings',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
         <div><label>Shahd facings</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="editLineField(${idx},'shahdFacings',this.value)" onblur="editLineFieldBlur()"/></div>
@@ -2475,7 +2607,7 @@ function initStoreMap(){
   entries.forEach(([accountId, loc])=>{
     const safeId = accountId.replace(/'/g,"\\'");
     const safeBranch = (loc.branch||'').replace(/'/g,"\\'");
-    L.circleMarker([loc.lat, loc.lng], { radius:7, color:'#C0272D', weight:2, fillColor:'#C0272D', fillOpacity:0.75 })
+    L.circleMarker([loc.lat, loc.lng], { radius:11, color:'#C0272D', weight:2.5, fillColor:'#C0272D', fillOpacity:0.75 })
       .addTo(storeMapInstance)
       .bindPopup(`<b>${loc.accountName||''}</b><br>${loc.branch||''}${loc.accuracy?`<br><span style="color:#6B615E;font-size:11px">±${Math.round(loc.accuracy)}m accuracy</span>`:''}<br><button onclick="openBranchDetail('${safeId}','${safeBranch}')" style="margin-top:6px;background:#C0272D;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:12px;font-weight:700;cursor:pointer">View details →</button>`);
   });
@@ -2501,18 +2633,18 @@ function screenBranchDetail(){
   return `<div class="screen">
     <button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="go('storemap')">← Back to map</button>
     <h1>${loc.accountName}</h1>
-    <p class="lede">${loc.branch}${loc.accuracy?` · located to within ±${Math.round(loc.accuracy)}m`:''}</p>
+    <p class="lede">${loc.branch}${loc.accuracy?` · located to within ±${Math.round(loc.accuracy)}m`:''}${branchRow && branchRow.lastVisitDate?` · Last visited: ${branchRow.lastVisitDate}`:''}</p>
     ${!branchRow ? emptyState('📊','No approved visit data yet','This branch is located on the map, but has no approved visits to show performance data from yet.') : `
       <div class="kpi-grid">
-        <div class="kpi accent"><div class="num">${fmt(branchRow.sfr)}%</div><div class="lbl">SFR</div></div>
+        <div class="kpi accent"><div class="num">${fmt(branchRow.sfr)}%</div><div class="lbl">SUC</div></div>
         <div class="kpi"><div class="num">${fmt(branchRow.sos)}%</div><div class="lbl">SOS</div></div>
         <div class="kpi"><div class="num">${fmt(branchRow.osaPct)}%</div><div class="lbl">OSA</div></div>
         <div class="kpi"><div class="num">${fmt(branchRow.priceOkPct)}%</div><div class="lbl">Price OK</div></div>
       </div>
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (facings)</th><th>Full Shelf Utilization (Units)</th><th>Shelf Utilization Capacity%</th><th>Days cover</th></tr>
+          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
         </table></div>
       </div>
     `}
@@ -2552,6 +2684,23 @@ function screenSkus(){
         ${confident.length ? `<button class="btn btn-primary btn-sm" style="margin-bottom:10px" onclick="applyAllPriceFixes()">Fix ${confident.length} automatically (÷100)</button>` : ''}
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>SKU</th><th>Was</th><th>RSP</th><th>→ Fix</th><th></th></tr>
         ${cands.slice(0,40).map((c,i)=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td>${c.original}</td><td>${c.rsp||'—'}</td><td>${c.confident?`<span style="color:var(--green);font-weight:700">${c.corrected}</span>`:`<span style="color:var(--red);font-weight:700">Needs review</span>`}</td><td>${c.confident?`<button class="btn btn-ghost btn-sm" onclick="applyOnePriceFix(${i})">Fix</button>`:`<button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button>`}</td></tr>`).join('')}
+        </table></div>
+        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
+      `; })()}
+    </div>
+    <div class="sectitle">Fix impossible capacity / تصحيح الكمية المستحيلة</div>
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Facings filled exceed closing stock</h3>
+      ${(() => {
+        const cands = findSuspiciousCapacity();
+        const mixups = cands.filter(c=>c.looksLikeFieldMixup);
+        if(cands.length===0) return `<p class="hint">No capacity issues detected right now.</p>`;
+        return `
+        <p class="hint" style="margin-bottom:10px">${cands.length} record${cands.length===1?'':'s'} found where the actual capacity filled is higher than the closing stock — that's not possible, since a facing can't be filled with stock that isn't there.</p>
+        ${mixups.length ? `<p class="hint" style="margin-bottom:10px;color:var(--red);font-weight:700">⚠️ ${mixups.length} of these have Actual Capacity set to EXACTLY the Full Shelf Utilization target — a strong sign the merchandiser typed that number into the wrong field, rather than what was actually filled. Worth a manual look rather than auto-fixing, since the real capacity for that visit is unknown.</p>` : ''}
+        <button class="btn btn-primary btn-sm" style="margin-bottom:10px" onclick="applyAllCapacityFixes()">Fix all ${cands.length} automatically (cap to closing stock)</button>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>SKU</th><th>Capacity</th><th>Closing stock</th><th>Flag</th><th>→ Fix</th><th></th></tr>
+        ${cands.slice(0,40).map((c,i)=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td>${fmt(c.capacity)}</td><td>${fmt(c.closing)}</td><td>${c.looksLikeFieldMixup?`<span style="color:var(--red);font-weight:700">⚠️ Matches full utilization (${fmt(c.pog)})</span>`:'—'}</td><td><span style="color:var(--green);font-weight:700">${fmt(c.closing)}</span></td><td><button class="btn btn-ghost btn-sm" onclick="applyOneCapacityFix(${i})">Fix</button> <button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
         </table></div>
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
@@ -2615,7 +2764,7 @@ function rejectPrompt(id){ const note = prompt('Reason for rejection (optional):
 function openVisit(id){
   const v = State.visits.find(v=>v.id===id); if(!v) return;
   const agg = visitAggregate(v);
-  alert(`${v.accountName} · ${v.branch}\n${v.date} · ${v.auditor}\nStatus: ${v.status}\n\nAvg SFR ${fmt(agg.avgSfr)}% · Avg SOS ${fmt(agg.avgSos)}%\nOSA ${fmt(agg.osaPct)}% · Price OK ${fmt(agg.priceOkPct)}%\nData complete ${fmt(agg.visitDonePct)}%` + (v.reviewNote ? `\nNote: ${v.reviewNote}` : ''));
+  alert(`${v.accountName} · ${v.branch}\n${v.date} · ${v.auditor}\nStatus: ${v.status}\n\nAvg SUC ${fmt(agg.avgSfr)}% · Avg SOS ${fmt(agg.avgSos)}%\nOSA ${fmt(agg.osaPct)}% · Price OK ${fmt(agg.priceOkPct)}%\nData complete ${fmt(agg.visitDonePct)}%` + (v.reviewNote ? `\nNote: ${v.reviewNote}` : ''));
 }
 function skuField(idx,field,val){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus[idx][field] = val; saveSkus(); }
 function addSku(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.push({id:'sku_'+uid(), name:'New SKU', category:'', rsp:0}); saveSkus(); render(); }
@@ -2661,18 +2810,30 @@ function render(){
 
   const conf = roleConf();
   let body = '';
-  if(State.tab==='newvisit') body = screenNewVisit();
-  else if(State.tab==='myvisits') body = screenMyVisits();
-  else if(State.tab==='approvals') body = screenApprovals();
-  else if(State.tab==='dashboard') body = screenDashboard();
-  else if(State.tab==='team') body = screenTeam();
-  else if(State.tab==='scorecard') body = screenScorecard();
-  else if(State.tab==='skus') body = screenSkus();
-  else if(State.tab==='allvisits') body = screenAllVisits();
-  else if(State.tab==='storemap') body = screenStoreMap();
-  else if(State.tab==='branchdetail') body = screenBranchDetail();
-  else if(State.tab==='editvisit') body = screenEditVisit();
-  else body = screenHome();
+  try{
+    if(State.tab==='newvisit') body = screenNewVisit();
+    else if(State.tab==='myvisits') body = screenMyVisits();
+    else if(State.tab==='approvals') body = screenApprovals();
+    else if(State.tab==='dashboard') body = screenDashboard();
+    else if(State.tab==='team') body = screenTeam();
+    else if(State.tab==='scorecard') body = screenScorecard();
+    else if(State.tab==='skus') body = screenSkus();
+    else if(State.tab==='allvisits') body = screenAllVisits();
+    else if(State.tab==='storemap') body = screenStoreMap();
+    else if(State.tab==='branchdetail') body = screenBranchDetail();
+    else if(State.tab==='editvisit') body = screenEditVisit();
+    else body = screenHome();
+  }catch(e){
+    console.error('Screen render failed for tab', State.tab, e);
+    body = `<div class="screen">
+      <h1>Something went wrong loading this screen</h1>
+      <p class="lede">This usually means one visit record has an unexpected value. Nothing else is affected — try another tab, or use "All Visits" to find and fix the record.</p>
+      <div class="card" style="border-color:var(--red)">
+        <p class="hint" style="font-family:monospace;white-space:pre-wrap;word-break:break-all">${(e && e.message ? e.message : String(e))}</p>
+      </div>
+      <button class="btn btn-ghost" onclick="go('home')">← Back to home</button>
+    </div>`;
+  }
 
   const showContextPill = conf.contexts.length > 1;
   app.innerHTML = `
@@ -2706,7 +2867,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix
 });
 
 /* ============================= INIT ============================= */
