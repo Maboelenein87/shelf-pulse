@@ -96,6 +96,16 @@
   .badge-dot{position:absolute;top:2px;right:18%;background:var(--red);color:#fff;font-size:9px;font-weight:800;min-width:15px;height:15px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px;}
   .navbtn-wrap{position:relative;flex:1;display:flex;}
   .toast{position:fixed;bottom:92px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:11px 18px;border-radius:30px;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.25);z-index:50;max-width:88%;text-align:center;}
+  .cam-overlay{position:fixed;inset:0;background:#000;z-index:200;display:flex;flex-direction:column;}
+  .cam-video-wrap{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#000;}
+  .cam-video-wrap video, .cam-video-wrap img{width:100%;height:100%;object-fit:cover;}
+  .cam-controls{padding:22px 20px calc(22px + env(safe-area-inset-bottom));display:flex;align-items:center;justify-content:center;gap:28px;background:#000;}
+  .cam-shutter{width:70px;height:70px;border-radius:50%;background:#fff;border:4px solid rgba(255,255,255,.4);cursor:pointer;}
+  .cam-shutter:active{background:#ddd;}
+  .cam-side-btn{background:rgba(255,255,255,.15);color:#fff;border:none;border-radius:24px;padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;}
+  .cam-top-bar{position:absolute;top:0;left:0;right:0;padding:14px 16px;padding-top:calc(14px + env(safe-area-inset-top));display:flex;justify-content:space-between;align-items:center;z-index:2;}
+  .cam-close-btn{background:rgba(0,0,0,.5);color:#fff;border:none;border-radius:50%;width:38px;height:38px;font-size:18px;cursor:pointer;}
+  .cam-hint{color:#fff;background:rgba(0,0,0,.5);padding:6px 14px;border-radius:16px;font-size:12px;}
   .loading{text-align:center;padding:40px;color:var(--ink-soft);font-size:13px;}
   .sectitle{font-size:11px;font-weight:800;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.4px;margin:16px 0 8px 2px;}
   .sectitle:first-child{margin-top:0;}
@@ -1024,6 +1034,7 @@ const State = {
   role: null, name: '', tab: 'home', navContext: 'field',
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
+  cameraOpen: false, cameraStream: null, cameraPreview: null,
   draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'' },
   toast: null,
   accountSearch: '',
@@ -1270,20 +1281,91 @@ function showToast(msg){ State.toast = msg; if(!isTypingNow()) render(); setTime
 
 /* ============================= PHOTO + GEO CAPTURE (multi-photo, 1-10) ============================= */
 const MAX_PHOTOS = 10;
-function capturePhoto(){
+async function capturePhoto(){
   if((State.draft.photos||[]).length >= MAX_PHOTOS){ showToast(`Max ${MAX_PHOTOS} photos per visit`); return; }
+  // Capture entirely in-page via the camera stream — this never hands off to the phone's native
+  // camera app, so nothing gets saved to the phone's own photo gallery or eats into device storage.
+  if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      State.cameraStream = stream;
+      State.cameraPreview = null;
+      State.cameraOpen = true;
+      render();
+      return;
+    }catch(e){
+      console.error('in-page camera unavailable, falling back to native picker', e);
+      // fall through to the file-input fallback below
+    }
+  }
+  capturePhotoFallback();
+}
+function capturePhotoFallback(){
   const inp = document.createElement('input');
   inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment';
   inp.onchange = async () => {
     const file = inp.files[0]; if(!file) return;
     showToast('Processing photo…');
     const dataUrl = await compressImage(file, 640, 0.55);
-    State.draft.photos = State.draft.photos || [];
-    State.draft.photos.push(dataUrl);
-    State.draft.capturedAt = State.draft.capturedAt || Date.now();
-    if(!State.draft.geo) captureGeo(); else { saveDraftLocal(); render(); }
+    addCapturedPhoto(dataUrl);
   };
   inp.click();
+}
+function addCapturedPhoto(dataUrl){
+  State.draft.photos = State.draft.photos || [];
+  State.draft.photos.push(dataUrl);
+  State.draft.capturedAt = State.draft.capturedAt || Date.now();
+  if(!State.draft.geo) captureGeo(); else { saveDraftLocal(); render(); }
+}
+function attachCameraStream(){
+  const video = document.getElementById('cam-live-video');
+  if(video && State.cameraStream && !State.cameraPreview){ video.srcObject = State.cameraStream; video.play().catch(()=>{}); }
+}
+function snapPhoto(){
+  const video = document.getElementById('cam-live-video');
+  if(!video || !video.videoWidth){ showToast('Camera still starting — try again in a second'); return; }
+  const maxDim = 640;
+  let w = video.videoWidth, h = video.videoHeight;
+  if(w > h && w > maxDim){ h = h*(maxDim/w); w = maxDim; }
+  else if(h > maxDim){ w = w*(maxDim/h); h = maxDim; }
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+  State.cameraPreview = canvas.toDataURL('image/jpeg', 0.55);
+  render();
+}
+function retakePhoto(){ State.cameraPreview = null; render(); }
+function confirmCameraPhoto(){
+  if(!State.cameraPreview) return;
+  addCapturedPhoto(State.cameraPreview);
+  closeCamera();
+}
+function closeCamera(){
+  if(State.cameraStream){ try{ State.cameraStream.getTracks().forEach(t=>t.stop()); }catch(e){} }
+  State.cameraStream = null;
+  State.cameraPreview = null;
+  State.cameraOpen = false;
+  render();
+}
+function cameraOverlayHtml(){
+  return `<div class="cam-overlay">
+    <div class="cam-top-bar">
+      <button class="cam-close-btn" onclick="closeCamera()">✕</button>
+      <span class="cam-hint">${State.cameraPreview ? 'Review photo / مراجعة الصورة' : 'Line up the shelf / صوّر الرف'}</span>
+      <span style="width:38px"></span>
+    </div>
+    <div class="cam-video-wrap">
+      ${State.cameraPreview
+        ? `<img src="${State.cameraPreview}"/>`
+        : `<video id="cam-live-video" autoplay playsinline muted></video>`}
+    </div>
+    <div class="cam-controls">
+      ${State.cameraPreview
+        ? `<button class="cam-side-btn" onclick="retakePhoto()">↺ Retake</button>
+           <button class="cam-side-btn" style="background:var(--red)" onclick="confirmCameraPhoto()">✓ Use photo</button>`
+        : `<div class="cam-shutter" onclick="snapPhoto()"></div>`}
+    </div>
+  </div>`;
 }
 function compressImage(file, maxDim, quality){
   return new Promise((resolve)=>{
@@ -2857,8 +2939,10 @@ function render(){
     ${body}
     ${navHtml()}
     ${State.toast ? `<div class="toast">${State.toast}</div>` : ''}
+    ${State.cameraOpen ? cameraOverlayHtml() : ''}
   `;
   if(State.tab==='storemap') setTimeout(initStoreMap, 0); // must run after the container div above is actually in the DOM
+  if(State.cameraOpen) setTimeout(attachCameraStream, 0); // re-bind the live stream to the freshly-created <video> element
 }
 
 /* ============================= EXPOSE HANDLERS ============================= */
@@ -2867,7 +2951,8 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto
 });
 
 /* ============================= INIT ============================= */
