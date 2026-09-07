@@ -893,6 +893,24 @@ async function visitUpdate(id, patch){
   const { doc, updateDoc } = firestoreFns;
   await updateDoc(doc(db, 'visits', id), patch);
 }
+function watchDelegations(){
+  if(!isConfigured) return;
+  const { collection, onSnapshot } = firestoreFns;
+  onSnapshot(collection(db, 'delegations'), snap => {
+    const delegations = [];
+    snap.forEach(d => delegations.push({ id: d.id, ...d.data() }));
+    State.delegations = delegations;
+    if(!isTypingNow()) render();
+  });
+}
+async function delegationCreate(rec){
+  const { doc, setDoc } = firestoreFns;
+  await setDoc(doc(db, 'delegations', rec.id), rec);
+}
+async function delegationDelete(id){
+  const { doc, deleteDoc } = firestoreFns;
+  await deleteDoc(doc(db, 'delegations', id));
+}
 /* ============================= DATA CORRECTION TOOLS (decimal-error detection + fixing) ============================= */
 const MAX_PLAUSIBLE_PRICE = 600; // business rule: no Shahd pack costs anywhere near this — anything above is a data-entry error
 function findSuspiciousPrices(){
@@ -1016,7 +1034,7 @@ const SUPERVISOR_PASSWORDS = {
 const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4568", "4569", "4570", "4632", "4807", "4808", "4854", "4876", "5109", "5461", "5472", "5486", "5600", "5605", "5614", "5662", "5693", "5715", "5716", "5799", "5813", "5834", "5882", "5900", "5923", "5985", "5996", "6003", "6070", "6102", "6115", "6130", "6152", "6213", "6246", "6259", "6276", "6356", "6388", "6396", "6608", "6618", "6739", "6848", "6856", "6881", "6896", "6949", "6966", "7025", "7073", "7159", "7176", "7215", "7216", "7217", "7252", "7254", "7255", "7262", "7301", "7316"]);
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
-  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','team','scorecard'] },
+  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','team','scorecard','allvisits','delegate'] },
   merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard','allvisits','storemap'] },
   trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard','allvisits','storemap'] },
   commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard','storemap'] },
@@ -1042,6 +1060,7 @@ const State = {
   expandedCategory: null, expandedBranch: null,
   loginRole: null, loginPassword: '', loginError: '', pendingMerchName: null, submitting: false,
   editingVisitId: null, editDraft: null, visitSearch: '',
+  delegateSearch: '', delegateSelected: new Set(), delegateTarget: '', delegateDate: todayStr(), delegations: [],
 };
 function todayStr(){ return new Date().toISOString().slice(0,10); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -1135,6 +1154,7 @@ async function loadAll(){
 
   await loadLocations();
   watchVisits();
+  watchDelegations();
   State.loaded = true;
   if(hasSavedSession) restoreDraftIfAny();
 }
@@ -1632,7 +1652,12 @@ function screenNewVisit(){
   </div>`;
 }
 function myAccounts(){
-  if(State.role==='merchandiser') return State.accounts.filter(a=>(a.merch||'').trim()===State.name.trim());
+  if(State.role==='merchandiser'){
+    const own = State.accounts.filter(a=>(a.merch||'').trim()===State.name.trim());
+    const delegatedIds = new Set(State.delegations.filter(x=>x.toMerch===State.name && x.date===State.draft.date).map(x=>x.accountId));
+    const delegated = State.accounts.filter(a=>delegatedIds.has(a.id) && (a.merch||'').trim()!==State.name.trim());
+    return [...own, ...delegated];
+  }
   return State.accounts;
 }
 function accountResultsHtml(){
@@ -1642,7 +1667,7 @@ function accountResultsHtml(){
   if(results.length===0) return `<p class="hint">No matches — try a different spelling.</p>`;
   return `<div style="margin-top:8px">${results.map(a=>`
     <div class="search-result" onclick="pickAccount('${a.id}')">
-      <div><div class="sr-main">${a.name}</div><div class="sr-sub">${a.branch} · ${a.region}</div></div>
+      <div><div class="sr-main">${a.name}${State.role==='merchandiser' && (a.merch||'').trim()!==State.name.trim()?' <span class="hint" style="text-transform:none">(delegated to you today)</span>':''}</div><div class="sr-sub">${a.branch} · ${a.region}</div></div>
       <div class="sr-sub">${a.target||0} visits/wk</div>
     </div>`).join('')}</div>`;
 }
@@ -1651,7 +1676,7 @@ function accountSearchAreaHtml(){
   return `<p class="hint">Type at least 2 letters to search, or pick from the full list:</p>
     <select onchange="if(this.value)pickAccount(this.value)">
       <option value="">Browse all ${myAccounts().length} accounts…</option>
-      ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}</option>`).join('')}
+      ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}${State.role==='merchandiser' && (a.merch||'').trim()!==State.name.trim()?' (delegated)':''}</option>`).join('')}
     </select>`;
 }
 function skuLineHtml(it, idx){
@@ -2576,7 +2601,9 @@ function screenScorecard(){
 /* ---- All Visits (browse + edit, control roles only) ---- */
 function visitListResultsHtml(){
   const q = State.visitSearch.toLowerCase();
-  const list = State.visits.filter(v => !q || (v.accountName+' '+v.branch+' '+v.auditor).toLowerCase().includes(q));
+  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
+  const pool = mySet ? State.visits.filter(v=>mySet.has(v.auditor)) : State.visits;
+  const list = pool.filter(v => !q || (v.accountName+' '+v.branch+' '+v.auditor).toLowerCase().includes(q));
   return `${list.slice(0,60).map(v=>{
       const agg = visitAggregate(v);
       return `<div class="card" style="padding:12px 14px">
@@ -2593,9 +2620,11 @@ function visitListResultsHtml(){
     ${list.length>60 ? `<p class="hint">Showing first 60 of ${list.length} matches — search to narrow down.</p>` : ''}`;
 }
 function screenAllVisits(){
+  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
+  const scopedCount = mySet ? State.visits.filter(v=>mySet.has(v.auditor)).length : State.visits.length;
   return `<div class="screen">
     <h1>All visits / كل الزيارات</h1>
-    <p class="lede">Browse and correct any submitted visit — ${State.visits.length} total.</p>
+    <p class="lede">${mySet ? 'Browse and correct visits for your team' : 'Browse and correct any submitted visit'} — ${scopedCount} total.</p>
     <input type="text" placeholder="Search account, branch, or auditor…" value="${State.visitSearch}" oninput="onVisitSearch(this.value)" style="margin-bottom:12px"/>
     <div id="visit-search-results">${visitListResultsHtml()}</div>
   </div>`;
@@ -2604,6 +2633,112 @@ function onVisitSearch(v){
   State.visitSearch = v;
   const el = document.getElementById('visit-search-results');
   if(el) el.innerHTML = visitListResultsHtml(); // targeted update — leaves the input untouched
+}
+
+/* ---- Delegate (one-off: hand a specific store, on a specific date, to another merchandiser — coverage gaps / unavailability.
+   This never changes who owns the store — the original merchandiser keeps it in their route and target permanently.
+   Whoever actually submits the visit gets the credit (auditor = the submitter), so this is purely about letting
+   someone else's account show up in the delegate's account list for that one day. ---- */
+function supervisorTeamAccounts(){
+  if(State.role==='supervisor') return State.accounts.filter(a=>supervisorOfMerch(a.merch)===State.name);
+  return State.accounts;
+}
+function delegateSearchInput(v){
+  State.delegateSearch = v;
+  const el = document.getElementById('delegate-list');
+  if(el) el.innerHTML = delegateListHtml();
+}
+function delegateToggle(id){
+  if(State.delegateSelected.has(id)) State.delegateSelected.delete(id); else State.delegateSelected.add(id);
+  render();
+}
+function delegateSetTarget(v){ State.delegateTarget = v; }
+function delegateSetDate(v){ State.delegateDate = v; render(); }
+function delegationsForAccountDate(accountId, date){
+  return State.delegations.filter(x=>x.accountId===accountId && x.date===date);
+}
+async function delegateApply(){
+  if(!['supervisor','merch_head','trade_marketing'].includes(State.role)){ showToast('Not authorized'); return; }
+  if(!State.delegateTarget){ showToast('Choose a merchandiser to delegate to first'); return; }
+  if(!State.delegateDate){ showToast('Choose a date first'); return; }
+  const ids = [...State.delegateSelected];
+  if(!ids.length){ showToast('Select at least one store to delegate'); return; }
+  const accounts = ids.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
+  if(!confirm(`Delegate ${accounts.length} store(s) to ${State.delegateTarget} for ${State.delegateDate} only? The store${accounts.length>1?'s':''} stay${accounts.length>1?'':'s'} on the original merchandiser's route afterwards, and credit goes to whoever actually submits the visit.`)) return;
+  showToast('Delegating…');
+  try{
+    for(const a of accounts){
+      // Replace any existing delegation for this store+date rather than stacking duplicates.
+      for(const existing of delegationsForAccountDate(a.id, State.delegateDate)){ await delegationDelete(existing.id); }
+      await delegationCreate({
+        id: uid(), accountId: a.id, accountName: a.name, branch: a.branch,
+        date: State.delegateDate, toMerch: State.delegateTarget, fromMerch: a.merch||'',
+        createdBy: identityLabel(), createdAt: Date.now(),
+      });
+    }
+  }catch(e){ console.error(e); showToast('Failed to save — try again'); return; }
+  State.delegateSelected = new Set();
+  showToast('Delegated ✓');
+  render();
+}
+async function cancelDelegation(id){
+  if(!confirm('Cancel this delegation?')) return;
+  try{ await delegationDelete(id); showToast('Cancelled ✓'); }
+  catch(e){ console.error(e); showToast('Failed to cancel — try again'); }
+}
+function delegateListHtml(){
+  const q = (State.delegateSearch||'').toLowerCase();
+  const pool = supervisorTeamAccounts();
+  const list = pool.filter(a => !q || (a.name+' '+a.branch+' '+(a.merch||'')).toLowerCase().includes(q));
+  return `${list.slice(0,80).map(a=>{
+      const existing = delegationsForAccountDate(a.id, State.delegateDate);
+      return `<div class="card" style="padding:12px 14px;display:flex;align-items:center;gap:10px">
+      <input type="checkbox" ${State.delegateSelected.has(a.id)?'checked':''} onchange="delegateToggle('${a.id}')" style="width:18px;height:18px;flex-shrink:0"/>
+      <div style="flex:1">
+        <div class="visit-main">${a.name} · ${a.branch}</div>
+        <div class="hint">Regular merchandiser: ${a.merch||'—'}${a.sup?' · Sup: '+a.sup:''}${existing.length?` · already delegated to ${existing.map(x=>x.toMerch).join(', ')} on ${State.delegateDate}`:''}</div>
+      </div>
+    </div>`;
+    }).join('') || emptyState('📭','No stores found','')}
+    ${list.length>80 ? `<p class="hint">Showing first 80 of ${list.length} matches — search to narrow down.</p>` : ''}`;
+}
+function activeDelegationsHtml(){
+  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
+  const today = todayStr();
+  const list = State.delegations
+    .filter(x => x.date >= today) // hide ones that have already passed
+    .filter(x => !mySet || mySet.has(x.fromMerch) || mySet.has(x.toMerch))
+    .sort((a,b)=> a.date.localeCompare(b.date));
+  if(!list.length) return `<p class="hint">No upcoming or active one-off delegations.</p>`;
+  return list.map(x=>`
+    <div class="card" style="padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <div>
+        <div class="visit-main">${x.accountName} · ${x.branch}</div>
+        <div class="hint">${x.date} · ${x.fromMerch||'—'} → ${x.toMerch}</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="cancelDelegation('${x.id}')">✕ Cancel</button>
+    </div>`).join('');
+}
+function screenDelegate(){
+  const merchOptions = [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))].sort();
+  return `<div class="screen">
+    <h1>${bi('Delegate visits','نقل الزيارة لمنسق اخر')}</h1>
+    <p class="lede">One-off only — hand a specific store to another merchandiser for a single date, e.g. coverage gaps or when someone's unavailable. The store stays on its regular merchandiser's route and target afterwards; whoever actually submits the visit gets the credit.</p>
+    <div class="card" style="position:sticky;top:8px;z-index:1">
+      <label>Date / التاريخ</label>
+      <input type="date" value="${State.delegateDate}" oninput="delegateSetDate(this.value)"/>
+      <label style="margin-top:10px">${bi('Delegate selected stores to','نقل الزيارات المحددة الى')}</label>
+      <select onchange="delegateSetTarget(this.value)">
+        <option value="">— ${bi('Choose merchandiser','اختر المندوب')} —</option>
+        ${merchOptions.map(m=>`<option value="${m.replace(/"/g,'&quot;')}" ${State.delegateTarget===m?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="delegateApply()">${bi('Delegate selected stores','نقل المتاجر المحددة')} (${State.delegateSelected.size})</button>
+    </div>
+    <input type="text" placeholder="Search store, branch, or merchandiser…" value="${State.delegateSearch||''}" oninput="delegateSearchInput(this.value)" style="margin:12px 0"/>
+    <div id="delegate-list">${delegateListHtml()}</div>
+    <div class="sectitle">Upcoming / active delegations</div>
+    ${activeDelegationsHtml()}
+  </div>`;
 }
 
 /* ---- Edit Visit ---- */
@@ -2651,7 +2786,7 @@ function editLineHtml(it, idx){
         <div><label>Category facings</label><input type="number" inputmode="decimal" value="${it.catFacings}" oninput="editLineField(${idx},'catFacings',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf price (EGP) — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editLineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
+        <div><label>${bi('Shelf price (EGP)','مراقبة السعر')} — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editLineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
         <div><label>Days since last visit</label><input type="number" inputmode="decimal" value="${it.days}" oninput="editLineField(${idx},'days',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
     </div>` : ''}
@@ -2872,6 +3007,7 @@ function navHtml(){
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
     allvisits: {id:'allvisits', ico:'🗂', lbl:bi('All Visits','كل الزيارات')},
     storemap: {id:'storemap', ico:'🗺️', lbl:bi('Store Map','الخريطة')},
+    delegate: {id:'delegate', ico:'🔁', lbl:bi('Delegate','نقل الزيارة')},
   };
   const manageTabs = (conf.manageTabs||[]).map(k=>manageTabDefs[k]);
   const tabs = State.navContext==='field' ? fieldTabs : manageTabs;
@@ -2904,6 +3040,7 @@ function render(){
     else if(State.tab==='storemap') body = screenStoreMap();
     else if(State.tab==='branchdetail') body = screenBranchDetail();
     else if(State.tab==='editvisit') body = screenEditVisit();
+    else if(State.tab==='delegate') body = screenDelegate();
     else body = screenHome();
   }catch(e){
     console.error('Screen render failed for tab', State.tab, e);
@@ -2952,6 +3089,7 @@ Object.assign(window, {
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
+  delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto
 });
 
