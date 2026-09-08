@@ -1297,11 +1297,24 @@ async function saveSkus(){ await refSet('skus', State.skus, REF_DATA_VERSION); S
 
 /* ============================= DRAFT PERSISTENCE (crash/network recovery) ============================= */
 function saveDraftLocal(){
+  const payload = { role: State.role, name: State.name, savedAt: Date.now(), draft: State.draft };
   try{
-    localStorage.setItem('shelfpulse_draft', JSON.stringify({ role: State.role, name: State.name, savedAt: Date.now(), draft: State.draft }));
-  }catch(e){ /* storage full or unavailable — draft just won't survive a crash this time */ }
+    localStorage.setItem('shelfpulse_draft', JSON.stringify(payload));
+  }catch(e){
+    // Quota exceeded — almost always because base64 photos are large, not because of the typed
+    // SKU data. Losing photos on a crash/refresh is recoverable (retake them); losing an hour of
+    // typed-in fields is not. So retry without photos instead of silently losing everything.
+    try{
+      const slim = { ...payload, draft: { ...State.draft, photos: [] } };
+      localStorage.setItem('shelfpulse_draft', JSON.stringify(slim));
+      if(!State._draftPhotoWarnShown){
+        State._draftPhotoWarnShown = true;
+        showToast("Your entries are backed up, but photos are too large to back up locally — if the app closes now you'll need to retake them");
+      }
+    }catch(e2){ /* still failing — device storage is genuinely full; nothing more we can do locally */ }
+  }
 }
-function clearDraftLocal(){ try{ localStorage.removeItem('shelfpulse_draft'); }catch(e){} }
+function clearDraftLocal(){ try{ localStorage.removeItem('shelfpulse_draft'); }catch(e){} State._draftPhotoWarnShown = false; }
 function restoreDraftIfAny(){
   try{
     const raw = localStorage.getItem('shelfpulse_draft');
@@ -1340,7 +1353,7 @@ async function submitVisit(){
     return;
   }
   // Duplicate-visit guard: same account, same auditor, submitted very recently
-  const dupe = State.visits.find(v => v.accountId===d.accountId && v.auditor===identityLabel() && v.date===d.date && v.status!=='rejected' && (Date.now()-(v.submittedAt||0)) < 12*3600*1000);
+  const dupe = State.visits.find(v => v.accountId===d.accountId && v.auditor===identityLabel() && v.date===todayStr() && v.status!=='rejected' && (Date.now()-(v.submittedAt||0)) < 12*3600*1000);
   if(dupe){
     const proceed = confirm('You already submitted a visit for this account today. Submit another anyway?');
     if(!proceed) return;
@@ -1362,7 +1375,7 @@ async function submitVisit(){
       id: visitId,
       accountId: d.accountId, accountName: d.accountName, branch: d.branch,
       channel: d.channel || '', region: d.region || '',
-      date: d.date, auditor: identityLabel(),
+      date: todayStr(), auditor: identityLabel(),
       status: 'pending', items: finalItems,
       photos: uploadedPhotos, geo: d.geo || null, capturedAt: d.capturedAt || null,
       submittedAt: Date.now(),
@@ -1726,7 +1739,8 @@ function screenNewVisit(){
         <div id="account-search-area">${accountSearchAreaHtml()}</div>
       `}
       <label>Date / التاريخ</label>
-      <input type="date" value="${d.date}" oninput="d('date',this.value)"/>
+      <input type="date" value="${todayStr()}" disabled style="background:#EFEBE9;color:var(--ink-soft)"/>
+      <p class="hint" style="margin:4px 0 0">Always today — visits can't be backdated / لا يمكن تسجيل زيارة بتاريخ سابق</p>
     </div>
 
     <div class="card">
@@ -1828,8 +1842,8 @@ function skuLineHtml(it, idx){
         <div><label>Actual shelf stock (closing) / الرصيد الفعلي على الرف</label><input type="number" inputmode="decimal" value="${it.closing}" oninput="lineField(${idx},'closing',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing}) — a facing can't hold stock that isn't there / تحقق من الكمية</p>` : ''}</div>
-        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/></div>
+        <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing}) — a facing can't hold stock that isn't there / تحقق من الكمية</p>` : ''}</div>
+        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
       </div>
       <div class="row2">
         <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
@@ -3107,8 +3121,8 @@ function getMonthlyCapacity(accountId, skuId, monthKey){
   for(const v of State.visits){
     if(v.accountId!==accountId || v.status==='rejected') continue;
     if((v.date||'').slice(0,7) !== monthKey) continue;
-    const item = (v.items||[]).find(it=>it.skuId===skuId && it.actualCapacity!=='' && it.actualCapacity!=null);
-    if(item) return item.actualCapacity;
+    const item = (v.items||[]).find(it=>it.skuId===skuId && it.pogFacings!=='' && it.pogFacings!=null);
+    if(item) return item.pogFacings;
   }
   return null;
 }
@@ -3120,7 +3134,7 @@ function pickAccount(id){
     const monthKey = monthKeyOf(dft.date);
     dft.items = State.skus.map(s => {
       const locked = getMonthlyCapacity(a.id, s.id, monthKey);
-      return {skuId:s.id, opening:'', closing:'', deliveries:'', pogFacings:'', actualCapacity: locked!==null?String(locked):'', catFacings:'', shahdFacings:'', actualPrice:'', days:'7', _open:false, capacityLocked: locked!==null};
+      return {skuId:s.id, opening:'', closing:'', deliveries:'', pogFacings: locked!==null?String(locked):'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:'7', _open:false, capacityLocked: locked!==null};
     });
   }
   saveDraftLocal();
