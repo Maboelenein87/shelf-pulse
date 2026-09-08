@@ -879,18 +879,30 @@ async function uploadVisitPhoto(dataUrl, visitId, idx){
   const blob = dataUrlToBlob(dataUrl);
   const path = `visit-photos/${visitId}/${idx}-${Date.now()}.jpg`;
   const fileRef = ref(storage, path);
-  await uploadBytes(fileRef, blob, { contentType: blob.type || 'image/jpeg' });
-  return await getDownloadURL(fileRef);
+  await withTimeout(uploadBytes(fileRef, blob, { contentType: blob.type || 'image/jpeg' }), PHOTO_UPLOAD_TIMEOUT_MS);
+  return await withTimeout(getDownloadURL(fileRef), PHOTO_UPLOAD_TIMEOUT_MS);
 }
-// Uploads any base64 entries and passes existing URLs through untouched — safe to call on a mix of both,
-// which is exactly what happens during the legacy-photo migration below.
+// Per-photo cap so a stalled upload (weak in-store signal) can't leave the merchandiser staring at
+// "Uploading & submitting…" forever — better to fall back than to hang indefinitely.
+const PHOTO_UPLOAD_TIMEOUT_MS = 15000;
+function withTimeout(promise, ms){
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('upload-timeout')), ms);
+    promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+}
+// Uploads photos to Storage in parallel (not one-by-one — sequential uploads were the main reason
+// submission could take a long time and appear stuck on a weak connection). Never throws and never
+// hangs: any photo whose upload fails or exceeds PHOTO_UPLOAD_TIMEOUT_MS silently falls back to
+// keeping its original base64 data rather than blocking the whole submission — a slightly bigger
+// Firestore doc beats a visit a merchandiser can't submit at all. Existing URL strings pass through
+// untouched, so this is also safe to call during the legacy-photo migration below.
 async function uploadVisitPhotos(photos, visitId){
-  const urls = [];
-  for(let i=0;i<(photos||[]).length;i++){
-    const p = photos[i];
-    urls.push(typeof p==='string' && p.startsWith('data:') ? await uploadVisitPhoto(p, visitId, i) : p);
-  }
-  return urls;
+  return Promise.all((photos||[]).map(async (p, i) => {
+    if(typeof p!=='string' || !p.startsWith('data:')) return p;
+    try{ return await uploadVisitPhoto(p, visitId, i); }
+    catch(e){ console.error('Photo upload failed/timed out, keeping embedded copy:', e); return p; }
+  }));
 }
 function findLegacyPhotoVisits(){
   return State.visits.filter(v => (v.photos||[]).some(p => typeof p==='string' && p.startsWith('data:')));
@@ -1312,8 +1324,8 @@ async function submitVisit(){
     return;
   }
   if(!d.geo){
-    showToast('Location not captured yet — retake the photo and allow location access');
-    return;
+    const proceed = confirm('No location was captured for this visit (weak GPS signal indoors is common) — it will be flagged as unverified. Submit anyway?');
+    if(!proceed) return;
   }
   if(d.catFacingsTotal === '' || d.catFacingsTotal === null || isNaN(parseFloat(d.catFacingsTotal))){
     showToast('Enter the total category facings (all brands) before submitting');
@@ -1485,9 +1497,28 @@ function captureGeo(){
   if(!navigator.geolocation){ showToast('Location not supported on this device'); saveDraftLocal(); render(); return; }
   navigator.geolocation.getCurrentPosition(
     pos => { State.draft.geo = { lat: +pos.coords.latitude.toFixed(5), lng: +pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) }; saveDraftLocal(); render(); },
-    err => { State.draft.geo = null; showToast('Location permission denied — visit will be flagged unverified'); saveDraftLocal(); render(); },
+    err => {
+      // A first high-accuracy (GPS-only) attempt often fails or times out indoors, inside a store with
+      // no clear sky view — that's a signal problem, not a permission problem. Retry once using
+      // network/Wi-Fi-based positioning (enableHighAccuracy:false), which works far better indoors,
+      // before concluding the visit should be flagged unverified.
+      if(err.code !== 1 /* not an actual permission denial */){
+        navigator.geolocation.getCurrentPosition(
+          pos => { State.draft.geo = { lat: +pos.coords.latitude.toFixed(5), lng: +pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) }; saveDraftLocal(); render(); },
+          err2 => { State.draft.geo = null; showToast(geoErrorMessage(err2)); saveDraftLocal(); render(); },
+          { enableHighAccuracy:false, timeout:15000, maximumAge:60000 }
+        );
+        return;
+      }
+      State.draft.geo = null; showToast(geoErrorMessage(err)); saveDraftLocal(); render();
+    },
     { enableHighAccuracy:true, timeout:8000 }
   );
+}
+function geoErrorMessage(err){
+  if(err.code === 1) return 'Location permission denied for this site — check Safari/Chrome site settings, then retry. Visit will be flagged unverified until then.';
+  if(err.code === 2) return 'Could not get a location fix indoors — visit will be flagged unverified. You can retry, or continue without it.';
+  return 'Location timed out — signal may be weak indoors. Visit will be flagged unverified. You can retry, or continue without it.';
 }
 function removePhotoAt(idx){ (State.draft.photos||[]).splice(idx,1); saveDraftLocal(); render(); }
 
@@ -1712,6 +1743,7 @@ function screenNewVisit(){
         <div class="verify-row">
           ${d.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location / لا يوجد موقع')}
           ${d.capturedAt ? statusChip('neutral', new Date(d.capturedAt).toLocaleTimeString()) : ''}
+          ${!d.geo ? `<button class="btn btn-ghost btn-sm" onclick="captureGeo()">↻ Retry location / إعادة المحاولة</button>` : ''}
         </div>
         ${d.photos.length < MAX_PHOTOS ? `<button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="capturePhoto()">＋ Add another photo / إضافة صورة</button>` : `<p class="hint" style="margin-top:8px">Max ${MAX_PHOTOS} reached / الحد الأقصى</p>`}
       ` : `
@@ -3211,7 +3243,7 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo
 });
 
 /* ============================= INIT ============================= */
