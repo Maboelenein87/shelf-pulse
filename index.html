@@ -840,19 +840,76 @@ const firebaseConfig = {
   appId: "1:192689350014:web:65ad03d4980ad64b3e7f2f"
 };
 
-let app, db;
+let app, db, storage;
 let firestoreFns = {};
+let storageFns = {};
 const isConfigured = firebaseConfig && typeof firebaseConfig === 'object';
 
 if(isConfigured){
   const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
   const fs = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+  const st = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js");
   firestoreFns = fs;
+  storageFns = st;
   app = initializeApp(firebaseConfig);
   db = fs.getFirestore(app);
+  storage = st.getStorage(app);
 } else {
   document.getElementById('setup-screen').style.display = 'block';
   document.getElementById('app').style.display = 'none';
+}
+
+/* ============================= PHOTO STORAGE (Firebase Storage, not Firestore) =============================
+   Photos are captured as base64 data URLs (see capturePhoto/snapPhoto) so the in-app camera preview and
+   local draft-recovery work offline. But they are never written to Firestore as base64 — right before a
+   visit is created, each photo is uploaded to Storage and only the resulting download URL is saved on the
+   visit document. This keeps visit documents small (Firestore caps a document at 1MiB) and means every
+   dashboard/list load doesn't have to download every photo just to render text. */
+function dataUrlToBlob(dataUrl){
+  const [header, base64] = dataUrl.split(',');
+  const mimeMatch = /data:(.*?);/.exec(header);
+  const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+async function uploadVisitPhoto(dataUrl, visitId, idx){
+  const { ref, uploadBytes, getDownloadURL } = storageFns;
+  const blob = dataUrlToBlob(dataUrl);
+  const path = `visit-photos/${visitId}/${idx}-${Date.now()}.jpg`;
+  const fileRef = ref(storage, path);
+  await uploadBytes(fileRef, blob, { contentType: blob.type || 'image/jpeg' });
+  return await getDownloadURL(fileRef);
+}
+// Uploads any base64 entries and passes existing URLs through untouched — safe to call on a mix of both,
+// which is exactly what happens during the legacy-photo migration below.
+async function uploadVisitPhotos(photos, visitId){
+  const urls = [];
+  for(let i=0;i<(photos||[]).length;i++){
+    const p = photos[i];
+    urls.push(typeof p==='string' && p.startsWith('data:') ? await uploadVisitPhoto(p, visitId, i) : p);
+  }
+  return urls;
+}
+function findLegacyPhotoVisits(){
+  return State.visits.filter(v => (v.photos||[]).some(p => typeof p==='string' && p.startsWith('data:')));
+}
+async function migrateLegacyPhotos(){
+  const targets = findLegacyPhotoVisits();
+  if(targets.length===0){ showToast('No legacy embedded photos found — everything is already in Storage'); return; }
+  if(!confirm(`Move photos out of Firestore and into Storage for ${targets.length} older visit(s)? Each photo gets uploaded and the visit record rewritten with a link instead. This can take a while for a lot of visits — leave this tab open until it finishes.`)) return;
+  let done = 0;
+  for(const v of targets){
+    try{
+      const newPhotos = await uploadVisitPhotos(v.photos, v.id);
+      await visitUpdate(v.id, { photos: newPhotos });
+      done++;
+      showToast(`Migrated ${done}/${targets.length}…`);
+    }catch(e){ console.error('Photo migration failed for visit', v.id, e); }
+  }
+  showToast(`Migration finished — ${done}/${targets.length} visit(s) updated ✓`);
+  render();
 }
 
 /* ============================= STORAGE HELPERS (Firestore) ============================= */
@@ -944,6 +1001,16 @@ function findSuspiciousCapacity(){
     });
   });
   return candidates.sort((a,b)=>(b.capacity-b.closing)-(a.capacity-a.closing));
+}
+// Review-only flag — unlike price/capacity there's no "correct value" to auto-fix to, since duration
+// is derived from timestamps, not a typed field. This just surfaces visits worth a second look.
+const SHORT_VISIT_MINUTES = 2; // business rule: can't realistically photograph, count facings, and check prices in under this
+function findSuspiciouslyShortVisits(){
+  return State.visits
+    .map(v => ({ v, mins: visitDurationMinutes(v) }))
+    .filter(x => x.mins !== null && x.mins < SHORT_VISIT_MINUTES)
+    .map(x => ({ visitId:x.v.id, account:x.v.accountName, branch:x.v.branch, date:x.v.date, auditor:x.v.auditor, status:x.v.status, mins:x.mins }))
+    .sort((a,b)=>a.mins-b.mins);
 }
 async function applyCapacityFix(c){
   const visit = State.visits.find(v=>v.id===c.visitId); if(!visit) return;
@@ -1268,14 +1335,24 @@ async function submitVisit(){
   }
   State.submitting = true; render();
   try{
+    const visitId = uid();
+    let uploadedPhotos;
+    try{
+      showToast('Uploading photo(s)…');
+      uploadedPhotos = await uploadVisitPhotos(d.photos || [], visitId);
+    }catch(uploadErr){
+      console.error('Photo upload failed:', uploadErr);
+      showToast('Photo upload failed — check your connection and try again. Your draft is safe.');
+      return;
+    }
     const finalItems = d.items.map(it => ({...it, catFacings: d.catFacingsTotal})); // one visit-level entry, copied to every line for compatibility with existing analysis
     const visit = {
-      id: uid(),
+      id: visitId,
       accountId: d.accountId, accountName: d.accountName, branch: d.branch,
       channel: d.channel || '', region: d.region || '',
       date: d.date, auditor: identityLabel(),
       status: 'pending', items: finalItems,
-      photos: d.photos || [], geo: d.geo || null, capturedAt: d.capturedAt || null,
+      photos: uploadedPhotos, geo: d.geo || null, capturedAt: d.capturedAt || null,
       submittedAt: Date.now(),
     };
     await visitCreate(visit);
@@ -1422,6 +1499,22 @@ function fmt(n, d=0){
   return n.toFixed(d);
 }
 function visitPhotos(v){ return (v.photos && v.photos.length) ? v.photos : (v.photo ? [v.photo] : []); }
+/* Visit duration: time from first photo (arrival proof) to submission. Not a perfect stopwatch —
+   a merchandiser could step away mid-visit — but it's the best evidence-anchored proxy we have
+   without adding a separate "arrived" tap. Returns null when either timestamp is missing or the
+   gap is negative/implausible (e.g. clock skew from an offline draft synced later). */
+function visitDurationMinutes(v){
+  if(!v || !v.capturedAt || !v.submittedAt) return null;
+  const mins = (v.submittedAt - v.capturedAt) / 60000;
+  if(!isFinite(mins) || mins < 0 || mins > 8*60) return null; // cap at 8h — treat longer gaps as offline-sync artifacts, not real dwell time
+  return mins;
+}
+function fmtDuration(mins){
+  if(mins === null || mins === undefined || !isFinite(mins)) return '—';
+  const total = Math.round(mins);
+  const h = Math.floor(total/60), m = total%60;
+  return h>0 ? `${h}h ${m}m` : `${m}m`;
+}
 function fmtCoverage(days){
   if(Array.isArray(days)) days = days.length ? days[0] : 0;
   if(days === Infinity) return '∞'; // in stock, but zero sales recorded — technically never runs out
@@ -1648,7 +1741,7 @@ function screenNewVisit(){
     <div class="sectitle">SKU checklist — all ${d.items.length} required (${d.items.filter(isItemComplete).length}/${d.items.length} complete)</div>
     ${d.items.map((it,idx)=>skuLineHtml(it,idx)).join('') || `<p class="hint">Select an account above to load its SKU checklist.</p>`}
     <div style="height:14px"></div>
-    <button class="btn btn-primary" onclick="submitVisit()">Submit visit for approval / إرسال الزيارة للموافقة</button>
+    <button class="btn btn-primary" onclick="submitVisit()" ${State.submitting?'disabled':''}>${State.submitting ? 'Uploading & submitting…' : 'Submit visit for approval / إرسال الزيارة للموافقة'}</button>
   </div>`;
 }
 function myAccounts(){
@@ -1746,6 +1839,7 @@ function approvalCardHtml(v){
     <div class="verify-row" style="margin-bottom:8px">
       ${verified ? statusChip('on','📍 Verified visit / زيارة موثقة') : statusChip('off','⚠️ Unverified / غير موثقة')}
       ${statusChip(agg.visitDonePct>=95?'on':'watch', fmt(agg.visitDonePct)+'% data complete / اكتمال البيانات')}
+      ${(() => { const mins = visitDurationMinutes(v); return mins!==null ? statusChip(mins<SHORT_VISIT_MINUTES?'off':'neutral', '⏱ '+fmtDuration(mins)+(mins<SHORT_VISIT_MINUTES?' — too fast to be real':'')) : ''; })()}
     </div>
     ${visitPhotos(v).length ? `<div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:8px">${visitPhotos(v).map(p=>`<img src="${p}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;flex-shrink:0;cursor:pointer" onclick="window.open('${p}')"/>`).join('')}</div>` : ''}
     ${v.geo ? `<p class="hint">📍 ${v.geo.lat}, ${v.geo.lng} (±${v.geo.accuracy}m) · ${v.capturedAt?new Date(v.capturedAt).toLocaleString():''}</p>` : ''}
@@ -1794,6 +1888,8 @@ function dashOverview(approved){
   const aggs = approved.map(v=>visitAggregate(v));
   const avg = f => aggs.reduce((s,a)=>s+f(a),0)/aggs.length;
   const stockSummary = computeNetworkStockSummary(approved);
+  const durations = approved.map(visitDurationMinutes).filter(m=>m!==null);
+  const avgDuration = durations.length ? durations.reduce((s,m)=>s+m,0)/durations.length : null;
   return `<div class="kpi-grid">
     <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf utilization (SUC) / متوسط تعبئة الرف</div></div>
     <div class="kpi"><div class="num">${fmt(avg(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf (SOS) / متوسط حصة الرف</div></div>
@@ -1802,6 +1898,7 @@ function dashOverview(approved){
     <div class="kpi accent"><div class="num">${fmt(stockSummary.totalStock)}</div><div class="lbl">Total stock on hand (grand total) / إجمالي المخزون</div></div>
     <div class="kpi"><div class="num">${fmt(stockSummary.avgCoverage,1)}d</div><div class="lbl">Avg stock coverage / تغطية المخزون</div></div>
     <div class="kpi"><div class="num">${fmt(aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
+    <div class="kpi"><div class="num">${avgDuration!==null?fmtDuration(avgDuration):'—'}</div><div class="lbl">Avg visit duration (photo→submit) / متوسط مدة الزيارة</div></div>
   </div>`;
 }
 
@@ -2574,7 +2671,9 @@ function screenScorecard(){
     const achieved = achievedForMerch(merch);
     const branches = [...new Set(visits.map(v=>v.branch))];
     const a = { avgSfr: avg(x=>x.avgSfr), avgSos: avg(x=>x.avgSos), osaPct: avg(x=>x.osaPct), priceOkPct: avg(x=>x.priceOkPct), visitDonePct: avg(x=>x.visitDonePct), visitAchievedPct: target ? Math.min(100, achieved/target*100) : 100 };
-    return { merch, sup: supervisorOfMerch(merch), visits: visits.length, branchCount: branches.length, target, achieved, score: scoreFor(a), ...a };
+    const durations = visits.map(visitDurationMinutes).filter(m=>m!==null);
+    const avgDuration = durations.length ? durations.reduce((s,m)=>s+m,0)/durations.length : null;
+    return { merch, sup: supervisorOfMerch(merch), visits: visits.length, branchCount: branches.length, target, achieved, score: scoreFor(a), avgDuration, ...a };
   }).sort((a,b)=>b.score-a.score);
   if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1><p class="lede">Weighted score by merchandiser.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
   return `<div class="screen">
@@ -2593,6 +2692,7 @@ function screenScorecard(){
           ${statusChip('neutral','OSA '+fmt(r.osaPct)+'%')}
           ${statusChip(r.priceOkPct>=80?'on':'watch','Price '+fmt(r.priceOkPct)+'%')}
           ${statusChip(r.visitDonePct>=95?'on':'watch','Data '+fmt(r.visitDonePct)+'%')}
+          ${statusChip('neutral','⏱ '+fmtDuration(r.avgDuration))}
         </div>
       </div>`).join('')}
   </div>`;
@@ -2610,7 +2710,7 @@ function visitListResultsHtml(){
         <div class="visit-row" style="border:none;padding:0">
           <div>
             <div class="visit-main">${v.accountName} · ${v.branch}</div>
-            <div class="visit-sub">${v.date} · ${v.auditor} · ${(v.items||[]).length} SKUs · ${fmt(agg.visitDonePct)}% complete${v.editedBy?' · edited by '+v.editedBy:''}</div>
+            <div class="visit-sub">${v.date} · ${v.auditor} · ${(v.items||[]).length} SKUs · ${fmt(agg.visitDonePct)}% complete · ⏱ ${fmtDuration(visitDurationMinutes(v))}${v.editedBy?' · edited by '+v.editedBy:''}</div>
           </div>
           <span class="status-badge status-${v.status}">${v.status}</span>
         </div>
@@ -2921,6 +3021,27 @@ function screenSkus(){
         </table></div>
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
+    </div>
+    <div class="sectitle">Suspiciously fast visits / زيارات سريعة بشكل مريب</div>
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Under ${SHORT_VISIT_MINUTES} minutes, photo to submit</h3>
+      ${(() => {
+        const cands = findSuspiciouslyShortVisits();
+        if(cands.length===0) return `<p class="hint">No suspiciously fast visits detected right now.</p>`;
+        return `
+        <p class="hint" style="margin-bottom:10px">${cands.length} visit${cands.length===1?'':'s'} took under ${SHORT_VISIT_MINUTES} minutes from the location photo to submission — not enough time to genuinely audit a shelf. Worth a manual look before trusting the data or the visit-compliance credit.</p>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>Auditor</th><th>Duration</th><th>Status</th><th></th></tr>
+        ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.auditor}</td><td style="color:var(--red);font-weight:700">${fmtDuration(c.mins)}</td><td><span class="status-badge status-${c.status}">${c.status}</span></td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; review</button></td></tr>`).join('')}
+        </table></div>
+        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
+      `; })()}
+    </div>` : ''}
+    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
+    <div class="sectitle">Move legacy photos to Storage / نقل الصور القديمة</div>
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">${findLegacyPhotoVisits().length} visit(s) still have photos embedded in the database</h3>
+      <p class="hint" style="margin-bottom:10px">New visits already upload photos to Firebase Storage instead of saving them inside the visit record. This one-time tool moves photos out of older visit records too, shrinking them and speeding up every dashboard/list load. Safe to run more than once — already-migrated visits are skipped automatically.</p>
+      <button class="btn btn-primary btn-sm" onclick="migrateLegacyPhotos()">Migrate now</button>
     </div>` : ''}
     ${State.role==='trade_marketing' ? `
     <div class="sectitle">Danger zone / منطقة الخطر</div>
@@ -3090,7 +3211,7 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos
 });
 
 /* ============================= INIT ============================= */
