@@ -852,7 +852,17 @@ if(isConfigured){
   firestoreFns = fs;
   storageFns = st;
   app = initializeApp(firebaseConfig);
-  db = fs.getFirestore(app);
+  // Offline persistence: writes (new visits, approvals) apply to a local IndexedDB cache instantly,
+  // regardless of signal, and the SDK syncs them to the server automatically the moment connectivity
+  // returns — no manual retry needed. This is what actually fixes "submit hangs on weak signal",
+  // not a longer timeout. Falls back to plain in-memory Firestore if the browser/context doesn't
+  // support it (e.g. private browsing) so the app still works, just without offline queuing.
+  try{
+    db = fs.initializeFirestore(app, { localCache: fs.persistentLocalCache({}) });
+  }catch(e){
+    console.warn('Offline persistence unavailable, falling back to online-only Firestore:', e);
+    db = fs.getFirestore(app);
+  }
   storage = st.getStorage(app);
 } else {
   document.getElementById('setup-screen').style.display = 'block';
@@ -956,11 +966,14 @@ function watchVisits(){
 }
 async function visitCreate(visit){
   const { doc, setDoc } = firestoreFns;
-  await setDoc(doc(db, 'visits', visit.id), visit);
+  // With offline persistence active (see init above) this resolves almost instantly regardless of
+  // signal — the write lands in the local cache and syncs in the background. This timeout only
+  // matters as a safety net if persistence failed to initialize for this browser/session.
+  await withTimeout(setDoc(doc(db, 'visits', visit.id), visit), 20000);
 }
 async function visitUpdate(id, patch){
   const { doc, updateDoc } = firestoreFns;
-  await updateDoc(doc(db, 'visits', id), patch);
+  await withTimeout(updateDoc(doc(db, 'visits', id), patch), 20000);
 }
 function watchDelegations(){
   if(!isConfigured) return;
@@ -1385,7 +1398,7 @@ async function submitVisit(){
     State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'' };
     clearDraftLocal();
     State.accountSearch = '';
-    showToast('Visit submitted for approval ✓');
+    showToast(navigator.onLine ? 'Visit submitted for approval ✓' : "Saved on this device ✓ — will upload automatically once you're back online. You can move to the next visit now.");
     State.tab = 'myvisits';
   } catch(err){
     console.error(err);
