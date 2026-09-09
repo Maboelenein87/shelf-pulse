@@ -1543,14 +1543,20 @@ async function finishArrival(photoDataUrl){
   try{
     let geo = d.geo;
     if(!geo){
-      geo = await new Promise(resolve => {
-        if(!navigator.geolocation){ resolve(null); return; }
-        navigator.geolocation.getCurrentPosition(
-          pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
-          () => resolve(null),
-          { enableHighAccuracy:true, timeout:8000 }
-        );
-      });
+      // Not wrapping this in a promise-based timeout before was the actual bug behind arrivals
+      // getting stuck on "Marking arrival…" indefinitely — some Android browsers/WebViews simply
+      // never invoke either callback if location is in a stuck permission/service state, ignoring
+      // the `timeout` option entirely. withTimeout is the real safety net here.
+      try{
+        geo = await withTimeout(new Promise(resolve => {
+          if(!navigator.geolocation){ resolve(null); return; }
+          navigator.geolocation.getCurrentPosition(
+            pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
+            () => resolve(null),
+            { enableHighAccuracy:true, timeout:8000 }
+          );
+        }), 10000);
+      }catch(e){ geo = null; } // timed out at the outer boundary — proceed without location rather than hang
     }
     let photoUrl = photoDataUrl;
     try{ photoUrl = await uploadVisitPhoto(photoDataUrl, arrivalId, 0); }catch(e){ console.error('Arrival photo upload failed, keeping embedded copy:', e); }
@@ -1644,25 +1650,44 @@ function compressImage(file, maxDim, quality){
 }
 function captureGeo(){
   if(!navigator.geolocation){ showToast('Location not supported on this device'); saveDraftLocal(); render(); return; }
-  navigator.geolocation.getCurrentPosition(
-    pos => { State.draft.geo = { lat: +pos.coords.latitude.toFixed(5), lng: +pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) }; saveDraftLocal(); render(); },
-    err => {
-      // A first high-accuracy (GPS-only) attempt often fails or times out indoors, inside a store with
-      // no clear sky view — that's a signal problem, not a permission problem. Retry once using
-      // network/Wi-Fi-based positioning (enableHighAccuracy:false), which works far better indoors,
-      // before concluding the visit should be flagged unverified.
-      if(err.code !== 1 /* not an actual permission denial */){
-        navigator.geolocation.getCurrentPosition(
-          pos => { State.draft.geo = { lat: +pos.coords.latitude.toFixed(5), lng: +pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) }; saveDraftLocal(); render(); },
-          err2 => { State.draft.geo = null; showToast(geoErrorMessage(err2)); saveDraftLocal(); render(); },
-          { enableHighAccuracy:false, timeout:15000, maximumAge:60000 }
-        );
-        return;
-      }
-      State.draft.geo = null; showToast(geoErrorMessage(err)); saveDraftLocal(); render();
+  // Wrapped in withTimeout as an outer safety net — some Android browsers/WebViews never invoke
+  // either callback at all when location is in a stuck permission/service state, silently ignoring
+  // the per-call `timeout` option below. Without this, the "No location" state (and the retry
+  // button) would just sit there with a request that's never actually going to resolve.
+  const attempt = new Promise(resolve => {
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve({ ok:true, geo: { lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) } }),
+      err => {
+        // A first high-accuracy (GPS-only) attempt often fails or times out indoors, inside a store with
+        // no clear sky view — that's a signal problem, not a permission problem. Retry once using
+        // network/Wi-Fi-based positioning (enableHighAccuracy:false), which works far better indoors,
+        // before concluding the visit should be flagged unverified.
+        if(err.code !== 1 /* not an actual permission denial */){
+          navigator.geolocation.getCurrentPosition(
+            pos => resolve({ ok:true, geo: { lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) } }),
+            err2 => resolve({ ok:false, err:err2 }),
+            { enableHighAccuracy:false, timeout:15000, maximumAge:60000 }
+          );
+          return;
+        }
+        resolve({ ok:false, err });
+      },
+      { enableHighAccuracy:true, timeout:8000 }
+    );
+  });
+  withTimeout(attempt, 25000).then(
+    result => {
+      if(result.ok){ State.draft.geo = result.geo; }
+      else { State.draft.geo = null; showToast(geoErrorMessage(result.err)); }
+      saveDraftLocal(); render();
     },
-    { enableHighAccuracy:true, timeout:8000 }
+    () => { State.draft.geo = null; showToast(geoErrorMessage({code:3})); saveDraftLocal(); render(); }
   );
+}
+function cancelArrivalPending(){
+  State.arrivalPending = false;
+  render();
+  showToast('Cancelled — tap Mark arrival to try again');
 }
 function geoErrorMessage(err){
   if(err.code === 1) return 'Location permission denied for this site — check Safari/Chrome site settings, then retry. Visit will be flagged unverified until then.';
@@ -1888,6 +1913,7 @@ function screenNewVisit(){
       <h3 style="color:var(--red)">Mark your arrival / تسجيل الوصول</h3>
       <p class="hint" style="margin:0 0 10px">Take a quick photo now to log exactly when and where you arrived — this starts the visit timer. Shelf data can't be entered until you do.</p>
       <button class="btn btn-primary" onclick="markArrival()" ${State.arrivalPending?'disabled':''}>${State.arrivalPending ? 'Marking arrival…' : '📍 Mark arrival — take photo / تسجيل الوصول'}</button>
+      ${State.arrivalPending ? `<button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="cancelArrivalPending()">Taking too long? Cancel and retry / إلغاء وإعادة المحاولة</button>` : ''}
     </div>
     ` : (!hasAccount ? '' : `
     <div class="card">
@@ -3450,7 +3476,7 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending
 });
 
 /* ============================= INIT ============================= */
