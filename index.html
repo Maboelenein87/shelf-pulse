@@ -1216,19 +1216,51 @@ async function saveVisitEdit(){
 }
 function cancelVisitEdit(){ State.editingVisitId = null; State.editDraft = null; State.tab = 'allvisits'; render(); }
 
-async function resetVisits(filterStatus){
+async function deleteVisitList(targets, label){
   if(State.role!=='trade_marketing'){ showToast('Not authorized'); return; }
-  const targets = filterStatus ? State.visits.filter(v=>v.status===filterStatus) : State.visits;
   const count = targets.length;
   if(count===0){ showToast('Nothing to delete'); return; }
-  const label = filterStatus ? `all ${count} ${filterStatus} visit${count===1?'':'s'}` : `ALL ${count} visit record${count===1?'':'s'} (every status)`;
   if(!confirm(`This will permanently delete ${label}. This cannot be undone. Continue?`)) return;
   const { doc, deleteDoc } = firestoreFns;
   showToast('Deleting…');
+  const ids = new Set(targets.map(v=>v.id));
   for(const v of targets){
     try{ await deleteDoc(doc(db, 'visits', v.id)); }catch(e){ console.error(e); }
   }
-  showToast('Deleted ✓');
+  // Best-effort cleanup: an arrival still pointing at a deleted visit would otherwise keep showing
+  // as "completed" on the Arrivals tab for a visit that no longer exists.
+  const orphanArrivals = State.arrivals.filter(a=>a.visitId && ids.has(a.visitId));
+  for(const a of orphanArrivals){
+    try{ await deleteDoc(doc(db, 'arrivals', a.id)); }catch(e){ console.error(e); }
+  }
+  showToast(`Deleted ✓ (${count})`);
+}
+async function resetVisits(filterStatus){
+  const targets = filterStatus ? State.visits.filter(v=>v.status===filterStatus) : State.visits;
+  const label = filterStatus ? `all ${targets.length} ${filterStatus} visit${targets.length===1?'':'s'}` : `ALL ${targets.length} visit record${targets.length===1?'':'s'} (every status)`;
+  await deleteVisitList(targets, label);
+}
+function setCleanupMonth(v){ State.cleanupMonth = v; render(); }
+function setCleanupDate(v){ State.cleanupDate = v; State.cleanupSelected = new Set(); render(); }
+function toggleCleanupVisit(id){
+  if(State.cleanupSelected.has(id)) State.cleanupSelected.delete(id); else State.cleanupSelected.add(id);
+  render();
+}
+async function deleteVisitsByMonth(){
+  if(!State.cleanupMonth){ showToast('Pick a month first'); return; }
+  const targets = State.visits.filter(v=>(v.date||'').slice(0,7)===State.cleanupMonth);
+  await deleteVisitList(targets, `all ${targets.length} visit${targets.length===1?'':'s'} from ${State.cleanupMonth}`);
+}
+async function deleteVisitsByDay(){
+  if(!State.cleanupDate){ showToast('Pick a date first'); return; }
+  const targets = State.visits.filter(v=>v.date===State.cleanupDate);
+  await deleteVisitList(targets, `all ${targets.length} visit${targets.length===1?'':'s'} from ${State.cleanupDate}`);
+}
+async function deleteSelectedCleanupVisits(){
+  const targets = State.visits.filter(v=>State.cleanupSelected.has(v.id));
+  if(targets.length===0){ showToast('Select at least one visit'); return; }
+  await deleteVisitList(targets, `${targets.length} selected visit${targets.length===1?'':'s'} from ${State.cleanupDate}`);
+  State.cleanupSelected = new Set();
 }
 
 /* ============================= ROLE / ACCESS CONTROL ============================= */
@@ -1271,6 +1303,7 @@ const State = {
   editingVisitId: null, editDraft: null, visitSearch: '',
   delegateSearch: '', delegateSelected: new Set(), delegateTarget: '', delegateDate: todayStr(), delegations: [],
   calendarDate: todayStr(),
+  cleanupMonth: '', cleanupDate: '', cleanupSelected: new Set(),
 };
 function todayStr(){ return new Date().toISOString().slice(0,10); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -3489,6 +3522,34 @@ function screenSkus(){
         <button class="btn btn-ghost btn-sm" onclick="resetVisits('pending')">Delete pending only (${State.visits.filter(v=>v.status==='pending').length})</button>
         <button class="btn btn-danger btn-sm" onclick="resetVisits(null)">Delete ALL (${State.visits.length})</button>
       </div>
+    </div>
+    <div class="card" style="border-color:var(--red);margin-top:10px">
+      <h3 style="color:var(--red)">Delete a whole month</h3>
+      <p class="hint" style="margin-bottom:10px">Wipes every visit dated within the selected month — e.g. clearing out August pilot data.</p>
+      <input type="month" value="${State.cleanupMonth}" onchange="setCleanupMonth(this.value)"/>
+      ${State.cleanupMonth ? (() => {
+        const n = State.visits.filter(v=>(v.date||'').slice(0,7)===State.cleanupMonth).length;
+        return `<p class="hint" style="margin:8px 0">${n} visit${n===1?'':'s'} match ${State.cleanupMonth}</p>
+        <button class="btn btn-danger btn-sm" onclick="deleteVisitsByMonth()" ${n===0?'disabled':''}>Delete ${n} visit${n===1?'':'s'} from this month</button>`;
+      })() : ''}
+    </div>
+    <div class="card" style="border-color:var(--red);margin-top:10px">
+      <h3 style="color:var(--red)">Delete a single day — or pick specific visits</h3>
+      <p class="hint" style="margin-bottom:10px">Wipe every visit from one date, or tick individual visits from that day to delete just those.</p>
+      <input type="date" value="${State.cleanupDate}" onchange="setCleanupDate(this.value)"/>
+      ${State.cleanupDate ? (() => {
+        const dayVisits = State.visits.filter(v=>v.date===State.cleanupDate);
+        return `<p class="hint" style="margin:8px 0">${dayVisits.length} visit${dayVisits.length===1?'':'s'} on ${State.cleanupDate}</p>
+        <button class="btn btn-danger btn-sm" onclick="deleteVisitsByDay()" ${dayVisits.length===0?'disabled':''} style="margin-bottom:10px">Delete all ${dayVisits.length} from this day</button>
+        ${dayVisits.length ? `
+        <div class="sectitle" style="margin-top:4px">Or pick individual visits</div>
+        ${dayVisits.map(v=>`<label style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)">
+          <input type="checkbox" ${State.cleanupSelected.has(v.id)?'checked':''} onchange="toggleCleanupVisit('${v.id}')"/>
+          <span>${v.accountName} · ${v.branch} · ${v.auditor} · <span class="hint">${v.status}</span></span>
+        </label>`).join('')}
+        <button class="btn btn-danger btn-sm" style="margin-top:10px" onclick="deleteSelectedCleanupVisits()" ${State.cleanupSelected.size===0?'disabled':''}>Delete ${State.cleanupSelected.size} selected</button>
+        ` : ''}`;
+      })() : ''}
     </div>` : ''}
   </div>`;
 }
@@ -3663,7 +3724,8 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
+  setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
 });
 
 /* ============================= INIT ============================= */
