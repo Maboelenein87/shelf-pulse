@@ -1209,8 +1209,8 @@ const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
   supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','team','scorecard','allvisits','delegate'] },
-  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','dashboard','team','scorecard','allvisits','storemap'] },
-  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','dashboard','team','scorecard','allvisits','storemap'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','team','scorecard','allvisits','storemap'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','team','scorecard','allvisits','storemap'] },
   commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
@@ -1236,6 +1236,7 @@ const State = {
   loginRole: null, loginPassword: '', loginError: '', pendingMerchName: null, submitting: false,
   editingVisitId: null, editDraft: null, visitSearch: '',
   delegateSearch: '', delegateSelected: new Set(), delegateTarget: '', delegateDate: todayStr(), delegations: [],
+  calendarDate: todayStr(),
 };
 function todayStr(){ return new Date().toISOString().slice(0,10); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -2156,6 +2157,40 @@ function arrivalCardHtml(a, isActive){
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
     </div>
     ${a.photo ? `<img src="${a.photo}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${a.photo}')"/>` : ''}
+  </div>`;
+}
+
+/* ---- Visits Calendar (pick a date, see every merchandiser's visit count that day) ---- */
+function setCalendarDate(val){ State.calendarDate = val; render(); }
+function screenVisitCalendar(){
+  const day = State.calendarDate;
+  const all = myMerchandisers();
+  const dayVisits = State.visits.filter(v => v.date === day);
+  const counts = {};
+  dayVisits.forEach(v => { counts[v.auditor] = (counts[v.auditor]||0) + 1; });
+  // Include every merchandiser on the roster, even ones with zero that day — a 0 is exactly the
+  // kind of gap this screen exists to surface, not something to quietly drop from the list.
+  const rows = all.map(name => ({ name, count: counts[name]||0 }))
+    .sort((a,b) => b.count - a.count || a.name.localeCompare(b.name));
+  const totalVisits = dayVisits.length;
+  const activeCount = rows.filter(r=>r.count>0).length;
+  return `<div class="screen">
+    <h1>Visits Calendar / تقويم الزيارات</h1>
+    <p class="lede">Pick a date to see how many visits each merchandiser logged that day.</p>
+    <div class="card">
+      <label>Date / التاريخ</label>
+      <input type="date" value="${day}" onchange="setCalendarDate(this.value)"/>
+    </div>
+    <div class="verify-row" style="margin:10px 0">
+      ${statusChip('neutral', `${totalVisits} visit${totalVisits===1?'':'s'} total / إجمالي الزيارات`)}
+      ${statusChip('neutral', `${activeCount}/${rows.length} merchandisers active / نشط`)}
+    </div>
+    <div class="sectitle">By merchandiser / حسب المندوب</div>
+    ${rows.length ? rows.map(r => `
+      <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px">
+        <div class="visit-main">${r.name}</div>
+        ${statusChip(r.count===0?'off':(r.count>=3?'on':'watch'), `${r.count} visit${r.count===1?'':'s'}`)}
+      </div>`).join('') : emptyState('📅','No merchandisers on the roster yet','Accounts need a merchandiser assigned before they show up here.')}
   </div>`;
 }
 
@@ -3437,6 +3472,7 @@ function navHtml(){
   const manageTabDefs = {
     approvals: {id:'approvals', ico:'✅', lbl:bi('Approvals','الموافقات'), badge: State.visits.filter(v=>v.status==='pending').length},
     arrivals: {id:'arrivals', ico:'📍', lbl:bi('Arrivals','الوصول'), badge: State.arrivals.filter(a=>a.status==='active').length},
+    visitcalendar: {id:'visitcalendar', ico:'📅', lbl:bi('Visits Calendar','تقويم الزيارات')},
     dashboard: {id:'dashboard', ico:'📊', lbl:bi('Dashboard','لوحة التحكم')},
     team: {id:'team', ico:'👥', lbl:bi('Team','الفريق')},
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
@@ -3468,6 +3504,7 @@ function render(){
     else if(State.tab==='myvisits') body = screenMyVisits();
     else if(State.tab==='approvals') body = screenApprovals();
     else if(State.tab==='arrivals') body = screenArrivals();
+    else if(State.tab==='visitcalendar') body = screenVisitCalendar();
     else if(State.tab==='dashboard') body = screenDashboard();
     else if(State.tab==='team') body = screenTeam();
     else if(State.tab==='scorecard') body = screenScorecard();
@@ -3526,7 +3563,7 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate
 });
 
 /* ============================= INIT ============================= */
