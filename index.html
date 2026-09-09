@@ -1242,8 +1242,9 @@ const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
   supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','team','scorecard','allvisits','delegate'] },
-  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','team','scorecard','allvisits','storemap'] },
-  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','team','scorecard','allvisits','storemap'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
+  commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','accounts','scorecard','allvisits','storemap'] },
   commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
@@ -2393,6 +2394,49 @@ function computeCustomerAnalysis(approved){
     };
   }).sort((a,b)=>b.avgSfr-a.avgSfr);
 }
+
+/* ---- Accounts (customer → branch drill-down: last visit, duration, totals) ---- */
+function screenAccounts(){
+  const approved = State.visits.filter(v=>v.status==='approved');
+  const customers = computeCustomerAnalysis(approved);
+  if(customers.length===0) return `<div class="screen"><h1>Accounts / الحسابات</h1>${emptyState('🏬','No approved visits yet','Data appears here once visits are approved.')}</div>`;
+  return `<div class="screen">
+    <h1>Accounts / الحسابات</h1>
+    <p class="lede">Every customer, drill into branches for last visit, duration &amp; totals.</p>
+    ${customers.map(c=>{
+      const open = State.expandedCategory === 'acct:'+c.name;
+      return `<div class="card">
+        <div class="branch-toggle" onclick="toggleCategory('acct:${c.name.replace(/'/g,"\\'")}')">
+          <div><div class="visit-main">${c.name}</div><div class="visit-sub">${c.branchCount} branch${c.branchCount>1?'es':''}</div></div>
+          <div style="font-size:16px">${open?'−':'+'}</div>
+        </div>
+        ${open ? c.branches.map(b=>{
+          const bKey = 'abr:'+c.name+'|'+b.branch;
+          const bOpen = State.expandedBranch === bKey;
+          const acct = State.accounts.find(a=>a.name===c.name && a.branch===b.branch);
+          const lastVisit = State.visits.filter(v=>v.accountName===c.name && v.branch===b.branch && v.status!=='rejected')
+            .sort((x,y)=>(y.submittedAt||0)-(x.submittedAt||0))[0];
+          const durMins = lastVisit ? visitDurationMinutes(lastVisit) : null;
+          const totalVel = b.skuList.reduce((s,sk)=>s+sk.avgVel,0);
+          return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
+            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div>
+              <div class="hint">Last visited: ${b.lastVisitDate||'—'}${durMins!==null?' · ⏱ '+fmtDuration(durMins):''}</div>
+            </div>
+            <div style="font-size:14px">${bOpen?'−':'+'}</div>
+          </div>
+          ${bOpen ? `<div class="verify-row" style="margin:0 0 10px">
+            ${statusChip('neutral', `Vel ${fmt(totalVel,1)}/d total`)}
+            ${statusChip(b.osaPct>=80?'on':'watch', `OSA ${fmt(b.osaPct)}%`)}
+            ${statusChip(b.sfr>=80?'on':'watch', `SUC ${fmt(b.sfr)}%`)}
+            ${statusChip(b.sos>=15?'on':'watch', `SOS ${fmt(b.sos)}%`)}
+            ${statusChip('neutral', `Merch: ${acct?acct.merch:'—'}`)}
+            ${statusChip('neutral', `Supervisor: ${acct?acct.sup:'—'}`)}
+          </div>` : ''}`;
+        }).join('') : ''}
+      </div>`;
+    }).join('')}
+  </div>`;
+}
 function computeNetworkStockSummary(approved){
   const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0));
   const stats = {}; // key: account|branch|sku -> {latestStock, velSum, velN}
@@ -3527,6 +3571,7 @@ function navHtml(){
     approvals: {id:'approvals', ico:'✅', lbl:bi('Approvals','الموافقات'), badge: State.visits.filter(v=>v.status==='pending').length},
     arrivals: {id:'arrivals', ico:'📍', lbl:bi('Arrivals','الوصول'), badge: State.arrivals.filter(a=>a.status==='active').length},
     visitcalendar: {id:'visitcalendar', ico:'📅', lbl:bi('Visits Calendar','تقويم الزيارات')},
+    accounts: {id:'accounts', ico:'🏬', lbl:bi('Accounts','الحسابات')},
     dashboard: {id:'dashboard', ico:'📊', lbl:bi('Dashboard','لوحة التحكم')},
     team: {id:'team', ico:'👥', lbl:bi('Team','الفريق')},
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
@@ -3559,6 +3604,7 @@ function render(){
     else if(State.tab==='approvals') body = screenApprovals();
     else if(State.tab==='arrivals') body = screenArrivals();
     else if(State.tab==='visitcalendar') body = screenVisitCalendar();
+    else if(State.tab==='accounts') body = screenAccounts();
     else if(State.tab==='dashboard') body = screenDashboard();
     else if(State.tab==='team') body = screenTeam();
     else if(State.tab==='scorecard') body = screenScorecard();
