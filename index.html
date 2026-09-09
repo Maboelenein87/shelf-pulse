@@ -951,18 +951,49 @@ function isTypingNow(){
   const el = document.activeElement;
   return !!(el && (el.tagName==='INPUT' || el.tagName==='TEXTAREA'));
 }
+// Below this, a visit's arrival-to-submission time is implausible for genuinely doing the shelf
+// audit — worth a supervisor's second look, not an accusation. Distinct from (and stricter than)
+// the older 2-minute photo-to-submit check in Manage SKUs, which only covers visits without a real
+// arrival timestamp to work from.
+const SHORT_COMPLETION_MINUTES = 20;
 function watchVisits(){
   if(!isConfigured) return;
   const { collection, onSnapshot, query, orderBy } = firestoreFns;
   const q = query(collection(db, 'visits'), orderBy('submittedAt', 'desc'));
+  let firstSnapshot = true;
   onSnapshot(q, snap => {
+    const conf = roleConf();
+    const canSeeArrivals = (conf.manageTabs||[]).includes('arrivals');
+    if(!firstSnapshot && canSeeArrivals){
+      snap.docChanges().forEach(ch => {
+        if(ch.type === 'added'){
+          const v = { id: ch.doc.id, ...ch.doc.data() };
+          if(v.auditor === identityLabel()) return; // no need to flag someone's own visit to themselves
+          const mins = visitDurationMinutes(v);
+          if(v.arrivedAt && mins !== null && mins < SHORT_COMPLETION_MINUTES) notifyFastCompletion(v, mins);
+        }
+      });
+    }
     const visits = [];
     snap.forEach(d => visits.push({ id: d.id, ...d.data() }));
     State.visits = visits;
+    firstSnapshot = false;
     // Never yank the screen out from under someone mid-keystroke — the data is still updated,
     // it just waits to redraw until they blur the field or take their next action.
     if(!isTypingNow()) render();
   });
+}
+function notifyFastCompletion(v, mins){
+  showToast(`🔍 ${v.auditor} completed ${v.accountName} in ${fmtDuration(mins)} — investigate`);
+  try{
+    if('Notification' in window){
+      if(Notification.permission === 'granted'){
+        new Notification('Fast visit — worth a look', { body: `${v.auditor} — ${v.accountName} in ${fmtDuration(mins)}` });
+      } else if(Notification.permission !== 'denied'){
+        Notification.requestPermission();
+      }
+    }
+  }catch(e){ /* toast above still covers it */ }
 }
 async function visitCreate(visit){
   const { doc, setDoc } = firestoreFns;
@@ -1571,6 +1602,13 @@ async function finishArrival(photoDataUrl){
     d.arrivalId = arrivalId;
     d.arrivedAt = arrivedAt;
     d.capturedAt = d.capturedAt || arrivedAt;
+    // The arrival photo becomes the visit's first shelf photo too — not a separate, invisible thing.
+    // This is what makes step 2 open with the photo already sitting there (not an empty gallery that
+    // looks like everything got wiped), and it's why a reload mid-visit restores cleanly: this photo
+    // now lives in the same draft.photos array that saveDraftLocal()/restoreDraftIfAny() already
+    // persist and restore, alongside every SKU field.
+    d.photos = d.photos || [];
+    if(d.photos.length === 0) d.photos.push(photoUrl);
     saveDraftLocal();
     showToast('Arrival marked ✓ — start the shelf check');
   }catch(e){
@@ -2100,7 +2138,12 @@ function arrivalCardHtml(a, isActive){
   const elapsedMins = isActive ? (Date.now()-a.arrivedAt)/60000 : null;
   const statusLabel = a.status==='active' ? 'on-site' : a.status==='completed' ? 'completed' : 'abandoned';
   const statusColor = a.status==='active' ? 'watch' : a.status==='completed' ? 'on' : 'off';
-  return `<div class="card">
+  // For a completed arrival, pull the actual completion duration from the linked visit — same
+  // arrival-to-submission figure the notification fired on — so the flag here matches exactly.
+  const linkedVisit = (a.status==='completed' && a.visitId) ? State.visits.find(v=>v.id===a.visitId) : null;
+  const completionMins = linkedVisit ? visitDurationMinutes(linkedVisit) : null;
+  const flagFast = completionMins !== null && completionMins < SHORT_COMPLETION_MINUTES;
+  return `<div class="card"${flagFast?' style="border-color:var(--red)"':''}>
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
       ${statusChip(statusColor, statusLabel)}
@@ -2108,6 +2151,8 @@ function arrivalCardHtml(a, isActive){
     <div class="verify-row" style="margin-bottom:8px">
       ${statusChip('neutral', '🕐 Arrived ' + new Date(a.arrivedAt).toLocaleTimeString())}
       ${isActive ? statusChip(elapsedMins>90?'watch':'neutral', '⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
+      ${completionMins !== null ? statusChip(flagFast?'off':'on', '⏱ ' + fmtDuration(completionMins) + ' total') : ''}
+      ${flagFast ? statusChip('off', '🔍 Investigate — too fast for a full visit') : ''}
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
     </div>
     ${a.photo ? `<img src="${a.photo}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${a.photo}')"/>` : ''}
@@ -3333,7 +3378,12 @@ function getMonthlyCapacity(accountId, skuId, monthKey){
   for(const v of State.visits){
     if(v.accountId!==accountId || v.status==='rejected') continue;
     if((v.date||'').slice(0,7) !== monthKey) continue;
-    const item = (v.items||[]).find(it=>it.skuId===skuId && it.pogFacings!=='' && it.pogFacings!=null);
+    // Zero doesn't count as "known capacity" — it's the placeholder merchandisers type when they
+    // don't carry the SKU or haven't measured the shelf yet (per the "enter 0, don't leave blank"
+    // instruction on the form). Locking the whole month to 0 would permanently block anyone from
+    // ever entering the real number once the SKU does get carried. Only a genuine positive figure
+    // should lock it going forward.
+    const item = (v.items||[]).find(it=>it.skuId===skuId && it.pogFacings!=='' && it.pogFacings!=null && parseFloat(it.pogFacings) > 0);
     if(item) return item.pogFacings;
   }
   return null;
