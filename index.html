@@ -1057,6 +1057,39 @@ function notifyArrival(a){
     }
   }catch(e){ /* Notification API unavailable — toast above still covers it */ }
 }
+// On-site too long is its own red flag, distinct from "completed too fast": someone who marks
+// arrival and then genuinely walks away (with or without the app open) leaves an arrival stuck at
+// 'active' with the elapsed clock still running — nothing in Firestore changes while that happens,
+// so it can't be caught by the onSnapshot listeners above and needs a periodic check instead.
+const LONG_ONSITE_MINUTES = 90;
+const longOnsiteNotified = new Set();
+function checkLongOnsiteArrivals(){
+  const conf = roleConf();
+  if(!(conf.manageTabs||[]).includes('arrivals')) return;
+  let flaggedNew = false;
+  State.arrivals.forEach(a => {
+    if(a.status !== 'active') return;
+    const mins = (Date.now()-a.arrivedAt)/60000;
+    if(mins >= LONG_ONSITE_MINUTES && !longOnsiteNotified.has(a.id)){
+      longOnsiteNotified.add(a.id);
+      notifyLongOnsite(a, mins);
+      flaggedNew = true;
+    }
+  });
+  if(flaggedNew && !isTypingNow()) render(); // so the Arrivals tab's flag appears without waiting for the next unrelated re-render
+}
+function notifyLongOnsite(a, mins){
+  showToast(`🔍 ${a.auditor} has been on-site at ${a.accountName} for ${fmtDuration(mins)} — investigate`);
+  try{
+    if('Notification' in window){
+      if(Notification.permission === 'granted'){
+        new Notification('Unusually long on-site time', { body: `${a.auditor} — ${a.accountName}, ${fmtDuration(mins)} so far` });
+      } else if(Notification.permission !== 'denied'){
+        Notification.requestPermission();
+      }
+    }
+  }catch(e){ /* toast above still covers it */ }
+}
 function watchDelegations(){
   if(!isConfigured) return;
   const { collection, onSnapshot } = firestoreFns;
@@ -1332,6 +1365,7 @@ async function loadAll(){
   watchVisits();
   watchDelegations();
   watchArrivals();
+  setInterval(checkLongOnsiteArrivals, 5*60*1000); // periodic — nothing in Firestore changes while someone's just sitting "active", so this can't be event-driven like the other notifications
   State.loaded = true;
   if(hasSavedSession) restoreDraftIfAny();
 }
@@ -1433,6 +1467,24 @@ async function submitVisit(){
   if(!d.photos || d.photos.length === 0){
     showToast('Take at least one photo before submitting — it also captures your location');
     return;
+  }
+  if(!d.geo){
+    // One more quiet attempt right before we ask them to accept "unverified" — by the time someone's
+    // finished the whole visit and is hitting submit, they've often drifted closer to a door or
+    // window since the arrival/first-photo attempt, so GPS has a real shot at a fix now that didn't
+    // exist a few minutes ago. Bounded so it can't turn into another hang.
+    showToast('Checking location…');
+    try{
+      d.geo = await withTimeout(new Promise(resolve => {
+        if(!navigator.geolocation){ resolve(null); return; }
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
+          () => resolve(null),
+          { enableHighAccuracy:true, timeout:8000 }
+        );
+      }), 10000);
+    }catch(e){ d.geo = null; }
+    if(d.geo) saveDraftLocal();
   }
   if(!d.geo){
     const proceed = confirm('No location was captured for this visit (weak GPS signal indoors is common) — it will be flagged as unverified. Submit anyway?');
@@ -2144,16 +2196,18 @@ function arrivalCardHtml(a, isActive){
   const linkedVisit = (a.status==='completed' && a.visitId) ? State.visits.find(v=>v.id===a.visitId) : null;
   const completionMins = linkedVisit ? visitDurationMinutes(linkedVisit) : null;
   const flagFast = completionMins !== null && completionMins < SHORT_COMPLETION_MINUTES;
-  return `<div class="card"${flagFast?' style="border-color:var(--red)"':''}>
+  const flagLong = isActive && elapsedMins >= LONG_ONSITE_MINUTES;
+  return `<div class="card"${(flagFast||flagLong)?' style="border-color:var(--red)"':''}>
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
       ${statusChip(statusColor, statusLabel)}
     </div>
     <div class="verify-row" style="margin-bottom:8px">
       ${statusChip('neutral', '🕐 Arrived ' + new Date(a.arrivedAt).toLocaleTimeString())}
-      ${isActive ? statusChip(elapsedMins>90?'watch':'neutral', '⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
+      ${isActive ? statusChip(flagLong?'off':(elapsedMins>60?'watch':'neutral'), '⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
       ${completionMins !== null ? statusChip(flagFast?'off':'on', '⏱ ' + fmtDuration(completionMins) + ' total') : ''}
       ${flagFast ? statusChip('off', '🔍 Investigate — too fast for a full visit') : ''}
+      ${flagLong ? statusChip('off', '🔍 Investigate — unusually long on-site') : ''}
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
     </div>
     ${a.photo ? `<img src="${a.photo}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${a.photo}')"/>` : ''}
