@@ -975,6 +975,57 @@ async function visitUpdate(id, patch){
   const { doc, updateDoc } = firestoreFns;
   await withTimeout(updateDoc(doc(db, 'visits', id), patch), 20000);
 }
+/* ============================= ARRIVALS (visit start → submit, for real on-site duration) ============================= */
+function watchArrivals(){
+  if(!isConfigured) return;
+  const { collection, onSnapshot, query, orderBy } = firestoreFns;
+  const q = query(collection(db, 'arrivals'), orderBy('arrivedAt', 'desc'));
+  let firstSnapshot = true;
+  onSnapshot(q, snap => {
+    const arrivals = [];
+    // New-arrival notifications: only for roles with an Arrivals tab, only for docs that showed up
+    // after this listener was already live (not the initial historical batch), and only for someone
+    // else's arrival (no need to notify a merchandiser about their own).
+    const conf = roleConf();
+    const canSeeArrivals = (conf.manageTabs||[]).includes('arrivals');
+    if(!firstSnapshot && canSeeArrivals){
+      snap.docChanges().forEach(ch => {
+        if(ch.type === 'added'){
+          const a = { id: ch.doc.id, ...ch.doc.data() };
+          if(a.status === 'active' && a.auditor !== identityLabel()){
+            notifyArrival(a);
+          }
+        }
+      });
+    }
+    snap.forEach(d => arrivals.push({ id: d.id, ...d.data() }));
+    State.arrivals = arrivals;
+    firstSnapshot = false;
+    if(!isTypingNow()) render();
+  });
+}
+async function arrivalCreate(arrival){
+  const { doc, setDoc } = firestoreFns;
+  await withTimeout(setDoc(doc(db, 'arrivals', arrival.id), arrival), 20000);
+}
+async function arrivalUpdate(id, patch){
+  const { doc, updateDoc } = firestoreFns;
+  await withTimeout(updateDoc(doc(db, 'arrivals', id), patch), 20000);
+}
+function notifyArrival(a){
+  showToast(`📍 ${a.auditor} arrived at ${a.accountName}`);
+  // Web Notification API — fires even if this tab is backgrounded (not if the browser is fully
+  // closed; that would need push infrastructure this app doesn't have). Best-effort only.
+  try{
+    if('Notification' in window){
+      if(Notification.permission === 'granted'){
+        new Notification('Merchandiser arrived', { body: `${a.auditor} — ${a.accountName} (${a.branch})` });
+      } else if(Notification.permission !== 'denied'){
+        Notification.requestPermission();
+      }
+    }
+  }catch(e){ /* Notification API unavailable — toast above still covers it */ }
+}
 function watchDelegations(){
   if(!isConfigured) return;
   const { collection, onSnapshot } = firestoreFns;
@@ -1126,9 +1177,9 @@ const SUPERVISOR_PASSWORDS = {
 const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4568", "4569", "4570", "4632", "4807", "4808", "4854", "4876", "5109", "5461", "5472", "5486", "5600", "5605", "5614", "5662", "5693", "5715", "5716", "5799", "5813", "5834", "5882", "5900", "5923", "5985", "5996", "6003", "6070", "6102", "6115", "6130", "6152", "6213", "6246", "6259", "6276", "6356", "6388", "6396", "6608", "6618", "6739", "6848", "6856", "6881", "6896", "6949", "6966", "7025", "7073", "7159", "7176", "7215", "7216", "7217", "7252", "7254", "7255", "7262", "7301", "7316"]);
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
-  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','team','scorecard','allvisits','delegate'] },
-  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard','allvisits','storemap'] },
-  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','dashboard','team','scorecard','allvisits','storemap'] },
+  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','team','scorecard','allvisits','delegate'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','dashboard','team','scorecard','allvisits','storemap'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','dashboard','team','scorecard','allvisits','storemap'] },
   commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
@@ -1144,8 +1195,9 @@ const State = {
   role: null, name: '', tab: 'home', navContext: 'field',
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
-  cameraOpen: false, cameraStream: null, cameraPreview: null,
-  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'' },
+  cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
+  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', arrivalId:null, arrivedAt:null },
+  arrivals: [], arrivalPending: false,
   toast: null,
   accountSearch: '',
   dashSub: 'overview',
@@ -1247,6 +1299,7 @@ async function loadAll(){
   await loadLocations();
   watchVisits();
   watchDelegations();
+  watchArrivals();
   State.loaded = true;
   if(hasSavedSession) restoreDraftIfAny();
 }
@@ -1391,11 +1444,13 @@ async function submitVisit(){
       date: todayStr(), auditor: identityLabel(),
       status: 'pending', items: finalItems,
       photos: uploadedPhotos, geo: d.geo || null, capturedAt: d.capturedAt || null,
+      arrivalId: d.arrivalId || null, arrivedAt: d.arrivedAt || null,
       submittedAt: Date.now(),
     };
     await visitCreate(visit);
     recordLocationLearning(visit); // fire-and-forget — don't block the submit confirmation on this
-    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'' };
+    if(d.arrivalId){ arrivalUpdate(d.arrivalId, {status:'completed', visitId}).catch(()=>{}); } // fire-and-forget, same reasoning
+    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', arrivalId:null, arrivedAt:null };
     clearDraftLocal();
     State.accountSearch = '';
     showToast(navigator.onLine ? 'Visit submitted for approval ✓' : "Saved on this device ✓ — will upload automatically once you're back online. You can move to the next visit now.");
@@ -1416,8 +1471,10 @@ function showToast(msg){ State.toast = msg; if(!isTypingNow()) render(); setTime
 
 /* ============================= PHOTO + GEO CAPTURE (multi-photo, 1-10) ============================= */
 const MAX_PHOTOS = 10;
-async function capturePhoto(){
-  if((State.draft.photos||[]).length >= MAX_PHOTOS){ showToast(`Max ${MAX_PHOTOS} photos per visit`); return; }
+// Shared camera opener — capturePhoto() (shelf photos) and markArrival() (arrival photo) both use
+// this, distinguished by State.cameraMode, so confirmCameraPhoto() knows which flow to feed the
+// captured image into.
+async function openCamera(){
   // Capture entirely in-page via the camera stream — this never hands off to the phone's native
   // camera app, so nothing gets saved to the phone's own photo gallery or eats into device storage.
   if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
@@ -1427,13 +1484,26 @@ async function capturePhoto(){
       State.cameraPreview = null;
       State.cameraOpen = true;
       render();
-      return;
+      return true;
     }catch(e){
       console.error('in-page camera unavailable, falling back to native picker', e);
-      // fall through to the file-input fallback below
+      // fall through to the file-input fallback
     }
   }
+  return false;
+}
+async function capturePhoto(){
+  if((State.draft.photos||[]).length >= MAX_PHOTOS){ showToast(`Max ${MAX_PHOTOS} photos per visit`); return; }
+  State.cameraMode = 'visit';
+  if(await openCamera()) return;
   capturePhotoFallback();
+}
+async function markArrival(){
+  if(!State.draft.accountId){ showToast('Select an account first'); return; }
+  if(State.draft.arrivalId || State.arrivalPending) return;
+  State.cameraMode = 'arrival';
+  if(await openCamera()) return;
+  arrivalPhotoFallback();
 }
 function capturePhotoFallback(){
   const inp = document.createElement('input');
@@ -1446,11 +1516,63 @@ function capturePhotoFallback(){
   };
   inp.click();
 }
+function arrivalPhotoFallback(){
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment';
+  inp.onchange = async () => {
+    const file = inp.files[0]; if(!file) return;
+    showToast('Processing photo…');
+    const dataUrl = await compressImage(file, 640, 0.55);
+    finishArrival(dataUrl);
+  };
+  inp.click();
+}
 function addCapturedPhoto(dataUrl){
   State.draft.photos = State.draft.photos || [];
   State.draft.photos.push(dataUrl);
   State.draft.capturedAt = State.draft.capturedAt || Date.now();
   if(!State.draft.geo) captureGeo(); else { saveDraftLocal(); render(); }
+}
+// Marks the true start of the visit: creates an `arrivals` doc immediately (so supervisors see it
+// live) and stamps the draft with arrivalId/arrivedAt, which visitDurationMinutes() and submitVisit()
+// then use as the real on-site start time instead of the old proxy (first shelf photo).
+async function finishArrival(photoDataUrl){
+  const d = State.draft;
+  const arrivalId = uid();
+  State.arrivalPending = true; render();
+  try{
+    let geo = d.geo;
+    if(!geo){
+      geo = await new Promise(resolve => {
+        if(!navigator.geolocation){ resolve(null); return; }
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
+          () => resolve(null),
+          { enableHighAccuracy:true, timeout:8000 }
+        );
+      });
+    }
+    let photoUrl = photoDataUrl;
+    try{ photoUrl = await uploadVisitPhoto(photoDataUrl, arrivalId, 0); }catch(e){ console.error('Arrival photo upload failed, keeping embedded copy:', e); }
+    const arrivedAt = Date.now();
+    const arrival = {
+      id: arrivalId, accountId:d.accountId, accountName:d.accountName, branch:d.branch,
+      channel:d.channel||'', region:d.region||'', auditor: identityLabel(),
+      date: todayStr(), arrivedAt, photo: photoUrl, geo: geo||null, status:'active', visitId:null,
+    };
+    await arrivalCreate(arrival);
+    d.geo = geo||d.geo;
+    d.arrivalId = arrivalId;
+    d.arrivedAt = arrivedAt;
+    d.capturedAt = d.capturedAt || arrivedAt;
+    saveDraftLocal();
+    showToast('Arrival marked ✓ — start the shelf check');
+  }catch(e){
+    console.error('Arrival mark failed', e);
+    showToast('Could not mark arrival — check your connection and try again.');
+  } finally {
+    State.arrivalPending = false; render();
+  }
 }
 function attachCameraStream(){
   const video = document.getElementById('cam-live-video');
@@ -1472,7 +1594,8 @@ function snapPhoto(){
 function retakePhoto(){ State.cameraPreview = null; render(); }
 function confirmCameraPhoto(){
   if(!State.cameraPreview) return;
-  addCapturedPhoto(State.cameraPreview);
+  if(State.cameraMode === 'arrival') finishArrival(State.cameraPreview);
+  else addCapturedPhoto(State.cameraPreview);
   closeCamera();
 }
 function closeCamera(){
@@ -1486,7 +1609,7 @@ function cameraOverlayHtml(){
   return `<div class="cam-overlay">
     <div class="cam-top-bar">
       <button class="cam-close-btn" onclick="closeCamera()">✕</button>
-      <span class="cam-hint">${State.cameraPreview ? 'Review photo / مراجعة الصورة' : 'Line up the shelf / صوّر الرف'}</span>
+      <span class="cam-hint">${State.cameraPreview ? 'Review photo / مراجعة الصورة' : (State.cameraMode==='arrival' ? 'Confirm your location / أكد موقعك' : 'Line up the shelf / صوّر الرف')}</span>
       <span style="width:38px"></span>
     </div>
     <div class="cam-video-wrap">
@@ -1556,13 +1679,16 @@ function fmt(n, d=0){
   return n.toFixed(d);
 }
 function visitPhotos(v){ return (v.photos && v.photos.length) ? v.photos : (v.photo ? [v.photo] : []); }
-/* Visit duration: time from first photo (arrival proof) to submission. Not a perfect stopwatch —
-   a merchandiser could step away mid-visit — but it's the best evidence-anchored proxy we have
-   without adding a separate "arrived" tap. Returns null when either timestamp is missing or the
-   gap is negative/implausible (e.g. clock skew from an offline draft synced later). */
+/* Visit duration: from the arrival tap (real on-site start, once that flow exists on a visit) to
+   submission — the most accurate figure we have. Older visits recorded before the arrival step
+   existed fall back to first-photo-to-submission, a rougher proxy. Returns null when the relevant
+   timestamps are missing or the gap is negative/implausible (e.g. clock skew from an offline draft
+   synced later). */
 function visitDurationMinutes(v){
-  if(!v || !v.capturedAt || !v.submittedAt) return null;
-  const mins = (v.submittedAt - v.capturedAt) / 60000;
+  if(!v || !v.submittedAt) return null;
+  const start = v.arrivedAt || v.capturedAt;
+  if(!start) return null;
+  const mins = (v.submittedAt - start) / 60000;
   if(!isFinite(mins) || mins < 0 || mins > 8*60) return null; // cap at 8h — treat longer gaps as offline-sync artifacts, not real dwell time
   return mins;
 }
@@ -1738,9 +1864,10 @@ function visitRowHtml(v){
 function screenNewVisit(){
   const d = State.draft;
   const hasAccount = !!d.accountName;
+  const arrived = !!d.arrivalId;
   return `<div class="screen">
     <h1>New visit / زيارة جديدة</h1>
-    <p class="lede">Search an account, capture the shelf, snap a photo.</p>
+    <p class="lede">Search an account, mark your arrival, then capture the shelf.</p>
     <div class="card">
       <h3>Account / الحساب</h3>
       ${hasAccount ? `
@@ -1754,6 +1881,19 @@ function screenNewVisit(){
       <label>Date / التاريخ</label>
       <input type="date" value="${todayStr()}" disabled style="background:#EFEBE9;color:var(--ink-soft)"/>
       <p class="hint" style="margin:4px 0 0">Always today — visits can't be backdated / لا يمكن تسجيل زيارة بتاريخ سابق</p>
+    </div>
+
+    ${hasAccount && !arrived ? `
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">Mark your arrival / تسجيل الوصول</h3>
+      <p class="hint" style="margin:0 0 10px">Take a quick photo now to log exactly when and where you arrived — this starts the visit timer. Shelf data can't be entered until you do.</p>
+      <button class="btn btn-primary" onclick="markArrival()" ${State.arrivalPending?'disabled':''}>${State.arrivalPending ? 'Marking arrival…' : '📍 Mark arrival — take photo / تسجيل الوصول'}</button>
+    </div>
+    ` : (!hasAccount ? '' : `
+    <div class="card">
+      <div class="verify-row">
+        ${statusChip('on', `📍 Arrived ${new Date(d.arrivedAt).toLocaleTimeString()} / وصل`)}
+      </div>
     </div>
 
     <div class="card">
@@ -1801,6 +1941,7 @@ function screenNewVisit(){
     ${d.items.map((it,idx)=>skuLineHtml(it,idx)).join('') || `<p class="hint">Select an account above to load its SKU checklist.</p>`}
     <div style="height:14px"></div>
     <button class="btn btn-primary" onclick="submitVisit()" ${State.submitting?'disabled':''}>${State.submitting ? 'Uploading & submitting…' : 'Submit visit for approval / إرسال الزيارة للموافقة'}</button>
+    `)}
   </div>`;
 }
 function myAccounts(){
@@ -1856,7 +1997,7 @@ function skuLineHtml(it, idx){
       </div>
       <div class="row2">
         <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing}) — a facing can't hold stock that isn't there / تحقق من الكمية</p>` : ''}</div>
-        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" ${it.capacityLocked?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/>${it.capacityLocked?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
+        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" ${(it.capacityLocked && it.pogFacings!=='')?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/>${(it.capacityLocked && it.pogFacings!=='')?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
       </div>
       <div class="row2">
         <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
@@ -1912,6 +2053,38 @@ function approvalCardHtml(v){
       <button class="btn btn-danger btn-sm" style="flex:1" onclick="rejectPrompt('${v.id}')">Reject / رفض</button>
       ` : `<p class="hint">View-only — you don't have approval rights.</p>`}
     </div>
+  </div>`;
+}
+
+/* ---- Arrivals (live "who's on-site now" + recent arrival history) ---- */
+function screenArrivals(){
+  const mySet = new Set(myMerchandisers());
+  const scoped = State.arrivals.filter(a => State.role!=='supervisor' || mySet.has(a.auditor));
+  const active = scoped.filter(a=>a.status==='active');
+  const recent = scoped.filter(a=>a.status!=='active').slice(0, 20);
+  return `<div class="screen">
+    <h1>Arrivals / الوصول</h1>
+    <p class="lede">Live view of who's on-site right now, and recent arrivals.</p>
+    <div class="sectitle">On-site now — ${active.length} / متواجدون الآن</div>
+    ${active.map(a=>arrivalCardHtml(a,true)).join('') || emptyState('📍','Nobody currently checked in','Arrivals show up here the moment a merchandiser marks arrival.')}
+    ${recent.length ? `<div class="sectitle" style="margin-top:16px">Recent / الأخيرة</div>${recent.map(a=>arrivalCardHtml(a,false)).join('')}` : ''}
+  </div>`;
+}
+function arrivalCardHtml(a, isActive){
+  const elapsedMins = isActive ? (Date.now()-a.arrivedAt)/60000 : null;
+  const statusLabel = a.status==='active' ? 'on-site' : a.status==='completed' ? 'completed' : 'abandoned';
+  const statusColor = a.status==='active' ? 'watch' : a.status==='completed' ? 'on' : 'off';
+  return `<div class="card">
+    <div class="visit-row" style="border:none;padding:0 0 8px;">
+      <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
+      ${statusChip(statusColor, statusLabel)}
+    </div>
+    <div class="verify-row" style="margin-bottom:8px">
+      ${statusChip('neutral', '🕐 Arrived ' + new Date(a.arrivedAt).toLocaleTimeString())}
+      ${isActive ? statusChip(elapsedMins>90?'watch':'neutral', '⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
+      ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
+    </div>
+    ${a.photo ? `<img src="${a.photo}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${a.photo}')"/>` : ''}
   </div>`;
 }
 
@@ -3147,13 +3320,18 @@ function pickAccount(id){
     const monthKey = monthKeyOf(dft.date);
     dft.items = State.skus.map(s => {
       const locked = getMonthlyCapacity(a.id, s.id, monthKey);
-      return {skuId:s.id, opening:'', closing:'', deliveries:'', pogFacings: locked!==null?String(locked):'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:'7', _open:false, capacityLocked: locked!==null};
+      return {skuId:s.id, opening:'', closing:'', deliveries:'', pogFacings: locked!==null?String(locked):'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:'7', _open:false, capacityLocked: locked!==null && locked!==''};
     });
   }
   saveDraftLocal();
   render();
 }
-function clearAccount(){ State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.accountSearch=''; clearDraftLocal(); render(); }
+function clearAccount(){
+  // Changing accounts abandons any in-progress arrival at the old one — best-effort, fire-and-forget
+  // so a slow connection doesn't block the merchandiser from moving on.
+  if(State.draft.arrivalId){ arrivalUpdate(State.draft.arrivalId, {status:'abandoned'}).catch(()=>{}); }
+  State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.draft.photos=[]; State.draft.geo=null; State.draft.capturedAt=null; State.draft.arrivalId=null; State.draft.arrivedAt=null; State.accountSearch=''; clearDraftLocal(); render();
+}
 function toggleLine(idx){ State.draft.items[idx]._open = !State.draft.items[idx]._open; render(); }
 function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); }
 function lineFieldBlur(){ render(); }
@@ -3182,6 +3360,7 @@ function navHtml(){
   ];
   const manageTabDefs = {
     approvals: {id:'approvals', ico:'✅', lbl:bi('Approvals','الموافقات'), badge: State.visits.filter(v=>v.status==='pending').length},
+    arrivals: {id:'arrivals', ico:'📍', lbl:bi('Arrivals','الوصول'), badge: State.arrivals.filter(a=>a.status==='active').length},
     dashboard: {id:'dashboard', ico:'📊', lbl:bi('Dashboard','لوحة التحكم')},
     team: {id:'team', ico:'👥', lbl:bi('Team','الفريق')},
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
@@ -3212,6 +3391,7 @@ function render(){
     if(State.tab==='newvisit') body = screenNewVisit();
     else if(State.tab==='myvisits') body = screenMyVisits();
     else if(State.tab==='approvals') body = screenApprovals();
+    else if(State.tab==='arrivals') body = screenArrivals();
     else if(State.tab==='dashboard') body = screenDashboard();
     else if(State.tab==='team') body = screenTeam();
     else if(State.tab==='scorecard') body = screenScorecard();
@@ -3270,7 +3450,7 @@ Object.assign(window, {
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
-  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo
+  closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival
 });
 
 /* ============================= INIT ============================= */
