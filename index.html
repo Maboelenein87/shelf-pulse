@@ -2428,13 +2428,13 @@ function computeCustomerAnalysis(approved){
   }).sort((a,b)=>b.avgSfr-a.avgSfr);
 }
 
-/* ---- Accounts (customer → branch drill-down: last visit, duration, totals) ---- */
+/* ---- Customers (customer → branch drill-down: last visit, duration, totals) ---- */
 function screenAccounts(){
   const approved = State.visits.filter(v=>v.status==='approved');
   const customers = computeCustomerAnalysis(approved);
-  if(customers.length===0) return `<div class="screen"><h1>Accounts / الحسابات</h1>${emptyState('🏬','No approved visits yet','Data appears here once visits are approved.')}</div>`;
+  if(customers.length===0) return `<div class="screen"><h1>Customers / العملاء</h1>${emptyState('🏬','No approved visits yet','Data appears here once visits are approved.')}</div>`;
   return `<div class="screen">
-    <h1>Accounts / الحسابات</h1>
+    <h1>Customers / العملاء</h1>
     <p class="lede">Every customer, drill into branches for last visit, duration &amp; totals.</p>
     ${customers.map(c=>{
       const open = State.expandedCategory === 'acct:'+c.name;
@@ -2451,6 +2451,12 @@ function screenAccounts(){
             .sort((x,y)=>(y.submittedAt||0)-(x.submittedAt||0))[0];
           const durMins = lastVisit ? visitDurationMinutes(lastVisit) : null;
           const totalVel = b.skuList.reduce((s,sk)=>s+sk.avgVel,0);
+          // Absolute facing counts from the latest visit — catFacings is one visit-level total copied
+          // onto every line item at submit time, so any item carries it; shahdFacings is per-SKU and
+          // needs summing across the whole visit to get the branch's actual Shahd facing count.
+          const lastItems = lastVisit ? (lastVisit.items||[]) : [];
+          const shahdFacingsAbs = lastItems.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
+          const catFacingsAbs = lastItems.length ? (parseFloat(lastItems[0].catFacings)||0) : 0;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
             <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div>
               <div class="hint">Last visited: ${b.lastVisitDate||'—'}${durMins!==null?' · ⏱ '+fmtDuration(durMins):''}</div>
@@ -2461,7 +2467,7 @@ function screenAccounts(){
             ${statusChip('neutral', `Vel ${fmt(totalVel,1)}/d total`)}
             ${statusChip(b.osaPct>=80?'on':'watch', `OSA ${fmt(b.osaPct)}%`)}
             ${statusChip(b.sfr>=80?'on':'watch', `SUC ${fmt(b.sfr)}%`)}
-            ${statusChip(b.sos>=15?'on':'watch', `SOS ${fmt(b.sos)}%`)}
+            ${statusChip(b.sos>=15?'on':'watch', `SOS ${fmt(b.sos)}% (${fmt(shahdFacingsAbs)} / ${fmt(catFacingsAbs)} facings)`)}
             ${statusChip('neutral', `Merch: ${acct?acct.merch:'—'}`)}
             ${statusChip('neutral', `Supervisor: ${acct?acct.sup:'—'}`)}
           </div>` : ''}`;
@@ -3632,7 +3638,7 @@ function navHtml(){
     approvals: {id:'approvals', ico:'✅', lbl:bi('Approvals','الموافقات'), badge: State.visits.filter(v=>v.status==='pending').length},
     arrivals: {id:'arrivals', ico:'📍', lbl:bi('Arrivals','الوصول'), badge: State.arrivals.filter(a=>a.status==='active').length},
     visitcalendar: {id:'visitcalendar', ico:'📅', lbl:bi('Visits Calendar','تقويم الزيارات')},
-    accounts: {id:'accounts', ico:'🏬', lbl:bi('Accounts','الحسابات')},
+    accounts: {id:'accounts', ico:'🏬', lbl:bi('Customers','العملاء')},
     dashboard: {id:'dashboard', ico:'📊', lbl:bi('Dashboard','لوحة التحكم')},
     team: {id:'team', ico:'👥', lbl:bi('Team','الفريق')},
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
