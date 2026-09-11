@@ -1061,7 +1061,11 @@ function notifyArrival(a){
 // arrival and then genuinely walks away (with or without the app open) leaves an arrival stuck at
 // 'active' with the elapsed clock still running — nothing in Firestore changes while that happens,
 // so it can't be caught by the onSnapshot listeners above and needs a periodic check instead.
-const LONG_ONSITE_MINUTES = 90;
+const LONG_ONSITE_MINUTES = 240; // 4 hours — was 90 min; raised because some merchandisers are permanently
+// stationed at one store all day rather than rotating between several. There's no data yet to tell
+// permanent vs. rotational stores apart (no such field exists in the account list), so this applies
+// uniformly for now. Once that distinction is added to the account data, this can split into two
+// thresholds (e.g. 90 min for rotational routes, 4h for permanent placements).
 const longOnsiteNotified = new Set();
 function checkLongOnsiteArrivals(){
   const conf = roleConf();
@@ -1131,13 +1135,14 @@ function findSuspiciousCapacity(){
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const capacity = parseFloat(it.actualCapacity);
       const closing = parseFloat(it.closing);
-      const pog = parseFloat(it.pogFacings);
+      const shahdSpace = parseFloat(it.shahdSpaceTotal);
       if(isNaN(capacity) || isNaN(closing)) return;
       if(capacity <= closing) return; // fine — facings filled can't exceed units actually on the shelf
-      // Likely cause: the merchandiser typed the Full Shelf Utilization (POG) target into this field by mistake,
-      // rather than what was actually filled — worth flagging separately since the fix here isn't just "cap to closing".
-      const looksLikeFieldMixup = !isNaN(pog) && pog>0 && Math.abs(capacity-pog) < 0.01;
-      candidates.push({ visitId:v.id, skuId:it.skuId, skuName:sku.name, account:v.accountName, branch:v.branch, date:v.date, capacity, closing, pog, looksLikeFieldMixup });
+      // Likely cause: the merchandiser typed the total dedicated Shahd space into this SKU's own field by
+      // mistake, rather than what was actually filled for just this SKU — worth flagging separately since
+      // the fix here isn't just "cap to closing".
+      const looksLikeFieldMixup = !isNaN(shahdSpace) && shahdSpace>0 && Math.abs(capacity-shahdSpace) < 0.01;
+      candidates.push({ visitId:v.id, skuId:it.skuId, skuName:sku.name, account:v.accountName, branch:v.branch, date:v.date, capacity, closing, pog:shahdSpace, looksLikeFieldMixup });
     });
   });
   return candidates.sort((a,b)=>(b.capacity-b.closing)-(a.capacity-a.closing));
@@ -1293,7 +1298,7 @@ const State = {
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
   cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
-  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', arrivalId:null, arrivedAt:null },
+  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', arrivalId:null, arrivedAt:null },
   arrivals: [], arrivalPending: false,
   toast: null,
   accountSearch: '',
@@ -1314,14 +1319,14 @@ const DEFAULT_ACCOUNTS = [{"id": "noid_0", "name": "7-Mart \u0647\u0627\u064a\u0
 let SKU_MAP = {};
 
 /* ============================= CALC ENGINE ============================= */
-const REQUIRED_ITEM_FIELDS = ['opening','deliveries','closing','pogFacings','actualCapacity','shahdFacings','actualPrice'];
+const REQUIRED_ITEM_FIELDS = ['opening','deliveries','closing','actualCapacity','shahdFacings','actualPrice'];
 function isItemComplete(it){
   return REQUIRED_ITEM_FIELDS.every(f => it[f] !== '' && it[f] !== undefined && it[f] !== null);
 }
 function computeItem(it){
   const n = v => { const x = parseFloat(v); return isNaN(x) ? 0 : x; };
   const opening = n(it.opening), closing = n(it.closing), deliveries = n(it.deliveries);
-  const pog = n(it.pogFacings), cap = n(it.actualCapacity), catF = n(it.catFacings), shahdF = n(it.shahdFacings);
+  const cap = n(it.actualCapacity), catF = n(it.catFacings), shahdF = n(it.shahdFacings), shahdSpace = n(it.shahdSpaceTotal);
   const price = n(it.actualPrice), days = n(it.days) || 1;
   const sku = SKU_MAP[it.skuId] || {};
 
@@ -1329,7 +1334,12 @@ function computeItem(it){
   const velocity = unitsSold / days;
   const actualShelfStock = closing;
   const stockCoverage = velocity > 0 ? actualShelfStock / velocity : (actualShelfStock > 0 ? Infinity : 0);
-  const sfr = pog > 0 ? Math.min(150, (cap / pog) * 100) : 0;
+  // sfr ("SUC") is this SKU's own filled units as a share of the visit's TOTAL dedicated Shahd space —
+  // not a per-SKU target anymore. Summed across every SKU in a visit, these shares add up to the
+  // branch's overall utilization of its dedicated space (see visitAggregate below), which is exactly
+  // the "total availability vs. the dedicated space" figure that matters — including the case where a
+  // merchandiser expanded Shahd's footprint into space that used to belong to a competitor.
+  const sfr = shahdSpace > 0 ? Math.min(150, (cap / shahdSpace) * 100) : 0;
   const sos = catF > 0 ? Math.min(100, (shahdF / catF) * 100) : 0;
   const osa = cap > 0 ? 'Y' : 'N';
 
@@ -1348,12 +1358,21 @@ function computeItem(it){
 
 function visitAggregate(visit){
   const items = (visit.items||[]).map(it => ({...it, calc: computeItem(it)}));
+  // sosVsShahd needs every item's shahdFacings at once (this SKU's share of the visit's total Shahd
+  // facings, distinct from `sos` which is share of the whole category) — computeItem only sees one
+  // item at a time, so this is layered on afterward, here, once per visit.
+  const totalShahdFacings = items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
+  items.forEach(it => { it.calc.sosVsShahd = totalShahdFacings>0 ? Math.min(100, (parseFloat(it.shahdFacings)||0)/totalShahdFacings*100) : 0; });
   const n = items.length || 1;
   const avg = f => items.reduce((s,it)=>s+f(it.calc),0) / n;
   const finiteCoverage = items.map(it=>it.calc.stockCoverage).filter(x=>isFinite(x));
   return {
     items,
-    avgSfr: avg(c=>c.sfr),
+    // avgSfr is a SUM here, not an average — per-item sfr is each SKU's share of the total dedicated
+    // space, so summing them back up gives the branch's overall "% of dedicated Shahd space filled"
+    // for this visit. Every downstream screen (Team, Scorecard, Dashboard, PPTX) reads this field as
+    // "SUC" and now gets the correct branch-level utilization figure automatically.
+    avgSfr: items.reduce((s,it)=>s+it.calc.sfr,0),
     avgSos: avg(c=>c.sos),
     osaPct: items.filter(it=>it.calc.osa==='Y').length / n * 100,
     priceOkPct: items.filter(it=>it.calc.priceStatus==='on').length / n * 100,
@@ -1528,6 +1547,10 @@ async function submitVisit(){
     showToast('Enter the total category facings (all brands) before submitting');
     return;
   }
+  if(d.shahdSpaceTotal === '' || d.shahdSpaceTotal === null || isNaN(parseFloat(d.shahdSpaceTotal))){
+    showToast('Enter the total dedicated Shahd space (units) before submitting');
+    return;
+  }
   const incompleteIdx = d.items.findIndex(it => !isItemComplete(it));
   if(incompleteIdx !== -1){
     const skuName = (SKU_MAP[d.items[incompleteIdx].skuId]||{}).name || 'a SKU';
@@ -1554,7 +1577,7 @@ async function submitVisit(){
       showToast('Photo upload failed — check your connection and try again. Your draft is safe.');
       return;
     }
-    const finalItems = d.items.map(it => ({...it, catFacings: d.catFacingsTotal})); // one visit-level entry, copied to every line for compatibility with existing analysis
+    const finalItems = d.items.map(it => ({...it, catFacings: d.catFacingsTotal, shahdSpaceTotal: d.shahdSpaceTotal})); // two visit-level totals, copied to every line for compatibility with existing analysis
     const visit = {
       id: visitId,
       accountId: d.accountId, accountName: d.accountName, branch: d.branch,
@@ -1568,7 +1591,7 @@ async function submitVisit(){
     await visitCreate(visit);
     recordLocationLearning(visit); // fire-and-forget — don't block the submit confirmation on this
     if(d.arrivalId){ arrivalUpdate(d.arrivalId, {status:'completed', visitId}).catch(()=>{}); } // fire-and-forget, same reasoning
-    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', arrivalId:null, arrivedAt:null };
+    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', arrivalId:null, arrivedAt:null };
     clearDraftLocal();
     State.accountSearch = '';
     showToast(navigator.onLine ? 'Visit submitted for approval ✓' : "Saved on this device ✓ — will upload automatically once you're back online. You can move to the next visit now.");
@@ -2088,6 +2111,21 @@ function screenNewVisit(){
       })()}
     </div>
 
+    <div class="card">
+      <h3>Full Shahd space utilization (total, dedicated units) / إجمالي مساحة شهد المخصصة</h3>
+      <p class="hint" style="margin:0 0 8px">Enter this once for the whole visit — the total shelf space set aside for Shahd across every SKU (not just this SKU's share). If the merchandiser has spread into extra space, count that too — this box is what shows the win.</p>
+      <input type="number" inputmode="decimal" placeholder="e.g. 60" value="${d.shahdSpaceTotal}" oninput="setShahdSpaceTotal(this.value)" onblur="shahdSpaceBlur()"/>
+      ${(() => {
+        const filledTotal = d.items.reduce((s,it)=>s+(parseFloat(it.actualCapacity)||0),0);
+        const spaceTotal = parseFloat(d.shahdSpaceTotal) || 0;
+        const fillPct = spaceTotal>0 ? Math.min(150,(filledTotal/spaceTotal*100)) : 0;
+        return `<div class="verify-row" style="margin-top:10px">
+          ${statusChip('neutral', `Filled so far / تم تعبئته: ${fmt(filledTotal)}`)}
+          ${spaceTotal>0 ? statusChip(fillPct>=80?'on':'watch', `Total utilization / إجمالي التعبئة: ${fmt(fillPct)}%`) : statusChip('neutral','Enter dedicated space total to see utilization')}
+        </div>`;
+      })()}
+    </div>
+
     <div class="sectitle">SKU checklist — all ${d.items.length} required (${d.items.filter(isItemComplete).length}/${d.items.length} complete)</div>
     ${d.items.map((it,idx)=>skuLineHtml(it,idx)).join('') || `<p class="hint">Select an account above to load its SKU checklist.</p>`}
     <div style="height:14px"></div>
@@ -2125,7 +2163,7 @@ function accountSearchAreaHtml(){
 }
 function skuLineHtml(it, idx){
   const sku = SKU_MAP[it.skuId] || {};
-  const c = computeItem({...it, catFacings: State.draft.catFacingsTotal}); // preview SOS live using the visit-level category total
+  const c = computeItem({...it, catFacings: State.draft.catFacingsTotal, shahdSpaceTotal: State.draft.shahdSpaceTotal}); // preview SOS/utilization live using the visit-level totals
   const complete = isItemComplete(it);
   const open = !!it._open;
   return `<div class="sku-line">
@@ -2148,17 +2186,13 @@ function skuLineHtml(it, idx){
       </div>
       <div class="row2">
         <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="lineField(${idx},'actualCapacity',this.value)" onblur="lineFieldBlur()"/>${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing}) — a facing can't hold stock that isn't there / تحقق من الكمية</p>` : ''}</div>
-        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" ${(it.capacityLocked && it.pogFacings!=='')?'disabled style="background:#EFEBE9;color:var(--ink-soft)"':''} oninput="lineField(${idx},'pogFacings',this.value)" onblur="lineFieldBlur()"/>${(it.capacityLocked && it.pogFacings!=='')?'<p class="hint">🔒 Set at this month\'s first visit — auto-carried / مقفل لهذا الشهر</p>':''}</div>
+        <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
         <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)" onblur="lineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point / تحقق من الفاصلة العشرية</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP) — please double-check / تحقق من السعر</p>` : ''}</div>
       </div>
-      <div class="row2">
-        <div><label>Days since last visit / عدد الأيام منذ آخر زيارة</label><input type="number" inputmode="decimal" value="${it.days}" placeholder="7" oninput="lineField(${idx},'days',this.value)" onblur="lineFieldBlur()"/></div>
-      </div>
-      ${it.actualCapacity!=='' || it.pogFacings!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
-        ${statusChip('neutral', 'SUC / تعبئة الرف '+fmt(c.sfr)+'%')}
+      ${it.actualCapacity!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+        ${statusChip('neutral', 'Utilization vs total / التعبئة من الإجمالي '+fmt(c.sfr)+'%')}
         ${statusChip('neutral', 'SOS / حصة الرف '+fmt(c.sos)+'%')}
         ${statusChip(c.osa==='Y'?'on':'off', 'OSA / التوافر '+c.osa)}
         ${statusChip(c.priceStatus, c.priceLbl)}
@@ -2345,23 +2379,24 @@ function computeCustomerAnalysis(approved){
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const priceVal = parseFloat(it.actualPrice);
-      c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, n:0, oosCount:0, priceOk:0, priceN:0, latestPrice:0, branchesCarrying:new Set() };
+      c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, sosVsShahdSum:0, n:0, oosCount:0, priceOk:0, priceN:0, latestPrice:0, branchesCarrying:new Set() };
       const s = c.skuStats[sku.id];
-      s.n++; s.sfrSum += it.calc.sfr; s.sosSum += it.calc.sos;
+      s.n++; s.sfrSum += it.calc.sfr; s.sosSum += it.calc.sos; s.sosVsShahdSum += it.calc.sosVsShahd;
       if(it.calc.osa==='N') s.oosCount++; else s.branchesCarrying.add(v.branch);
       if(it.calc.velocity>0){ s.velSum += it.calc.velocity; s.velN++; }
       if(!isNaN(priceVal) && priceVal>0){ s.latestPrice = priceVal; } // overwritten each pass — ends on the most recent visit's reading, not an average
       if(it.calc.priceStatus!=='neutral'){ s.priceN++; if(it.calc.priceStatus==='on') s.priceOk++; b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
 
-      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestPog:0, latestSfr:0 };
+      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestShahdSpace:0, latestSfr:0, latestSosVsShahd:0 };
       const bs = b.skuStats[sku.id];
       bs.n++; if(it.calc.osa==='N') bs.oosCount++;
       if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; }
       if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // latest reading, not an average
       bs.latestStock = it.calc.actualShelfStock; // overwritten each pass — ends on the most recent visit's reading
       bs.latestCapacity = parseFloat(it.actualCapacity) || 0; // facings actually on shelf, latest visit
-      bs.latestPog = parseFloat(it.pogFacings) || 0; // planogram target facings ("full capacity"), latest visit
-      bs.latestSfr = it.calc.sfr; // latest visit's SUC%, not an average — matches stock/price
+      bs.latestShahdSpace = parseFloat(it.shahdSpaceTotal) || 0; // total dedicated Shahd space for the branch, latest visit (same across every SKU that visit)
+      bs.latestSfr = it.calc.sfr; // latest visit's utilization-vs-total%, not an average — matches stock/price
+      bs.latestSosVsShahd = it.calc.sosVsShahd; // this SKU's share of total Shahd facings, latest visit
     });
    }catch(e){ console.error('Skipping malformed visit in customer analysis:', v && v.id, e); }
   });
@@ -2379,7 +2414,7 @@ function computeCustomerAnalysis(approved){
           actualPrice: s.latestPrice||0,
           priceStatus: s.priceStatus, oosCount:s.oosCount, n:s.n,
           stock: s.latestStock, coverageDays,
-          capacity: s.latestCapacity, pog: s.latestPog, sfr: s.latestSfr,
+          capacity: s.latestCapacity, pog: s.latestShahdSpace, sfr: s.latestSfr, sosVsShahd: s.latestSosVsShahd,
         };
       }).sort((a,b2)=>b2.avgVel-a.avgVel),
     }));
@@ -2392,7 +2427,7 @@ function computeCustomerAnalysis(approved){
       return {
         name:s.name, category:s.category, rsp:s.rsp,
         avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
-        sfr:s.sfrSum/s.n, osaPct: (s.n-s.oosCount)/s.n*100,
+        sfr:s.sfrSum/s.n, osaPct: (s.n-s.oosCount)/s.n*100, sosVsShahd: s.sosVsShahdSum/s.n,
         priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
         actualPrice: s.latestPrice||0,
         oosCount:s.oosCount, visits:s.n, coverage:s.branchesCarrying.size,
@@ -2459,7 +2494,7 @@ function screenAccounts(){
           const catFacingsAbs = lastItems.length ? (parseFloat(lastItems[0].catFacings)||0) : 0;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
             <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div>
-              <div class="hint">Last visited: ${b.lastVisitDate||'—'}${durMins!==null?' · ⏱ '+fmtDuration(durMins):''}</div>
+              <div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}${durMins!==null?' · ⏱ '+fmtDuration(durMins):''}</div>
             </div>
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
@@ -2518,11 +2553,11 @@ function dashCustomers(approved){
           const bKey = 'br:'+r.name+'|'+b.branch;
           const bOpen = State.expandedBranch === bKey;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
-            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}</div></div>
+            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}</div></div>
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
-          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (facings)</th><th>Full Shelf Utilization (Units)</th><th>Shelf Utilization Capacity%</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Dedicated total (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Days cover</th></tr>
+            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
           </table></div>` : ''}`;
         }).join('')}
 
@@ -2532,8 +2567,8 @@ function dashCustomers(approved){
         </table></div>
 
         <div class="sectitle">By SKU — price, stock &amp; coverage / حسب المنتج <span class="hint">(vel = avg units/day per store; not a company total)</span></div>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/store/d</th><th>In branches</th><th>Total stock</th><th>Avg days cover</th><th>OOS</th></tr>
-          ${r.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`).join('')}
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/store/d</th><th>In branches</th><th>Total stock</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Avg days cover</th><th>OOS</th></tr>
+          ${r.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`).join('')}
         </table></div>
         <div class="verify-row" style="margin-top:8px">
           ${statusChip('neutral', `Total stock on hand / إجمالي المخزون: ${fmt(r.totalStock)}`)}
@@ -2560,9 +2595,9 @@ function computeCategoryAnalysis(approved){
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       byCat[sku.category] = byCat[sku.category] || { sfrSum:0, sosSum:0, n:0 };
       byCat[sku.category].sfrSum += it.calc.sfr; byCat[sku.category].sosSum += it.calc.sos; byCat[sku.category].n++;
-      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sosSum:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
+      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sosSum:0, sosVsShahdSum:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
       const b = bySku[sku.id];
-      b.sfrSum += it.calc.sfr; b.sosSum += it.calc.sos; b.n++;
+      b.sfrSum += it.calc.sfr; b.sosSum += it.calc.sos; b.sosVsShahdSum += it.calc.sosVsShahd; b.n++;
       if(it.calc.osa==='Y') b.storesCarrying.add(v.accountName+' · '+v.branch);
       if(it.calc.velocity>0){ b.velSum += it.calc.velocity; b.velN++; }
       if(it.calc.priceStatus!=='neutral'){ b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; if(it.calc.priceStatus==='watch') b.priceAbove++; }
@@ -2572,7 +2607,7 @@ function computeCategoryAnalysis(approved){
   const catRows = Object.entries(byCat).map(([cat,c])=>({category:cat, avgSfr:c.sfrSum/c.n, avgSos:c.sosSum/c.n})).sort((a,b)=>b.avgSfr-a.avgSfr);
   const skuRows = Object.values(bySku).map(s=>({
     ...s, avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
-    avgSfr:s.sfrSum/s.n, avgSos:s.sosSum/s.n, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
+    avgSfr:s.sfrSum/s.n, avgSos:s.sosSum/s.n, avgSosVsShahd:s.sosVsShahdSum/s.n, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
     aboveRspPct: s.priceN?s.priceAbove/s.priceN*100:0,
     coveragePct: totalStores ? s.storesCarrying.size/totalStores*100 : 0, coverageCount: s.storesCarrying.size,
   })).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
@@ -2590,9 +2625,9 @@ function dashCategories(approved){
   </div>
   <div class="card">
     <h3>SKU performance across all ${totalStores} stores / أداء المنتجات في كل الفروع</h3>
-    <p class="hint" style="margin-top:-4px;margin-bottom:8px">"Vel/store" = average units sold per day at a single store. "Network total" = summed across every store carrying it. "Coverage" = % of visited stores where it's in stock right now.</p>
-    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Vel/store/d</th><th>Network total/d</th><th>Coverage</th><th>Price OK</th></tr>
-    ${skuRows.map(r=>`<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`).join('')}
+    <p class="hint" style="margin-top:-4px;margin-bottom:8px">"Vel/store" = average units sold per day at a single store. "Network total" = summed across every store carrying it. "Coverage" = % of visited stores where it's in stock right now. "Util vs total" and "SOS vs Shahd" are each SKU's average share of the dedicated Shahd space and of total Shahd facings, across every store — the grand-total/average view.</p>
+    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Vel/store/d</th><th>Network total/d</th><th>Coverage</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Price OK</th></tr>
+    ${skuRows.map(r=>`<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})</td><td>${fmt(r.avgSfr)}%</td><td>${fmt(r.avgSosVsShahd)}%</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`).join('')}
     </table></div>
   </div>`;
 }
@@ -3069,7 +3104,7 @@ async function exportExcel(){
           Date: v.date, Auditor: v.auditor, Status: v.status,
           SKU: sku.name||'', Category: sku.category||'',
           'Opening Stock': it.opening, 'Deliveries': it.deliveries, 'Actual Shelf Stock (Closing)': it.closing,
-          'POG Facings': it.pogFacings, 'Actual Capacity Filled': it.actualCapacity,
+          'Shahd Space Total (dedicated units)': it.shahdSpaceTotal, 'Actual Capacity Filled': it.actualCapacity,
           'Category Facings': it.catFacings, 'Shahd Facings': it.shahdFacings,
           'Actual Price (EGP)': it.actualPrice, 'RSP (EGP)': sku.rsp||'', 'Price Status': c.priceLbl,
           'Units Sold': fmt(c.unitsSold), 'Velocity (units/store/day)': fmt(c.velocity,2),
@@ -3354,7 +3389,7 @@ function editLineHtml(it, idx){
       </div>
       <div class="row2">
         <div><label>Actual Capacity Filled / الكمية الفعلية للمنتج</label><input type="number" inputmode="decimal" value="${it.actualCapacity}" oninput="editLineField(${idx},'actualCapacity',this.value)" onblur="editLineFieldBlur()"/>${it.actualCapacity && it.closing && parseFloat(it.actualCapacity)>parseFloat(it.closing) ? `<p class="hint" style="color:var(--red)">⚠️ Can't be more than the closing stock (${it.closing})</p>` : ''}</div>
-        <div><label>Full Shelf Utilization (Units) / سعة الرف</label><input type="number" inputmode="decimal" value="${it.pogFacings}" oninput="editLineField(${idx},'pogFacings',this.value)" onblur="editLineFieldBlur()"/></div>
+        <div><label>Full Shahd space total (dedicated) / إجمالي مساحة شهد المخصصة</label><input type="number" inputmode="decimal" value="${it.shahdSpaceTotal}" oninput="editLineField(${idx},'shahdSpaceTotal',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
         <div><label>Shahd facings</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="editLineField(${idx},'shahdFacings',this.value)" onblur="editLineFieldBlur()"/></div>
@@ -3362,7 +3397,6 @@ function editLineHtml(it, idx){
       </div>
       <div class="row2">
         <div><label>${bi('Shelf price (EGP)','مراقبة السعر')} — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editLineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
-        <div><label>Days since last visit</label><input type="number" inputmode="decimal" value="${it.days}" oninput="editLineField(${idx},'days',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
     </div>` : ''}
   </div>`;
@@ -3435,8 +3469,8 @@ function screenBranchDetail(){
       </div>
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (facings)</th><th>Full Shelf Utilization (Units)</th><th>Shelf Utilization Capacity%</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Dedicated total (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Days cover</th></tr>
+          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
         </table></div>
       </div>
     `}
@@ -3489,10 +3523,10 @@ function screenSkus(){
         if(cands.length===0) return `<p class="hint">No capacity issues detected right now.</p>`;
         return `
         <p class="hint" style="margin-bottom:10px">${cands.length} record${cands.length===1?'':'s'} found where the actual capacity filled is higher than the closing stock — that's not possible, since a facing can't be filled with stock that isn't there.</p>
-        ${mixups.length ? `<p class="hint" style="margin-bottom:10px;color:var(--red);font-weight:700">⚠️ ${mixups.length} of these have Actual Capacity set to EXACTLY the Full Shelf Utilization target — a strong sign the merchandiser typed that number into the wrong field, rather than what was actually filled. Worth a manual look rather than auto-fixing, since the real capacity for that visit is unknown.</p>` : ''}
+        ${mixups.length ? `<p class="hint" style="margin-bottom:10px;color:var(--red);font-weight:700">⚠️ ${mixups.length} of these have Actual Capacity set to EXACTLY the total dedicated Shahd space — a strong sign the merchandiser typed that number into the wrong field, rather than what was actually filled for this SKU. Worth a manual look rather than auto-fixing, since the real capacity for that visit is unknown.</p>` : ''}
         <button class="btn btn-primary btn-sm" style="margin-bottom:10px" onclick="applyAllCapacityFixes()">Fix all ${cands.length} automatically (cap to closing stock)</button>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>SKU</th><th>Capacity</th><th>Closing stock</th><th>Flag</th><th>→ Fix</th><th></th></tr>
-        ${cands.slice(0,40).map((c,i)=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td>${fmt(c.capacity)}</td><td>${fmt(c.closing)}</td><td>${c.looksLikeFieldMixup?`<span style="color:var(--red);font-weight:700">⚠️ Matches full utilization (${fmt(c.pog)})</span>`:'—'}</td><td><span style="color:var(--green);font-weight:700">${fmt(c.closing)}</span></td><td><button class="btn btn-ghost btn-sm" onclick="applyOneCapacityFix(${i})">Fix</button> <button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
+        ${cands.slice(0,40).map((c,i)=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td>${fmt(c.capacity)}</td><td>${fmt(c.closing)}</td><td>${c.looksLikeFieldMixup?`<span style="color:var(--red);font-weight:700">⚠️ Matches dedicated Shahd space total (${fmt(c.pog)})</span>`:'—'}</td><td><span style="color:var(--green);font-weight:700">${fmt(c.closing)}</span></td><td><button class="btn btn-ghost btn-sm" onclick="applyOneCapacityFix(${i})">Fix</button> <button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
         </table></div>
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
@@ -3565,6 +3599,8 @@ function go(tab){ State.tab = tab; render(); window.scrollTo(0,0); }
 function d(field,val){ State.draft[field]=val; }
 function setCatFacingsTotal(v){ State.draft.catFacingsTotal = v; saveDraftLocal(); }
 function catFacingsBlur(){ render(); }
+function setShahdSpaceTotal(v){ State.draft.shahdSpaceTotal = v; saveDraftLocal(); }
+function shahdSpaceBlur(){ render(); }
 function setDashSub(s){ State.dashSub = s; render(); }
 function toggleCategory(cat){ State.expandedCategory = State.expandedCategory===cat ? null : cat; render(); }
 function toggleBranchRow(key){ State.expandedBranch = State.expandedBranch===key ? null : key; render(); }
@@ -3573,30 +3609,31 @@ function onAccountSearch(v){
   const el = document.getElementById('account-search-area');
   if(el) el.innerHTML = accountSearchAreaHtml(); // targeted update — leaves the input itself untouched so the keyboard never closes
 }
-function monthKeyOf(dateStr){ return (dateStr || todayStr()).slice(0,7); }
-function getMonthlyCapacity(accountId, skuId, monthKey){
-  for(const v of State.visits){
-    if(v.accountId!==accountId || v.status==='rejected') continue;
-    if((v.date||'').slice(0,7) !== monthKey) continue;
-    // Zero doesn't count as "known capacity" — it's the placeholder merchandisers type when they
-    // don't carry the SKU or haven't measured the shelf yet (per the "enter 0, don't leave blank"
-    // instruction on the form). Locking the whole month to 0 would permanently block anyone from
-    // ever entering the real number once the SKU does get carried. Only a genuine positive figure
-    // should lock it going forward.
-    const item = (v.items||[]).find(it=>it.skuId===skuId && it.pogFacings!=='' && it.pogFacings!=null && parseFloat(it.pogFacings) > 0);
-    if(item) return item.pogFacings;
-  }
-  return null;
+function daysAgoLabel(dateStr){
+  if(!dateStr) return '';
+  const days = Math.round((new Date(todayStr()) - new Date(dateStr)) / 86400000);
+  if(days <= 0) return ' (today)';
+  if(days === 1) return ' (1d ago)';
+  return ` (${days}d ago)`;
+}
+function daysSinceLastVisitFor(accountId){
+  // Auto-computed from real visit history now that every visit is dated the day it happened (see the
+  // "always today" lock) — no reason to make merchandisers guess/type this by hand anymore.
+  const prior = State.visits
+    .filter(v => v.accountId===accountId && v.status!=='rejected' && v.date < todayStr())
+    .sort((a,b) => (b.submittedAt||0)-(a.submittedAt||0))[0];
+  if(!prior) return 7; // no prior visit on record — neutral fallback rather than 0, which would understate velocity
+  const days = Math.round((new Date(todayStr()) - new Date(prior.date)) / 86400000);
+  return days > 0 ? days : 1; // guard against a same-day repeat visit skewing the velocity denominator toward zero
 }
 function pickAccount(id){
   const a = State.accounts.find(a=>a.id===id); if(!a) return;
   const dft = State.draft;
   dft.accountId = a.id; dft.accountName = a.name; dft.branch = a.branch; dft.channel = a.channel; dft.region = a.region;
   if(dft.items.length === 0){
-    const monthKey = monthKeyOf(dft.date);
+    const daysSince = daysSinceLastVisitFor(a.id);
     dft.items = State.skus.map(s => {
-      const locked = getMonthlyCapacity(a.id, s.id, monthKey);
-      return {skuId:s.id, opening:'', closing:'', deliveries:'', pogFacings: locked!==null?String(locked):'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:'7', _open:false, capacityLocked: locked!==null && locked!==''};
+      return {skuId:s.id, opening:'', closing:'', deliveries:'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:String(daysSince), _open:false};
     });
   }
   saveDraftLocal();
@@ -3606,7 +3643,7 @@ function clearAccount(){
   // Changing accounts abandons any in-progress arrival at the old one — best-effort, fire-and-forget
   // so a slow connection doesn't block the merchandiser from moving on.
   if(State.draft.arrivalId){ arrivalUpdate(State.draft.arrivalId, {status:'abandoned'}).catch(()=>{}); }
-  State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.draft.photos=[]; State.draft.geo=null; State.draft.capturedAt=null; State.draft.arrivalId=null; State.draft.arrivedAt=null; State.accountSearch=''; clearDraftLocal(); render();
+  State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.draft.shahdSpaceTotal=''; State.draft.photos=[]; State.draft.geo=null; State.draft.capturedAt=null; State.draft.arrivalId=null; State.draft.arrivedAt=null; State.accountSearch=''; clearDraftLocal(); render();
 }
 function toggleLine(idx){ State.draft.items[idx]._open = !State.draft.items[idx]._open; render(); }
 function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); }
@@ -3728,7 +3765,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
