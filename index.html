@@ -1147,6 +1147,27 @@ function findSuspiciousCapacity(){
   });
   return candidates.sort((a,b)=>(b.capacity-b.closing)-(a.capacity-a.closing));
 }
+function findSuspiciousSos(){
+  // Visit-level, not per-item — total Shahd facings across every SKU can never legitimately exceed
+  // the total category facings entered for that same visit, UNLESS the merchandiser explicitly
+  // confirmed there's extra display space beyond the main category shelf (checkbox on the form).
+  // Anything over that line without the flag is a counting error worth a manual look.
+  const candidates = [];
+  State.visits.forEach(v=>{
+    if(v.status==='rejected' || v.extraDisplay) return;
+    const items = v.items || [];
+    const catTotal = parseFloat(items[0]?.catFacings) || 0;
+    const shahdSum = items.reduce((s,it)=>{
+      const sku = SKU_MAP[it.skuId];
+      if(sku && sku.category==='Marinated Fresh') return s; // different category, not part of this count
+      return s + (parseFloat(it.shahdFacings)||0);
+    }, 0);
+    if(catTotal>0 && shahdSum>catTotal){
+      candidates.push({ visitId:v.id, account:v.accountName, branch:v.branch, date:v.date, auditor:v.auditor, catTotal, shahdSum });
+    }
+  });
+  return candidates.sort((a,b)=>(b.shahdSum-b.catTotal)-(a.shahdSum-a.catTotal));
+}
 // Review-only flag — unlike price/capacity there's no "correct value" to auto-fix to, since duration
 // is derived from timestamps, not a typed field. This just surfaces visits worth a second look.
 const SHORT_VISIT_MINUTES = 2; // business rule: can't realistically photograph, count facings, and check prices in under this
@@ -1298,7 +1319,7 @@ const State = {
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
   cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
-  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', arrivalId:null, arrivedAt:null },
+  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null },
   arrivals: [], arrivalPending: false,
   toast: null,
   accountSearch: '',
@@ -1596,6 +1617,14 @@ async function submitVisit(){
     showToast('Enter the total dedicated Shahd space (units) before submitting');
     return;
   }
+  {
+    const shahdFacingsSum = d.items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
+    const catTotal = parseFloat(d.catFacingsTotal) || 0;
+    if(shahdFacingsSum > catTotal && !d.extraDisplay){
+      showToast(`Total Shahd facings (${shahdFacingsSum}) can't exceed total category facings (${catTotal}) — recheck your counts, or confirm the extra-display checkbox below the category facings box if this is real.`);
+      return;
+    }
+  }
   const incompleteIdx = d.items.findIndex(it => !isItemComplete(it));
   if(incompleteIdx !== -1){
     const skuName = (SKU_MAP[d.items[incompleteIdx].skuId]||{}).name || 'a SKU';
@@ -1630,13 +1659,13 @@ async function submitVisit(){
       date: todayStr(), auditor: identityLabel(),
       status: 'pending', items: finalItems,
       photos: uploadedPhotos, geo: d.geo || null, capturedAt: d.capturedAt || null,
-      arrivalId: d.arrivalId || null, arrivedAt: d.arrivedAt || null,
+      arrivalId: d.arrivalId || null, arrivedAt: d.arrivedAt || null, extraDisplay: !!d.extraDisplay,
       submittedAt: Date.now(),
     };
     await visitCreate(visit);
     recordLocationLearning(visit); // fire-and-forget — don't block the submit confirmation on this
     if(d.arrivalId){ arrivalUpdate(d.arrivalId, {status:'completed', visitId}).catch(()=>{}); } // fire-and-forget, same reasoning
-    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', arrivalId:null, arrivedAt:null };
+    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null };
     clearDraftLocal();
     State.accountSearch = '';
     showToast(navigator.onLine ? 'Visit submitted for approval ✓' : "Saved on this device ✓ — will upload automatically once you're back online. You can move to the next visit now.");
@@ -2149,10 +2178,17 @@ function screenNewVisit(){
         const shahdTotal = d.items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
         const catTotal = parseFloat(d.catFacingsTotal) || 0;
         const sosOverall = catTotal>0 ? (shahdTotal/catTotal*100) : 0;
+        const exceeds = catTotal>0 && shahdTotal>catTotal;
         return `<div class="verify-row" style="margin-top:10px">
           ${statusChip('neutral', `Total Shahd so far / إجمالي شهد: ${fmt(shahdTotal)}`)}
           ${catTotal>0 ? statusChip(sosOverall>=15?'on':'watch', `Overall SOS / حصة الرف: ${fmt(sosOverall)}%`) : statusChip('neutral','Enter category total to see SOS')}
-        </div>`;
+        </div>
+        ${exceeds ? `
+        <p class="hint" style="color:var(--red);font-weight:700;margin:8px 0">⚠️ Total Shahd facings (${fmt(shahdTotal)}) can't exceed total category facings (${fmt(catTotal)}) — recheck your counts, or confirm below if Shahd genuinely has extra display space beyond the main category shelf (e.g. an end-cap or secondary display).</p>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" ${d.extraDisplay?'checked':''} onchange="setExtraDisplay(this.checked)"/>
+          <span>We have extra display beyond the category shelf / لدينا عرض إضافي خارج رف الفئة</span>
+        </label>` : ''}`;
       })()}
     </div>
 
@@ -2416,35 +2452,46 @@ function computeCustomerAnalysis(approved){
     const agg = visitAggregate(v);
     byCustomer[v.accountName] = byCustomer[v.accountName] || { name:v.accountName, branches:{}, skuStats:{}, photos:[] };
     const c = byCustomer[v.accountName];
-    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, sfrSum:0, sosSum:0, osaSum:0, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null, latestCatFacingsTotal:0, latestShahdSpaceTotal:0, latestShahdFacingsTotal:0 };
+    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null, latestSfr:0, latestSos:0, latestOsaPct:0, latestCatFacingsTotal:0, latestShahdSpaceTotal:0, latestShahdFacingsTotal:0, latestExtraDisplay:false };
     const b = c.branches[v.branch];
-    b.visits++; b.sfrSum += agg.avgSfr; b.sosSum += agg.avgSos; b.osaSum += agg.osaPct;
-    b.lastVisitDate = v.date; // overwritten each pass — ends on the most recent visit's date
-    // Absolute totals for the branch header — one set of numbers per branch, not per SKU. Overwritten
-    // each pass so it ends on the latest visit's reading, same as lastVisitDate above.
+    b.visits++;
+    // Every figure in the branch header — SUC%, SOS%, OSA%, and the absolute totals — now comes from
+    // this SAME single latest visit, not an average of one mixed with a snapshot of the other. That
+    // mismatch (a historical average shown next to a latest-only total) is what produced nonsense like
+    // "SOS 417%" sitting beside "Category facings: 70 · Shahd facings: 21" (which is actually 30%).
+    // `sorted` runs oldest→newest, so each later visit correctly overwrites the previous "latest".
+    b.lastVisitDate = v.date;
+    b.latestSfr = agg.avgSfr; b.latestSos = agg.avgSos; b.latestOsaPct = agg.osaPct;
     b.latestCatFacingsTotal = agg.catFacingsTotal;
     b.latestShahdSpaceTotal = agg.shahdSpaceTotal;
     b.latestShahdFacingsTotal = agg.shahdFacingsTotal;
+    b.latestExtraDisplay = !!v.extraDisplay;
     visitPhotos(v).forEach(p=>c.photos.push({photo:p, branch:v.branch, date:v.date}));
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const priceVal = parseFloat(it.actualPrice);
       c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, sosVsShahdSum:0, n:0, oosCount:0, priceOk:0, priceN:0, latestPrice:0, branchesCarrying:new Set() };
       const s = c.skuStats[sku.id];
-      s.n++; s.sfrSum += it.calc.sfr; s.sosSum += it.calc.sos; s.sosVsShahdSum += it.calc.sosVsShahd;
+      s.n++; s.sfrSum += (it.calc.sfr||0); s.sosSum += (it.calc.sos||0); s.sosVsShahdSum += (it.calc.sosVsShahd||0);
       if(it.calc.osa==='N') s.oosCount++; else s.branchesCarrying.add(v.branch);
       if(it.calc.velocity>0){ s.velSum += it.calc.velocity; s.velN++; }
       if(!isNaN(priceVal) && priceVal>0){ s.latestPrice = priceVal; } // overwritten each pass — ends on the most recent visit's reading, not an average
       if(it.calc.priceStatus!=='neutral'){ s.priceN++; if(it.calc.priceStatus==='on') s.priceOk++; b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
 
-      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestSfr:0, latestSos:0, latestSosVsShahd:0 };
+      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestSfr:0, latestSos:0, latestSosVsShahd:0, latestShahdFacings:0 };
       const bs = b.skuStats[sku.id];
       bs.n++; if(it.calc.osa==='N') bs.oosCount++;
       if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; }
       if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // latest reading, not an average
       bs.latestStock = it.calc.actualShelfStock; // overwritten each pass — ends on the most recent visit's reading
       bs.latestCapacity = parseFloat(it.actualCapacity) || 0; // facings actually on shelf, latest visit
-      bs.latestSfr = it.calc.sfr; // latest visit's utilization-vs-total%, not an average — matches stock/price
+      bs.latestShahdFacings = parseFloat(it.shahdFacings) || 0; // this SKU's own facing count, latest visit
+      // Recomputed directly against THIS visit's resolved dedicated-space total (the same figure shown
+      // in the branch header) rather than trusting it.calc.sfr as-is — for legacy visits, calc.sfr is
+      // deliberately computed a different way internally (against that SKU's own old individual target,
+      // kept for a separate, safely-bounded scoring metric elsewhere) which would otherwise show a
+      // number here that doesn't match the total sitting right next to it in the header.
+      bs.latestSfr = agg.shahdSpaceTotal > 0 ? Math.min(300, (bs.latestCapacity / agg.shahdSpaceTotal) * 100) : 0;
       bs.latestSos = it.calc.sos; // this SKU's share of total category facings, latest visit
       bs.latestSosVsShahd = it.calc.sosVsShahd; // this SKU's share of total Shahd facings, latest visit
     });
@@ -2452,9 +2499,9 @@ function computeCustomerAnalysis(approved){
   });
   return Object.values(byCustomer).map(c=>{
     const branches = Object.values(c.branches).map(b=>({
-      branch:b.branch, sfr:b.sfrSum/b.visits, sos:b.sosSum/b.visits, osaPct:b.osaSum/b.visits, lastVisitDate:b.lastVisitDate,
+      branch:b.branch, sfr:b.latestSfr, sos:b.latestSos, osaPct:b.latestOsaPct, lastVisitDate:b.lastVisitDate,
       priceOkPct: b.priceN?b.priceOk/b.priceN*100:0, visits:b.visits,
-      catFacingsTotal: b.latestCatFacingsTotal, shahdSpaceTotal: b.latestShahdSpaceTotal, shahdFacingsTotal: b.latestShahdFacingsTotal,
+      catFacingsTotal: b.latestCatFacingsTotal, shahdSpaceTotal: b.latestShahdSpaceTotal, shahdFacingsTotal: b.latestShahdFacingsTotal, extraDisplay: b.latestExtraDisplay,
       skuList: Object.entries(b.skuStats).map(([skuId,s])=>{
         const avgVel = s.velN?s.velSum/s.velN:0;
         // Coverage uses the SAME average velocity shown as "Vel/d" (not a single latest-visit reading), paired with the latest stock count.
@@ -2464,7 +2511,7 @@ function computeCustomerAnalysis(approved){
           avgVel,
           actualPrice: s.latestPrice||0,
           priceStatus: s.priceStatus, oosCount:s.oosCount, n:s.n,
-          stock: s.latestStock, coverageDays,
+          stock: s.latestStock, coverageDays, shahdFacings: s.latestShahdFacings,
           capacity: s.latestCapacity, sfr: s.latestSfr, sos: s.latestSos, sosVsShahd: s.latestSosVsShahd,
         };
       }).sort((a,b2)=>b2.avgVel-a.avgVel),
@@ -2604,11 +2651,11 @@ function dashCustomers(approved){
           const bKey = 'br:'+r.name+'|'+b.branch;
           const bOpen = State.expandedBranch === bKey;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
-            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Dedicated Shahd space: ${fmt(b.shahdSpaceTotal)} · Category facings: ${fmt(b.catFacingsTotal)} · Shahd facings: ${fmt(b.shahdFacingsTotal)}</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}</div></div>
+            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Dedicated Shahd space: ${fmt(b.shahdSpaceTotal)} · Category facings: ${fmt(b.catFacingsTotal)} · Shahd facings: ${fmt(b.shahdFacingsTotal)}${b.shahdFacingsTotal>b.catFacingsTotal?(b.extraDisplay?' <span style="color:var(--amber)">⚠️ Exceeds category — extra display beyond category shelf confirmed</span>':' <span style="color:var(--red)">⚠️ Exceeds category facings — needs review</span>'):''}</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}</div></div>
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
-          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
+          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Facings</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
+            ${b.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
           </table></div>` : ''}`;
         }).join('')}
 
@@ -3525,11 +3572,12 @@ function screenBranchDetail(){
         ${statusChip('neutral', `Dedicated Shahd space: ${fmt(branchRow.shahdSpaceTotal)}`)}
         ${statusChip('neutral', `Category facings: ${fmt(branchRow.catFacingsTotal)}`)}
         ${statusChip('neutral', `Shahd facings: ${fmt(branchRow.shahdFacingsTotal)}`)}
+        ${branchRow.shahdFacingsTotal>branchRow.catFacingsTotal ? statusChip(branchRow.extraDisplay?'watch':'off', branchRow.extraDisplay?'⚠️ Extra display beyond category shelf confirmed':'⚠️ Exceeds category facings — needs review') : ''}
       </div>
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Facings</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
+          ${branchRow.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
         </table></div>
       </div>
     `}
@@ -3586,6 +3634,20 @@ function screenSkus(){
         <button class="btn btn-primary btn-sm" style="margin-bottom:10px" onclick="applyAllCapacityFixes()">Fix all ${cands.length} automatically (cap to closing stock)</button>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>SKU</th><th>Capacity</th><th>Closing stock</th><th>Flag</th><th>→ Fix</th><th></th></tr>
         ${cands.slice(0,40).map((c,i)=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td>${fmt(c.capacity)}</td><td>${fmt(c.closing)}</td><td>${c.looksLikeFieldMixup?`<span style="color:var(--red);font-weight:700">⚠️ Matches dedicated Shahd space total (${fmt(c.pog)})</span>`:'—'}</td><td><span style="color:var(--green);font-weight:700">${fmt(c.closing)}</span></td><td><button class="btn btn-ghost btn-sm" onclick="applyOneCapacityFix(${i})">Fix</button> <button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
+        </table></div>
+        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
+      `; })()}
+    </div>
+    <div class="sectitle">Shahd facings exceed category total / واجهات شهد تتجاوز إجمالي الفئة</div>
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Total Shahd facings greater than total category facings</h3>
+      ${(() => {
+        const cands = findSuspiciousSos();
+        if(cands.length===0) return `<p class="hint">No SOS counting issues detected right now.</p>`;
+        return `
+        <p class="hint" style="margin-bottom:10px">${cands.length} visit${cands.length===1?'':'s'} found where the total Shahd facings entered add up to more than the total category facings for that same visit — that's not possible unless there's real extra display space beyond the main category shelf, which the merchandiser didn't confirm at the time. Each one needs a manual look: either the counts were mistyped, or it should be re-opened and the "extra display" box checked if the extra space is genuine.</p>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>Merchandiser</th><th>Shahd facings</th><th>Category facings</th><th></th></tr>
+        ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.auditor}</td><td><span style="color:var(--red);font-weight:700">${fmt(c.shahdSum)}</span></td><td>${fmt(c.catTotal)}</td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
         </table></div>
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
@@ -3657,6 +3719,7 @@ function screenSkus(){
 function go(tab){ State.tab = tab; render(); window.scrollTo(0,0); }
 function d(field,val){ State.draft[field]=val; }
 function setCatFacingsTotal(v){ State.draft.catFacingsTotal = v; saveDraftLocal(); }
+function setExtraDisplay(checked){ State.draft.extraDisplay = checked; saveDraftLocal(); render(); }
 function catFacingsBlur(){ render(); }
 function setShahdSpaceTotal(v){ State.draft.shahdSpaceTotal = v; saveDraftLocal(); }
 function shahdSpaceBlur(){ render(); }
@@ -3702,7 +3765,7 @@ function clearAccount(){
   // Changing accounts abandons any in-progress arrival at the old one — best-effort, fire-and-forget
   // so a slow connection doesn't block the merchandiser from moving on.
   if(State.draft.arrivalId){ arrivalUpdate(State.draft.arrivalId, {status:'abandoned'}).catch(()=>{}); }
-  State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.draft.shahdSpaceTotal=''; State.draft.photos=[]; State.draft.geo=null; State.draft.capturedAt=null; State.draft.arrivalId=null; State.draft.arrivedAt=null; State.accountSearch=''; clearDraftLocal(); render();
+  State.draft.accountId=''; State.draft.accountName=''; State.draft.branch=''; State.draft.items=[]; State.draft.catFacingsTotal=''; State.draft.shahdSpaceTotal=''; State.draft.extraDisplay=false; State.draft.photos=[]; State.draft.geo=null; State.draft.capturedAt=null; State.draft.arrivalId=null; State.draft.arrivedAt=null; State.accountSearch=''; clearDraftLocal(); render();
 }
 function toggleLine(idx){ State.draft.items[idx]._open = !State.draft.items[idx]._open; render(); }
 function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); }
@@ -3824,7 +3887,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
