@@ -1329,6 +1329,12 @@ function computeItem(it){
   const cap = n(it.actualCapacity), catF = n(it.catFacings), shahdF = n(it.shahdFacings), shahdSpace = n(it.shahdSpaceTotal);
   const price = n(it.actualPrice), days = n(it.days) || 1;
   const sku = SKU_MAP[it.skuId] || {};
+  // Marinated Fresh lives in a different category/shelf entirely and is tracked for its own facings
+  // and availability only — it's deliberately excluded from Shahd's core SUC (space utilization) and
+  // SOS (share of category) figures so it doesn't distort what those numbers represent. sfr/sos come
+  // back null (not 0) here specifically so the aggregation below can tell "excluded" apart from
+  // "genuinely zero" and skip it out of sums/averages rather than silently diluting them.
+  const excludedFromSucSos = sku.category === 'Marinated Fresh';
 
   const unitsSold = Math.max(0, opening + deliveries - closing);
   const velocity = unitsSold / days;
@@ -1339,8 +1345,8 @@ function computeItem(it){
   // branch's overall utilization of its dedicated space (see visitAggregate below), which is exactly
   // the "total availability vs. the dedicated space" figure that matters — including the case where a
   // merchandiser expanded Shahd's footprint into space that used to belong to a competitor.
-  const sfr = shahdSpace > 0 ? Math.min(150, (cap / shahdSpace) * 100) : 0;
-  const sos = catF > 0 ? Math.min(100, (shahdF / catF) * 100) : 0;
+  const sfr = excludedFromSucSos ? null : (shahdSpace > 0 ? Math.min(150, (cap / shahdSpace) * 100) : 0);
+  const sos = excludedFromSucSos ? null : (catF > 0 ? Math.min(100, (shahdF / catF) * 100) : 0);
   const osa = cap > 0 ? 'Y' : 'N';
 
   const rsp = sku.rsp || 0;
@@ -1353,34 +1359,58 @@ function computeItem(it){
   }
   const visitDone = isItemComplete(it);
 
-  return {unitsSold, velocity, actualShelfStock, stockCoverage, sfr, sos, osa, priceStatus, priceLbl, priceDiffPct, visitDone};
+  return {unitsSold, velocity, actualShelfStock, stockCoverage, sfr, sos, osa, priceStatus, priceLbl, priceDiffPct, visitDone, excludedFromSucSos};
 }
 
 function visitAggregate(visit){
   const rawItems = visit.items || [];
   // Backward compatibility: every visit submitted before the "Full Shahd space" redesign has no
-  // shahdSpaceTotal — but it still carries the old per-SKU pogFacings field, since that data was
-  // never deleted, just stopped being written to. Approximating the old total by summing those
-  // keeps historical SUC numbers meaningful instead of every pre-redesign visit reading 0%.
+  // shahdSpaceTotal. Those visits never had a shared-pool concept — each SKU was measured against
+  // its OWN individual pogFacings target — so they get their own branch below, computed and averaged
+  // the old way. Retrofitting them into the new shared-pool sum (dividing each SKU's actual capacity,
+  // which was entered at a much larger scale, by a small summed-target denominator) is what produced
+  // the wildly inflated 200%+ SUC figures — this keeps historical numbers meaningful instead.
   const hasNewTotal = rawItems.some(it => it.shahdSpaceTotal !== '' && it.shahdSpaceTotal !== undefined && it.shahdSpaceTotal !== null);
-  const legacyTotal = hasNewTotal ? null : rawItems.reduce((s,it)=>s+(parseFloat(it.pogFacings)||0),0);
-  const items = rawItems.map(it => ({...it, calc: computeItem(hasNewTotal ? it : {...it, shahdSpaceTotal: legacyTotal})}));
+  let items, avgSfr;
+  if(hasNewTotal){
+    items = rawItems.map(it => ({...it, calc: computeItem(it)}));
+    // A SUM, not an average — per-item sfr is each SKU's share of the one shared dedicated-space
+    // total, so summing them back up gives the branch's overall "% of dedicated space filled".
+    // Marinated Fresh items carry sfr:null (excluded), which coerces to 0 here and contributes
+    // nothing to the sum — correct, since they're not part of this pool at all.
+    avgSfr = items.reduce((s,it)=>s+(it.calc.sfr||0),0);
+  } else {
+    items = rawItems.map(it => {
+      const calc = computeItem({...it, shahdSpaceTotal:''}); // sfr comes back null/0 here — overridden right below with the old per-SKU-target formula, unless excluded
+      if(!calc.excludedFromSucSos){
+        const cap = parseFloat(it.actualCapacity) || 0, pog = parseFloat(it.pogFacings) || 0;
+        calc.sfr = pog > 0 ? Math.min(150, (cap/pog)*100) : 0;
+      }
+      return {...it, calc};
+    });
+    // Excluded items must also be excluded from the denominator here, not just contribute 0 — this is
+    // an average, not a sum, so including them would dilute it even though the math looks harmless.
+    const counted = items.filter(it=>!it.calc.excludedFromSucSos);
+    avgSfr = counted.length ? counted.reduce((s,it)=>s+it.calc.sfr,0) / counted.length : 0; // old semantics: an average across independently-targeted SKUs, not shares of a whole
+  }
   // sosVsShahd needs every item's shahdFacings at once (this SKU's share of the visit's total Shahd
   // facings, distinct from `sos` which is share of the whole category) — computeItem only sees one
-  // item at a time, so this is layered on afterward, here, once per visit.
-  const totalShahdFacings = items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
-  items.forEach(it => { it.calc.sosVsShahd = totalShahdFacings>0 ? Math.min(100, (parseFloat(it.shahdFacings)||0)/totalShahdFacings*100) : 0; });
+  // item at a time, so this is layered on afterward, here, once per visit. Marinated Fresh facings are
+  // excluded from the total itself (not just given a 0 share), since they're a different category.
+  const shahdCounted = items.filter(it=>!it.calc.excludedFromSucSos);
+  const totalShahdFacings = shahdCounted.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
+  items.forEach(it => { it.calc.sosVsShahd = it.calc.excludedFromSucSos ? null : (totalShahdFacings>0 ? Math.min(100, (parseFloat(it.shahdFacings)||0)/totalShahdFacings*100) : 0); });
   const n = items.length || 1;
   const avg = f => items.reduce((s,it)=>s+f(it.calc),0) / n;
   const finiteCoverage = items.map(it=>it.calc.stockCoverage).filter(x=>isFinite(x));
+  const legacyTotal = hasNewTotal ? null : rawItems.reduce((s,it)=>s+(parseFloat(it.pogFacings)||0),0);
   return {
     items,
-    // avgSfr is a SUM here, not an average — per-item sfr is each SKU's share of the total dedicated
-    // space, so summing them back up gives the branch's overall "% of dedicated Shahd space filled"
-    // for this visit. Every downstream screen (Team, Scorecard, Dashboard, PPTX) reads this field as
-    // "SUC" and now gets the correct branch-level utilization figure automatically.
-    avgSfr: items.reduce((s,it)=>s+it.calc.sfr,0),
-    avgSos: avg(c=>c.sos),
+    avgSfr,
+    // A SUM, same reasoning as avgSfr above — sos per item is this SKU's share of total category
+    // facings, so summing gives the true overall SOS instead of dividing it by however many SKUs exist.
+    // Marinated Fresh's sos:null coerces to 0 and doesn't affect this sum — excluded, as intended.
+    avgSos: items.reduce((s,it)=>s+(it.calc.sos||0),0),
     osaPct: items.filter(it=>it.calc.osa==='Y').length / n * 100,
     priceOkPct: items.filter(it=>it.calc.priceStatus==='on').length / n * 100,
     visitDonePct: items.filter(it=>it.calc.visitDone).length / n * 100,
@@ -1390,12 +1420,13 @@ function visitAggregate(visit){
     hasPhoto: !!(visit.photos && visit.photos.length) || !!visit.photo,
     hasGeo: !!visit.geo,
     // Absolute totals for this visit — one number each, not per-SKU (category facings and dedicated
-    // Shahd space are visit-level inputs; Shahd facings is the sum across every SKU). shahdSpaceTotal
-    // uses the same legacy-fallback logic as the per-item calc above, so old visits resolve to a real
-    // number here too, not 0.
+    // Shahd space are visit-level inputs; Shahd facings is the sum across every SKU). For legacy
+    // visits this total is informational only now (a rough sum of old per-SKU targets for display) —
+    // it's no longer used in the SUC% math above, which is why the two can look inconsistent on an
+    // old visit; that inconsistency is expected and resolves itself once re-submitted under the new model.
     catFacingsTotal: parseFloat(rawItems[0]?.catFacings) || 0,
     shahdSpaceTotal: hasNewTotal ? (parseFloat(rawItems[0]?.shahdSpaceTotal) || 0) : legacyTotal,
-    shahdFacingsTotal: items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0),
+    shahdFacingsTotal: totalShahdFacings,
   };
 }
 
@@ -2460,7 +2491,7 @@ function computeCustomerAnalysis(approved){
       const cc = catMap[s.category];
       cc.sfrSum += s.sfr; cc.velSum += s.avgVelPerStore; cc.n++;
     });
-    const categories = Object.values(catMap).map(cc=>({ category:cc.category, avgSfr: cc.sfrSum/cc.n, avgVelPerStore: cc.velSum/cc.n })).sort((a,b)=>b.avgSfr-a.avgSfr);
+    const categories = Object.values(catMap).filter(cc=>cc.category!=='Marinated Fresh').map(cc=>({ category:cc.category, avgSfr: cc.sfrSum/cc.n, avgVelPerStore: cc.velSum/cc.n })).sort((a,b)=>b.avgSfr-a.avgSfr);
     const available = skuList.filter(s=>s.oosCount < s.visits).length;
     const topSku = skuList.filter(s=>s.avgVelPerStore>0)[0];
     const oosSku = [...skuList].sort((a,b)=>b.oosCount-a.oosCount)[0];
@@ -2577,7 +2608,7 @@ function dashCustomers(approved){
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
           ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmt(s.sos)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+            ${b.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
           </table></div>` : ''}`;
         }).join('')}
 
@@ -2588,7 +2619,7 @@ function dashCustomers(approved){
 
         <div class="sectitle">By SKU — price, stock &amp; coverage / حسب المنتج <span class="hint">(vel = avg units/day per store; not a company total)</span></div>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/store/d</th><th>In branches</th><th>Total stock</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Avg days cover</th><th>OOS</th></tr>
-          ${r.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`).join('')}
+          ${r.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`; }).join('')}
         </table></div>
         <div class="verify-row" style="margin-top:8px">
           ${statusChip('neutral', `Total stock on hand / إجمالي المخزون: ${fmt(r.totalStock)}`)}
@@ -2624,7 +2655,10 @@ function computeCategoryAnalysis(approved){
     });
    }catch(e){ console.error('Skipping malformed visit in category analysis:', v && v.id, e); }
   });
-  const catRows = Object.entries(byCat).map(([cat,c])=>({category:cat, avgSfr:c.sfrSum/c.n, avgSos:c.sosSum/c.n})).sort((a,b)=>b.avgSfr-a.avgSfr);
+  // Marinated Fresh is excluded from the SUC/SOS story entirely (a different category/shelf) — its
+  // row here would only ever read 0%/0%, which isn't a real reading, so it's left out of this table
+  // rather than showing a misleading zero.
+  const catRows = Object.entries(byCat).filter(([cat])=>cat!=='Marinated Fresh').map(([cat,c])=>({category:cat, avgSfr:c.sfrSum/c.n, avgSos:c.sosSum/c.n})).sort((a,b)=>b.avgSfr-a.avgSfr);
   const skuRows = Object.values(bySku).map(s=>({
     ...s, avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
     avgSfr:s.sfrSum/s.n, avgSos:s.sosSum/s.n, avgSosVsShahd:s.sosVsShahdSum/s.n, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
@@ -2647,7 +2681,7 @@ function dashCategories(approved){
     <h3>SKU performance across all ${totalStores} stores / أداء المنتجات في كل الفروع</h3>
     <p class="hint" style="margin-top:-4px;margin-bottom:8px">"Vel/store" = average units sold per day at a single store. "Network total" = summed across every store carrying it. "Coverage" = % of visited stores where it's in stock right now. "Util vs total" and "SOS vs Shahd" are each SKU's average share of the dedicated Shahd space and of total Shahd facings, across every store — the grand-total/average view.</p>
     <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Vel/store/d</th><th>Network total/d</th><th>Coverage</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Price OK</th></tr>
-    ${skuRows.map(r=>`<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})</td><td>${fmt(r.avgSfr)}%</td><td>${fmt(r.avgSosVsShahd)}%</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`).join('')}
+    ${skuRows.map(r=>{ const excl = r.category==='Marinated Fresh'; return `<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})</td><td>${excl?'—':fmt(r.avgSfr)+'%'}</td><td>${excl?'—':fmt(r.avgSosVsShahd)+'%'}</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`; }).join('')}
     </table></div>
   </div>`;
 }
@@ -3495,7 +3529,7 @@ function screenBranchDetail(){
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmt(s.sos)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+          ${branchRow.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
         </table></div>
       </div>
     `}
