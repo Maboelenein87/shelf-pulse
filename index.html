@@ -1357,7 +1357,14 @@ function computeItem(it){
 }
 
 function visitAggregate(visit){
-  const items = (visit.items||[]).map(it => ({...it, calc: computeItem(it)}));
+  const rawItems = visit.items || [];
+  // Backward compatibility: every visit submitted before the "Full Shahd space" redesign has no
+  // shahdSpaceTotal — but it still carries the old per-SKU pogFacings field, since that data was
+  // never deleted, just stopped being written to. Approximating the old total by summing those
+  // keeps historical SUC numbers meaningful instead of every pre-redesign visit reading 0%.
+  const hasNewTotal = rawItems.some(it => it.shahdSpaceTotal !== '' && it.shahdSpaceTotal !== undefined && it.shahdSpaceTotal !== null);
+  const legacyTotal = hasNewTotal ? null : rawItems.reduce((s,it)=>s+(parseFloat(it.pogFacings)||0),0);
+  const items = rawItems.map(it => ({...it, calc: computeItem(hasNewTotal ? it : {...it, shahdSpaceTotal: legacyTotal})}));
   // sosVsShahd needs every item's shahdFacings at once (this SKU's share of the visit's total Shahd
   // facings, distinct from `sos` which is share of the whole category) — computeItem only sees one
   // item at a time, so this is layered on afterward, here, once per visit.
@@ -1382,6 +1389,13 @@ function visitAggregate(visit){
     avgCoverage: finiteCoverage.length ? finiteCoverage.reduce((a,b)=>a+b,0)/finiteCoverage.length : 0,
     hasPhoto: !!(visit.photos && visit.photos.length) || !!visit.photo,
     hasGeo: !!visit.geo,
+    // Absolute totals for this visit — one number each, not per-SKU (category facings and dedicated
+    // Shahd space are visit-level inputs; Shahd facings is the sum across every SKU). shahdSpaceTotal
+    // uses the same legacy-fallback logic as the per-item calc above, so old visits resolve to a real
+    // number here too, not 0.
+    catFacingsTotal: parseFloat(rawItems[0]?.catFacings) || 0,
+    shahdSpaceTotal: hasNewTotal ? (parseFloat(rawItems[0]?.shahdSpaceTotal) || 0) : legacyTotal,
+    shahdFacingsTotal: items.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0),
   };
 }
 
@@ -2371,10 +2385,15 @@ function computeCustomerAnalysis(approved){
     const agg = visitAggregate(v);
     byCustomer[v.accountName] = byCustomer[v.accountName] || { name:v.accountName, branches:{}, skuStats:{}, photos:[] };
     const c = byCustomer[v.accountName];
-    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, sfrSum:0, sosSum:0, osaSum:0, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null };
+    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, sfrSum:0, sosSum:0, osaSum:0, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null, latestCatFacingsTotal:0, latestShahdSpaceTotal:0, latestShahdFacingsTotal:0 };
     const b = c.branches[v.branch];
     b.visits++; b.sfrSum += agg.avgSfr; b.sosSum += agg.avgSos; b.osaSum += agg.osaPct;
     b.lastVisitDate = v.date; // overwritten each pass — ends on the most recent visit's date
+    // Absolute totals for the branch header — one set of numbers per branch, not per SKU. Overwritten
+    // each pass so it ends on the latest visit's reading, same as lastVisitDate above.
+    b.latestCatFacingsTotal = agg.catFacingsTotal;
+    b.latestShahdSpaceTotal = agg.shahdSpaceTotal;
+    b.latestShahdFacingsTotal = agg.shahdFacingsTotal;
     visitPhotos(v).forEach(p=>c.photos.push({photo:p, branch:v.branch, date:v.date}));
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
@@ -2387,15 +2406,15 @@ function computeCustomerAnalysis(approved){
       if(!isNaN(priceVal) && priceVal>0){ s.latestPrice = priceVal; } // overwritten each pass — ends on the most recent visit's reading, not an average
       if(it.calc.priceStatus!=='neutral'){ s.priceN++; if(it.calc.priceStatus==='on') s.priceOk++; b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
 
-      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestShahdSpace:0, latestSfr:0, latestSosVsShahd:0 };
+      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestSfr:0, latestSos:0, latestSosVsShahd:0 };
       const bs = b.skuStats[sku.id];
       bs.n++; if(it.calc.osa==='N') bs.oosCount++;
       if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; }
       if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // latest reading, not an average
       bs.latestStock = it.calc.actualShelfStock; // overwritten each pass — ends on the most recent visit's reading
       bs.latestCapacity = parseFloat(it.actualCapacity) || 0; // facings actually on shelf, latest visit
-      bs.latestShahdSpace = parseFloat(it.shahdSpaceTotal) || 0; // total dedicated Shahd space for the branch, latest visit (same across every SKU that visit)
       bs.latestSfr = it.calc.sfr; // latest visit's utilization-vs-total%, not an average — matches stock/price
+      bs.latestSos = it.calc.sos; // this SKU's share of total category facings, latest visit
       bs.latestSosVsShahd = it.calc.sosVsShahd; // this SKU's share of total Shahd facings, latest visit
     });
    }catch(e){ console.error('Skipping malformed visit in customer analysis:', v && v.id, e); }
@@ -2404,6 +2423,7 @@ function computeCustomerAnalysis(approved){
     const branches = Object.values(c.branches).map(b=>({
       branch:b.branch, sfr:b.sfrSum/b.visits, sos:b.sosSum/b.visits, osaPct:b.osaSum/b.visits, lastVisitDate:b.lastVisitDate,
       priceOkPct: b.priceN?b.priceOk/b.priceN*100:0, visits:b.visits,
+      catFacingsTotal: b.latestCatFacingsTotal, shahdSpaceTotal: b.latestShahdSpaceTotal, shahdFacingsTotal: b.latestShahdFacingsTotal,
       skuList: Object.entries(b.skuStats).map(([skuId,s])=>{
         const avgVel = s.velN?s.velSum/s.velN:0;
         // Coverage uses the SAME average velocity shown as "Vel/d" (not a single latest-visit reading), paired with the latest stock count.
@@ -2414,7 +2434,7 @@ function computeCustomerAnalysis(approved){
           actualPrice: s.latestPrice||0,
           priceStatus: s.priceStatus, oosCount:s.oosCount, n:s.n,
           stock: s.latestStock, coverageDays,
-          capacity: s.latestCapacity, pog: s.latestShahdSpace, sfr: s.latestSfr, sosVsShahd: s.latestSosVsShahd,
+          capacity: s.latestCapacity, sfr: s.latestSfr, sos: s.latestSos, sosVsShahd: s.latestSosVsShahd,
         };
       }).sort((a,b2)=>b2.avgVel-a.avgVel),
     }));
@@ -2553,11 +2573,11 @@ function dashCustomers(approved){
           const bKey = 'br:'+r.name+'|'+b.branch;
           const bOpen = State.expandedBranch === bKey;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
-            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}</div></div>
+            <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div><div class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}% · OSA ${fmt(b.osaPct)}% · Price OK ${fmt(b.priceOkPct)}%</div><div class="hint">Dedicated Shahd space: ${fmt(b.shahdSpaceTotal)} · Category facings: ${fmt(b.catFacingsTotal)} · Shahd facings: ${fmt(b.shahdFacingsTotal)}</div><div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}</div></div>
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
-          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Dedicated total (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+          ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
+            ${b.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmt(s.sos)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
           </table></div>` : ''}`;
         }).join('')}
 
@@ -3467,10 +3487,15 @@ function screenBranchDetail(){
         <div class="kpi"><div class="num">${fmt(branchRow.osaPct)}%</div><div class="lbl">OSA</div></div>
         <div class="kpi"><div class="num">${fmt(branchRow.priceOkPct)}%</div><div class="lbl">Price OK</div></div>
       </div>
+      <div class="verify-row" style="margin:10px 0">
+        ${statusChip('neutral', `Dedicated Shahd space: ${fmt(branchRow.shahdSpaceTotal)}`)}
+        ${statusChip('neutral', `Category facings: ${fmt(branchRow.catFacingsTotal)}`)}
+        ${statusChip('neutral', `Shahd facings: ${fmt(branchRow.shahdFacingsTotal)}`)}
+      </div>
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Dedicated total (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${s.pog>0?fmt(s.capacity):'—'}</td><td>${s.pog>0?fmt(s.pog):'—'}</td><td>${s.pog>0?fmt(s.sfr)+'%':'—'}</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
+          ${branchRow.skuList.map(s=>`<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.sfr)}%</td><td>${fmt(s.sosVsShahd)}%</td><td>${fmt(s.sos)}%</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`).join('')}
         </table></div>
       </div>
     `}
