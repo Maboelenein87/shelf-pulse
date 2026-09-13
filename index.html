@@ -1572,6 +1572,17 @@ function restoreDraftIfAny(){
     if(!raw) return;
     const saved = JSON.parse(raw);
     if(saved.role===State.role && saved.name===State.name && saved.draft && saved.draft.items && saved.draft.items.length){
+      // A draft that started on an earlier calendar day is stale — visits are always dated today (see
+      // the "always today" lock), so resuming yesterday's in-progress arrival/SKU data under today's
+      // date would silently misattribute it. Discard it instead and let them start clean — this is
+      // the merchandiser-side half of "closing" a stuck arrival; the other half is a management action
+      // on the Arrivals tab that closes the matching server-side record for reporting purposes.
+      const startedDay = saved.draft.arrivedAt ? new Date(saved.draft.arrivedAt).toISOString().slice(0,10)
+                        : (saved.draft.capturedAt ? new Date(saved.draft.capturedAt).toISOString().slice(0,10) : null);
+      if(startedDay && startedDay !== todayStr()){
+        clearDraftLocal();
+        return;
+      }
       State.draft = saved.draft;
       showToast('Resumed your unsaved visit draft ✓');
     }
@@ -2322,21 +2333,43 @@ function approvalCardHtml(v){
   </div>`;
 }
 
+async function closeArrival(id){
+  if(!confirm('Close this arrival? The merchandiser will be able to mark a fresh arrival at this store next time.')) return;
+  try{ await arrivalUpdate(id, {status:'abandoned'}); showToast('Arrival closed ✓'); }
+  catch(e){ console.error(e); showToast('Could not close — check your connection and try again.'); }
+}
+async function closeStaleArrivals(){
+  const stale = State.arrivals.filter(a=>a.status==='active' && (Date.now()-a.arrivedAt) >= STALE_ARRIVAL_MINUTES*60000);
+  if(stale.length===0){ showToast('Nothing stale to close'); return; }
+  if(!confirm(`Close ${stale.length} arrival${stale.length===1?'':'s'} stuck for over a day? Each merchandiser will be able to mark a fresh arrival at their store next time.`)) return;
+  showToast('Closing…');
+  for(const a of stale){ try{ await arrivalUpdate(a.id, {status:'abandoned'}); }catch(e){ console.error(e); } }
+  showToast('Closed ✓');
+}
 /* ---- Arrivals (live "who's on-site now" + recent arrival history) ---- */
+// A day+ stuck "active" is almost certainly an abandoned draft (app closed mid-visit, device changed,
+// never got back to submit) rather than a genuine multi-day visit — worth a manual close so it stops
+// cluttering the "on-site now" view and the merchandiser can start clean the next day. Management-only
+// (Merch Head / Trade Marketing), not Supervisor — this is data hygiene across the whole roster, not
+// day-to-day team management.
+const STALE_ARRIVAL_MINUTES = 24*60;
 function screenArrivals(){
   const mySet = new Set(myMerchandisers());
   const scoped = State.arrivals.filter(a => State.role!=='supervisor' || mySet.has(a.auditor));
   const active = scoped.filter(a=>a.status==='active');
   const recent = scoped.filter(a=>a.status!=='active').slice(0, 20);
+  const canClose = State.role==='merch_head' || State.role==='trade_marketing';
+  const staleCount = active.filter(a=>(Date.now()-a.arrivedAt) >= STALE_ARRIVAL_MINUTES*60000).length;
   return `<div class="screen">
     <h1>Arrivals / الوصول</h1>
     <p class="lede">Live view of who's on-site right now, and recent arrivals.</p>
+    ${canClose && staleCount>0 ? `<button class="btn btn-danger btn-sm" style="margin-bottom:10px" onclick="closeStaleArrivals()">Close ${staleCount} arrival${staleCount===1?'':'s'} stuck over a day</button>` : ''}
     <div class="sectitle">On-site now — ${active.length} / متواجدون الآن</div>
-    ${active.map(a=>arrivalCardHtml(a,true)).join('') || emptyState('📍','Nobody currently checked in','Arrivals show up here the moment a merchandiser marks arrival.')}
-    ${recent.length ? `<div class="sectitle" style="margin-top:16px">Recent / الأخيرة</div>${recent.map(a=>arrivalCardHtml(a,false)).join('')}` : ''}
+    ${active.map(a=>arrivalCardHtml(a,true,canClose)).join('') || emptyState('📍','Nobody currently checked in','Arrivals show up here the moment a merchandiser marks arrival.')}
+    ${recent.length ? `<div class="sectitle" style="margin-top:16px">Recent / الأخيرة</div>${recent.map(a=>arrivalCardHtml(a,false,false)).join('')}` : ''}
   </div>`;
 }
-function arrivalCardHtml(a, isActive){
+function arrivalCardHtml(a, isActive, canClose){
   const elapsedMins = isActive ? (Date.now()-a.arrivedAt)/60000 : null;
   const statusLabel = a.status==='active' ? 'on-site' : a.status==='completed' ? 'completed' : 'abandoned';
   const statusColor = a.status==='active' ? 'watch' : a.status==='completed' ? 'on' : 'off';
@@ -2346,6 +2379,7 @@ function arrivalCardHtml(a, isActive){
   const completionMins = linkedVisit ? visitDurationMinutes(linkedVisit) : null;
   const flagFast = completionMins !== null && completionMins < SHORT_COMPLETION_MINUTES;
   const flagLong = isActive && elapsedMins >= LONG_ONSITE_MINUTES;
+  const isStale = isActive && elapsedMins >= STALE_ARRIVAL_MINUTES;
   return `<div class="card"${(flagFast||flagLong)?' style="border-color:var(--red)"':''}>
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
@@ -2360,6 +2394,7 @@ function arrivalCardHtml(a, isActive){
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
     </div>
     ${a.photo ? `<img src="${a.photo}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${a.photo}')"/>` : ''}
+    ${canClose && isActive ? `<button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="closeArrival('${a.id}')">${isStale?'Close — stuck over a day':'Close arrival'}</button>` : ''}
   </div>`;
 }
 
@@ -3887,7 +3922,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
