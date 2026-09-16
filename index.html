@@ -849,6 +849,7 @@ if(isConfigured){
   const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
   const fs = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
   const st = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js");
+  const au = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
   firestoreFns = fs;
   storageFns = st;
   app = initializeApp(firebaseConfig);
@@ -864,6 +865,17 @@ if(isConfigured){
     db = fs.getFirestore(app);
   }
   storage = st.getStorage(app);
+  // Anonymous auth — required now that Firestore/Storage rules check request.auth != null instead of
+  // being wide open to the internet (the change this whole feature exists for). This is invisible to
+  // the person using the app: no login screen, no password, just a background signed-in session that
+  // lets real app traffic through while a stranger hitting the database URL directly gets rejected.
+  // Every read/write anywhere below this point waits for this to resolve first, since it's a top-level
+  // await in a module script.
+  try{
+    await au.signInAnonymously(au.getAuth(app));
+  }catch(e){
+    console.error('Anonymous sign-in failed — Firestore/Storage requests will be rejected until this succeeds:', e);
+  }
 } else {
   document.getElementById('setup-screen').style.display = 'block';
   document.getElementById('app').style.display = 'none';
@@ -1762,7 +1774,15 @@ function addCapturedPhoto(dataUrl){
 // Marks the true start of the visit: creates an `arrivals` doc immediately (so supervisors see it
 // live) and stamps the draft with arrivalId/arrivedAt, which visitDurationMinutes() and submitVisit()
 // then use as the real on-site start time instead of the old proxy (first shelf photo).
+// arrivalAttemptGen guards against duplicate arrival records: tapping "Cancel and retry" only ever
+// reset the pending flag before, it never actually stopped the original write still running in the
+// background — so an impatient cancel-then-retry could let BOTH attempts land a few seconds apart,
+// producing two "on-site" cards for the same visit. Each attempt now carries its own generation
+// number; if it's been superseded by the time its write finishes, it silently closes out whatever it
+// just created instead of claiming the draft.
+let arrivalAttemptGen = 0;
 async function finishArrival(photoDataUrl){
+  const myGen = ++arrivalAttemptGen;
   const d = State.draft;
   const arrivalId = uid();
   State.arrivalPending = true; render();
@@ -1793,6 +1813,13 @@ async function finishArrival(photoDataUrl){
       date: todayStr(), arrivedAt, photo: photoUrl, geo: geo||null, status:'active', visitId:null,
     };
     await arrivalCreate(arrival);
+    if(myGen !== arrivalAttemptGen){
+      // Cancelled and retried while this write was still in flight — it succeeded, but a newer
+      // attempt has already taken over the draft. Close this one out immediately rather than leaving
+      // a second "active" arrival sitting there for the same visit.
+      arrivalUpdate(arrivalId, {status:'abandoned'}).catch(()=>{});
+      return;
+    }
     d.geo = geo||d.geo;
     d.arrivalId = arrivalId;
     d.arrivedAt = arrivedAt;
@@ -1807,10 +1834,12 @@ async function finishArrival(photoDataUrl){
     saveDraftLocal();
     showToast('Arrival marked ✓ — start the shelf check');
   }catch(e){
-    console.error('Arrival mark failed', e);
-    showToast('Could not mark arrival — check your connection and try again.');
+    if(myGen === arrivalAttemptGen){
+      console.error('Arrival mark failed', e);
+      showToast('Could not mark arrival — check your connection and try again.');
+    }
   } finally {
-    State.arrivalPending = false; render();
+    if(myGen === arrivalAttemptGen){ State.arrivalPending = false; render(); }
   }
 }
 function attachCameraStream(){
@@ -1918,6 +1947,7 @@ function captureGeo(){
   );
 }
 function cancelArrivalPending(){
+  arrivalAttemptGen++; // invalidates whatever finishArrival() call is still in flight
   State.arrivalPending = false;
   render();
   showToast('Cancelled — tap Mark arrival to try again');
@@ -2308,6 +2338,12 @@ function screenApprovals(){
 function approvalCardHtml(v){
   const agg = visitAggregate(v);
   const verified = agg.hasPhoto && agg.hasGeo;
+  // Same numbers the branch header shows post-approval — surfaced here too so a supervisor can catch
+  // an impossible count (like Shahd facings exceeding category facings) before approving it, not after.
+  const countedItems = agg.items.filter(it=>(SKU_MAP[it.skuId]||{}).category!=='Marinated Fresh');
+  const shahdFacingsSum = countedItems.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
+  const actualSpaceFilled = countedItems.reduce((s,it)=>s+(parseFloat(it.actualCapacity)||0),0);
+  const exceedsCategory = agg.catFacingsTotal>0 && shahdFacingsSum>agg.catFacingsTotal;
   return `<div class="card">
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${v.accountName} · ${v.branch}</div><div class="visit-sub">${v.date} · submitted by ${v.auditor}</div></div>
@@ -2317,6 +2353,14 @@ function approvalCardHtml(v){
       ${verified ? statusChip('on','📍 Verified visit / زيارة موثقة') : statusChip('off','⚠️ Unverified / غير موثقة')}
       ${statusChip(agg.visitDonePct>=95?'on':'watch', fmt(agg.visitDonePct)+'% data complete / اكتمال البيانات')}
       ${(() => { const mins = visitDurationMinutes(v); return mins!==null ? statusChip(mins<SHORT_VISIT_MINUTES?'off':'neutral', '⏱ '+fmtDuration(mins)+(mins<SHORT_VISIT_MINUTES?' — too fast to be real':'')) : ''; })()}
+    </div>
+    <div class="verify-row" style="margin-bottom:8px">
+      ${statusChip('neutral', `Category facings: ${fmt(agg.catFacingsTotal)}`)}
+      ${statusChip(exceedsCategory?'off':'neutral', `Shahd facings: ${fmt(shahdFacingsSum)}`)}
+      ${statusChip('neutral', `Dedicated Shahd space: ${fmt(agg.shahdSpaceTotal)}`)}
+      ${statusChip('neutral', `Actual space filled: ${fmt(actualSpaceFilled)}`)}
+      ${exceedsCategory && !v.extraDisplay ? statusChip('off','⚠️ Shahd facings exceed category — check before approving') : ''}
+      ${v.extraDisplay ? statusChip('watch','Extra display beyond category shelf confirmed') : ''}
     </div>
     ${visitPhotos(v).length ? `<div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:8px">${visitPhotos(v).map(p=>`<img src="${p}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;flex-shrink:0;cursor:pointer" onclick="window.open('${p}')"/>`).join('')}</div>` : ''}
     ${v.geo ? `<p class="hint">📍 ${v.geo.lat}, ${v.geo.lng} (±${v.geo.accuracy}m) · ${v.capturedAt?new Date(v.capturedAt).toLocaleString():''}</p>` : ''}
