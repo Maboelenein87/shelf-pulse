@@ -1315,7 +1315,6 @@ const ROLES = {
   merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
   trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
   commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','accounts','scorecard','allvisits','storemap'] },
-  commercial:   { label:'Commercial Dashboard', needsPassword:true, password:'shahd-view2026', contexts:['manage'], canApprove:false, canEditRef:false, viewOnly:true, manageTabs:['dashboard','team','scorecard','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
 function identityLabel(){
@@ -2414,7 +2413,13 @@ function screenArrivals(){
   </div>`;
 }
 function arrivalCardHtml(a, isActive, canClose){
-  const elapsedMins = isActive ? (Date.now()-a.arrivedAt)/60000 : null;
+  const rawElapsedMins = isActive ? (Date.now()-a.arrivedAt)/60000 : null;
+  // A negative value means the arrival timestamp is in the future relative to whoever's viewing this —
+  // not a display bug, but a real device clock mismatch on the merchandiser's phone (wrong time/timezone
+  // setting). Worth flagging distinctly rather than silently showing "-29m", since a wrong clock could
+  // also be quietly skewing that device's other timestamp-based data (visit duration, "today" date lock).
+  const clockMismatch = isActive && rawElapsedMins < 0;
+  const elapsedMins = isActive ? Math.max(0, rawElapsedMins) : null;
   const statusLabel = a.status==='active' ? 'on-site' : a.status==='completed' ? 'completed' : 'abandoned';
   const statusColor = a.status==='active' ? 'watch' : a.status==='completed' ? 'on' : 'off';
   // For a completed arrival, pull the actual completion duration from the linked visit — same
@@ -2422,17 +2427,18 @@ function arrivalCardHtml(a, isActive, canClose){
   const linkedVisit = (a.status==='completed' && a.visitId) ? State.visits.find(v=>v.id===a.visitId) : null;
   const completionMins = linkedVisit ? visitDurationMinutes(linkedVisit) : null;
   const flagFast = completionMins !== null && completionMins < SHORT_COMPLETION_MINUTES;
-  const flagLong = isActive && elapsedMins >= LONG_ONSITE_MINUTES;
-  const isStale = isActive && elapsedMins >= STALE_ARRIVAL_MINUTES;
-  return `<div class="card"${(flagFast||flagLong)?' style="border-color:var(--red)"':''}>
+  const flagLong = isActive && !clockMismatch && elapsedMins >= LONG_ONSITE_MINUTES;
+  const isStale = isActive && !clockMismatch && elapsedMins >= STALE_ARRIVAL_MINUTES;
+  return `<div class="card"${(flagFast||flagLong||clockMismatch)?' style="border-color:var(--red)"':''}>
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
       ${statusChip(statusColor, statusLabel)}
     </div>
     <div class="verify-row" style="margin-bottom:8px">
       ${statusChip('neutral', '🕐 Arrived ' + new Date(a.arrivedAt).toLocaleTimeString())}
-      ${isActive ? statusChip(flagLong?'off':(elapsedMins>60?'watch':'neutral'), '⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
+      ${isActive ? statusChip(clockMismatch?'off':(flagLong?'off':(elapsedMins>60?'watch':'neutral')), clockMismatch?'⏱ time unknown':'⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
       ${completionMins !== null ? statusChip(flagFast?'off':'on', '⏱ ' + fmtDuration(completionMins) + ' total') : ''}
+      ${clockMismatch ? statusChip('off', '📵 Device clock mismatch — check phone time/timezone settings') : ''}
       ${flagFast ? statusChip('off', '🔍 Investigate — too fast for a full visit') : ''}
       ${flagLong ? statusChip('off', '🔍 Investigate — unusually long on-site') : ''}
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
@@ -2569,8 +2575,10 @@ function computeCustomerAnalysis(approved){
       // in the branch header) rather than trusting it.calc.sfr as-is — for legacy visits, calc.sfr is
       // deliberately computed a different way internally (against that SKU's own old individual target,
       // kept for a separate, safely-bounded scoring metric elsewhere) which would otherwise show a
-      // number here that doesn't match the total sitting right next to it in the header.
-      bs.latestSfr = agg.shahdSpaceTotal > 0 ? Math.min(300, (bs.latestCapacity / agg.shahdSpaceTotal) * 100) : 0;
+      // number here that doesn't match the total sitting right next to it in the header. Marinated
+      // Fresh still needs its own exclusion applied here too, same as it.calc.sfr/sos/sosVsShahd —
+      // this recompute bypasses that object entirely, so it has to be re-checked explicitly.
+      bs.latestSfr = it.calc.excludedFromSucSos ? null : (agg.shahdSpaceTotal > 0 ? Math.min(300, (bs.latestCapacity / agg.shahdSpaceTotal) * 100) : 0);
       bs.latestSos = it.calc.sos; // this SKU's share of total category facings, latest visit
       bs.latestSosVsShahd = it.calc.sosVsShahd; // this SKU's share of total Shahd facings, latest visit
     });
