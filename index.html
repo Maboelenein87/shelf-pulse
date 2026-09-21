@@ -1041,6 +1041,16 @@ async function removeGalleryPhotoPrompt(accountId, url){
   try{ await galleryRemovePhoto(accountId, url); showToast('Removed ✓'); }
   catch(e){ console.error(e); showToast('Could not remove — try again.'); }
 }
+async function deleteVisitPhotoPrompt(visitId, photoUrl){
+  if(!confirm('Delete this photo from the visit record? This cannot be undone.')) return;
+  try{
+    const visit = State.visits.find(v=>v.id===visitId);
+    if(!visit){ showToast('Visit not found — it may have been deleted already.'); return; }
+    const newPhotos = (visit.photos||[]).filter(p=>p!==photoUrl);
+    await visitUpdate(visitId, { photos: newPhotos });
+    showToast('Photo deleted ✓');
+  }catch(e){ console.error(e); showToast('Could not delete — check your connection and try again.'); }
+}
 
 /* ============================= STORAGE HELPERS (Firestore) ============================= */
 const REF_DATA_VERSION = 3; // bump this whenever DEFAULT_SKUS/DEFAULT_ACCOUNTS change, to force a refresh
@@ -1407,7 +1417,7 @@ const SUPERVISOR_PASSWORDS = {
 const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4568", "4569", "4570", "4632", "4807", "4808", "4854", "4876", "5109", "5461", "5472", "5486", "5600", "5605", "5614", "5662", "5693", "5715", "5716", "5799", "5813", "5834", "5882", "5900", "5923", "5985", "5996", "6003", "6070", "6102", "6115", "6130", "6152", "6213", "6246", "6259", "6276", "6356", "6388", "6396", "6608", "6618", "6739", "6848", "6856", "6881", "6896", "6949", "6966", "7025", "7073", "7159", "7176", "7215", "7216", "7217", "7252", "7254", "7255", "7262", "7301", "7316"]);
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
-  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','team','scorecard','allvisits','delegate'] },
+  supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','accounts','team','scorecard','allvisits','delegate'] },
   merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
   trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
   commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','accounts','scorecard','allvisits','storemap'] },
@@ -1891,6 +1901,32 @@ function addCapturedPhoto(dataUrl){
 // number; if it's been superseded by the time its write finishes, it silently closes out whatever it
 // just created instead of claiming the draft.
 let arrivalAttemptGen = 0;
+function haversineMeters(lat1,lng1,lat2,lng2){
+  const R = 6371000, toRad = d => d*Math.PI/180;
+  const dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+  return R * 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+// Catches "wrong customer selected" — e.g. physically at Oscar but picked Seoudi Waterway from the
+// list — by comparing this arrival's GPS against every account's previously learned location
+// (State.locations, built up from past visits' geo). If the captured point sits much closer to a
+// DIFFERENT known account than to the one actually selected, that's a strong signal of a mis-pick.
+// Advisory only, not a hard block: learned locations are sparse early on and GPS drifts indoors, so
+// blocking submission on this would cause more harm than the errors it catches.
+function checkLocationMismatch(accountId, geo){
+  if(!geo) return null;
+  let nearest = null, nearestDist = Infinity;
+  Object.entries(State.locations||{}).forEach(([id, loc]) => {
+    if(loc.accuracy != null && loc.accuracy > 100) return; // ignore low-precision learned points — too unreliable to compare against
+    const dist = haversineMeters(geo.lat, geo.lng, loc.lat, loc.lng);
+    if(dist < nearestDist){ nearestDist = dist; nearest = { id, ...loc }; }
+  });
+  if(!nearest || nearest.id === accountId || nearestDist >= 150) return null;
+  const own = State.locations && State.locations[accountId];
+  const ownDist = own ? haversineMeters(geo.lat, geo.lng, own.lat, own.lng) : Infinity;
+  if(ownDist <= nearestDist + 100) return null; // selected account's own location is about as close — not a clear mismatch
+  return { accountId: nearest.id, accountName: nearest.accountName, branch: nearest.branch, distance: Math.round(nearestDist) };
+}
 async function finishArrival(photoDataUrl){
   const myGen = ++arrivalAttemptGen;
   const d = State.draft;
@@ -1917,10 +1953,12 @@ async function finishArrival(photoDataUrl){
     let photoUrl = photoDataUrl;
     try{ photoUrl = await uploadVisitPhoto(photoDataUrl, arrivalId, 0); }catch(e){ console.error('Arrival photo upload failed, keeping embedded copy:', e); }
     const arrivedAt = Date.now();
+    const mismatch = checkLocationMismatch(d.accountId, geo);
     const arrival = {
       id: arrivalId, accountId:d.accountId, accountName:d.accountName, branch:d.branch,
       channel:d.channel||'', region:d.region||'', auditor: identityLabel(),
       date: todayStr(), arrivedAt, photo: photoUrl, geo: geo||null, status:'active', visitId:null,
+      locationMismatch: mismatch,
     };
     await arrivalCreate(arrival);
     if(myGen !== arrivalAttemptGen){
@@ -1942,7 +1980,11 @@ async function finishArrival(photoDataUrl){
     d.photos = d.photos || [];
     if(d.photos.length === 0) d.photos.push(photoUrl);
     saveDraftLocal();
-    showToast('Arrival marked ✓ — start the shelf check');
+    if(mismatch){
+      showToast(`⚠️ This location matches ${mismatch.accountName} (${mismatch.branch}), not ${d.accountName} — double check you picked the right customer.`);
+    } else {
+      showToast('Arrival marked ✓ — start the shelf check');
+    }
   }catch(e){
     if(myGen === arrivalAttemptGen){
       console.error('Arrival mark failed', e);
@@ -2541,7 +2583,7 @@ function arrivalCardHtml(a, isActive, canClose){
   const flagFast = completionMins !== null && completionMins < SHORT_COMPLETION_MINUTES;
   const flagLong = isActive && !clockMismatch && elapsedMins >= LONG_ONSITE_MINUTES;
   const isStale = isActive && !clockMismatch && elapsedMins >= STALE_ARRIVAL_MINUTES;
-  return `<div class="card"${(flagFast||flagLong||clockMismatch)?' style="border-color:var(--red)"':''}>
+  return `<div class="card"${(flagFast||flagLong||clockMismatch||a.locationMismatch)?' style="border-color:var(--red)"':''}>
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${a.auditor}</div><div class="visit-sub">${a.accountName} · ${a.branch}</div></div>
       ${statusChip(statusColor, statusLabel)}
@@ -2551,6 +2593,7 @@ function arrivalCardHtml(a, isActive, canClose){
       ${isActive ? statusChip(clockMismatch?'off':(flagLong?'off':(elapsedMins>60?'watch':'neutral')), clockMismatch?'⏱ time unknown':'⏱ ' + fmtDuration(elapsedMins) + ' on-site') : ''}
       ${completionMins !== null ? statusChip(flagFast?'off':'on', '⏱ ' + fmtDuration(completionMins) + ' total') : ''}
       ${clockMismatch ? statusChip('off', '📵 Device clock mismatch — check phone time/timezone settings') : ''}
+      ${a.locationMismatch ? statusChip('off', `🚩 Wrong customer? Location matches ${a.locationMismatch.accountName} (${a.locationMismatch.branch}), ~${a.locationMismatch.distance}m away`) : ''}
       ${flagFast ? statusChip('off', '🔍 Investigate — too fast for a full visit') : ''}
       ${flagLong ? statusChip('off', '🔍 Investigate — unusually long on-site') : ''}
       ${a.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location')}
@@ -2615,12 +2658,40 @@ function screenDashboard(){
       <button class="${State.dashSub==='customer'?'active':''}" onclick="setDashSub('customer')">Customers / العملاء</button>
       <button class="${State.dashSub==='category'?'active':''}" onclick="setDashSub('category')">Categories / الفئات</button>
       <button class="${State.dashSub==='opportunity'?'active':''}" onclick="setDashSub('opportunity')">Opportunities / الفرص</button>
+      <button class="${State.dashSub==='photos'?'active':''}" onclick="setDashSub('photos')">Photos / الصور</button>
     </div>
     ${State.dashSub==='overview' ? dashOverview(approved)
       : State.dashSub==='customer' ? dashCustomers(approved)
       : State.dashSub==='category' ? dashCategories(approved)
+      : State.dashSub==='photos' ? dashPhotos(approved)
       : dashOpportunities(approved)}
   </div>`;
+}
+function dashPhotos(approved){
+  const customers = computeCustomerAnalysis(approved);
+  const withPhotos = customers.filter(c=>c.photos && c.photos.length);
+  const canDelete = State.role==='merch_head' || State.role==='trade_marketing';
+  if(withPhotos.length===0) return emptyState('📷','No photos yet','Photos appear here once visits with photos are approved.');
+  return withPhotos.map(c=>{
+    const open = State.expandedCategory === 'photodash:'+c.name;
+    const byBranch = {};
+    c.photos.forEach(p=>{ (byBranch[p.branch] = byBranch[p.branch]||[]).push(p); });
+    return `<div class="card">
+      <div class="branch-toggle" onclick="toggleCategory('photodash:${c.name.replace(/'/g,"\\'")}')">
+        <div><div class="visit-main">${c.name}</div><div class="visit-sub">${c.photos.length} photo${c.photos.length===1?'':'s'} across ${Object.keys(byBranch).length} branch${Object.keys(byBranch).length===1?'':'es'}</div></div>
+        <div style="font-size:16px">${open?'−':'+'}</div>
+      </div>
+      ${open ? Object.entries(byBranch).map(([branch,photos])=>`
+        <div class="hint" style="font-weight:700;margin:10px 0 6px">${branch}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+          ${photos.map(p=>`<div style="position:relative">
+            <img src="${p.photo}" title="${p.auditor} · ${p.date}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${p.photo}')"/>
+            ${canDelete ? `<button class="remove-x" style="position:absolute;top:-6px;right:-6px;background:var(--red);color:#fff;border-radius:50%;width:20px;height:20px;padding:0;font-size:13px;line-height:20px" onclick="deleteVisitPhotoPrompt('${p.visitId}','${p.photo.replace(/'/g,"\\'")}')">✕</button>` : ''}
+          </div>`).join('')}
+        </div>
+      `).join('') : ''}
+    </div>`;
+  }).join('');
 }
 function dashOverview(approved){
   const aggs = approved.map(v=>visitAggregate(v));
@@ -2663,7 +2734,7 @@ function computeCustomerAnalysis(approved){
     b.latestShahdSpaceTotal = agg.shahdSpaceTotal;
     b.latestShahdFacingsTotal = agg.shahdFacingsTotal;
     b.latestExtraDisplay = !!v.extraDisplay;
-    visitPhotos(v).forEach(p=>c.photos.push({photo:p, branch:v.branch, date:v.date}));
+    visitPhotos(v).forEach(p=>c.photos.push({photo:p, branch:v.branch, date:v.date, visitId:v.id, auditor:v.auditor}));
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const priceVal = parseFloat(it.actualPrice);
@@ -2721,10 +2792,18 @@ function computeCustomerAnalysis(approved){
       },0);
       const coverageVals = branches.map(b=>{ const match = b.skuList.find(x=>x.id===skuId); return match ? match.coverageDays : 0; }).filter(x=>x>0 && isFinite(x));
       const hasInfiniteCoverage = branches.some(b=>{ const match = b.skuList.find(x=>x.id===skuId); return match && match.coverageDays === Infinity; });
+      // Utilization and SOS are averaged across branches' LATEST readings (already latest-only, from
+      // the branch rollup above) — not across every historical visit. A branch that had a bad input
+      // months ago and has since been visited correctly isn't still dragged down by that old number.
+      const branchReadings = branches.map(b=>b.skuList.find(x=>x.id===skuId)).filter(Boolean);
+      const sfrVals = branchReadings.map(x=>x.sfr).filter(v=>v!=null);
+      const sosVsShahdVals = branchReadings.map(x=>x.sosVsShahd).filter(v=>v!=null);
       return {
         name:s.name, category:s.category, rsp:s.rsp,
         avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
-        sfr:s.sfrSum/s.n, osaPct: (s.n-s.oosCount)/s.n*100, sosVsShahd: s.sosVsShahdSum/s.n,
+        sfr: sfrVals.length ? sfrVals.reduce((a,b2)=>a+b2,0)/sfrVals.length : null,
+        osaPct: (s.n-s.oosCount)/s.n*100,
+        sosVsShahd: sosVsShahdVals.length ? sosVsShahdVals.reduce((a,b2)=>a+b2,0)/sosVsShahdVals.length : null,
         priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
         actualPrice: s.latestPrice||0,
         oosCount:s.oosCount, visits:s.n, coverage:s.branchesCarrying.size,
@@ -2735,7 +2814,7 @@ function computeCustomerAnalysis(approved){
     skuList.forEach(s=>{
       catMap[s.category] = catMap[s.category] || { category:s.category, sfrSum:0, sosSum:0, velSum:0, n:0 };
       const cc = catMap[s.category];
-      cc.sfrSum += s.sfr; cc.velSum += s.avgVelPerStore; cc.n++;
+      cc.sfrSum += (s.sfr||0); cc.velSum += s.avgVelPerStore; cc.n++;
     });
     const categories = Object.values(catMap).filter(cc=>cc.category!=='Marinated Fresh').map(cc=>({ category:cc.category, avgSfr: cc.sfrSum/cc.n, avgVelPerStore: cc.velSum/cc.n })).sort((a,b)=>b.avgSfr-a.avgSfr);
     const available = skuList.filter(s=>s.oosCount < s.visits).length;
@@ -2762,7 +2841,11 @@ function computeCustomerAnalysis(approved){
 
 /* ---- Customers (customer → branch drill-down: last visit, duration, totals) ---- */
 function screenAccounts(){
-  const approved = State.visits.filter(v=>v.status==='approved');
+  let approved = State.visits.filter(v=>v.status==='approved');
+  if(State.role==='supervisor'){
+    const mySet = new Set(myMerchandisers());
+    approved = approved.filter(v=>mySet.has(v.auditor));
+  }
   const customers = computeCustomerAnalysis(approved);
   if(customers.length===0) return `<div class="screen"><h1>Customers / العملاء</h1>${emptyState('🏬','No approved visits yet','Data appears here once visits are approved.')}</div>`;
   return `<div class="screen">
@@ -2804,7 +2887,7 @@ function screenAccounts(){
             ${statusChip('neutral', `Supervisor: ${acct?acct.sup:'—'}`)}
           </div>
           ${(() => {
-            const canManageGallery = State.role==='merch_head' || State.role==='trade_marketing';
+            const canManageGallery = State.role==='merch_head' || State.role==='trade_marketing' || State.role==='supervisor';
             const gallery = acct ? ((State.galleries[acct.id] && State.galleries[acct.id].photos) || []) : [];
             if(!acct) return '';
             return `<div style="margin:0 0 10px">
@@ -2901,29 +2984,42 @@ function dashCustomers(approved){
 function computeCategoryAnalysis(approved){
   const byCat = {}, bySku = {};
   const totalStores = new Set(approved.map(v=>v.accountName+' · '+v.branch)).size;
-  approved.forEach(v=>{
+  // Utilization (SUC) and SOS are tracked per store+SKU and overwritten on every later visit — sorted
+  // oldest→newest below, so what survives is always each store's LATEST reading, not an average
+  // blended with however many visits (some possibly bad, from before the calc-engine fixes) came
+  // before it. Velocity/price/OOS stay as genuine running tallies across all visits — those are
+  // meant to reflect activity over time, not a single current snapshot.
+  const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0));
+  const latestReading = {}; // key: "account · branch|skuId" -> {sfr, sos, sosVsShahd, category, skuId}
+  sorted.forEach(v=>{
    try{
     const agg = visitAggregate(v);
+    const storeKey = v.accountName+' · '+v.branch;
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
-      byCat[sku.category] = byCat[sku.category] || { sfrSum:0, sosSum:0, n:0 };
-      byCat[sku.category].sfrSum += it.calc.sfr; byCat[sku.category].sosSum += it.calc.sos; byCat[sku.category].n++;
-      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sosSum:0, sosVsShahdSum:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
+      byCat[sku.category] = byCat[sku.category] || { sfrSum:0, sfrN:0, sosSum:0, sosN:0 };
+      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sfrN:0, sosSum:0, sosN:0, sosVsShahdSum:0, sosVsShahdN:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
       const b = bySku[sku.id];
-      b.sfrSum += it.calc.sfr; b.sosSum += it.calc.sos; b.sosVsShahdSum += it.calc.sosVsShahd; b.n++;
-      if(it.calc.osa==='Y') b.storesCarrying.add(v.accountName+' · '+v.branch);
+      b.n++;
+      if(it.calc.osa==='Y') b.storesCarrying.add(storeKey);
       if(it.calc.velocity>0){ b.velSum += it.calc.velocity; b.velN++; }
       if(it.calc.priceStatus!=='neutral'){ b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; if(it.calc.priceStatus==='watch') b.priceAbove++; }
+      latestReading[storeKey+'|'+sku.id] = { sfr: it.calc.sfr, sos: it.calc.sos, sosVsShahd: it.calc.sosVsShahd, category: sku.category, skuId: sku.id };
     });
    }catch(e){ console.error('Skipping malformed visit in category analysis:', v && v.id, e); }
+  });
+  Object.values(latestReading).forEach(r=>{
+    if(r.sfr!=null){ byCat[r.category].sfrSum += r.sfr; byCat[r.category].sfrN++; bySku[r.skuId].sfrSum += r.sfr; bySku[r.skuId].sfrN++; }
+    if(r.sos!=null){ byCat[r.category].sosSum += r.sos; byCat[r.category].sosN++; bySku[r.skuId].sosSum += r.sos; bySku[r.skuId].sosN++; }
+    if(r.sosVsShahd!=null){ bySku[r.skuId].sosVsShahdSum += r.sosVsShahd; bySku[r.skuId].sosVsShahdN++; }
   });
   // Marinated Fresh is excluded from the SUC/SOS story entirely (a different category/shelf) — its
   // row here would only ever read 0%/0%, which isn't a real reading, so it's left out of this table
   // rather than showing a misleading zero.
-  const catRows = Object.entries(byCat).filter(([cat])=>cat!=='Marinated Fresh').map(([cat,c])=>({category:cat, avgSfr:c.sfrSum/c.n, avgSos:c.sosSum/c.n})).sort((a,b)=>b.avgSfr-a.avgSfr);
+  const catRows = Object.entries(byCat).filter(([cat])=>cat!=='Marinated Fresh').map(([cat,c])=>({category:cat, avgSfr: c.sfrN?c.sfrSum/c.sfrN:0, avgSos: c.sosN?c.sosSum/c.sosN:0})).sort((a,b)=>b.avgSfr-a.avgSfr);
   const skuRows = Object.values(bySku).map(s=>({
     ...s, avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
-    avgSfr:s.sfrSum/s.n, avgSos:s.sosSum/s.n, avgSosVsShahd:s.sosVsShahdSum/s.n, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
+    avgSfr: s.sfrN?s.sfrSum/s.sfrN:0, avgSos: s.sosN?s.sosSum/s.sosN:0, avgSosVsShahd: s.sosVsShahdN?s.sosVsShahdSum/s.sosVsShahdN:0, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
     aboveRspPct: s.priceN?s.priceAbove/s.priceN*100:0,
     coveragePct: totalStores ? s.storesCarrying.size/totalStores*100 : 0, coverageCount: s.storesCarrying.size,
   })).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
@@ -4247,7 +4343,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
