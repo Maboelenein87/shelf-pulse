@@ -839,19 +839,24 @@ const firebaseConfig = {
   messagingSenderId: "192689350014",
   appId: "1:192689350014:web:65ad03d4980ad64b3e7f2f"
 };
+// Execution Gallery photo storage — deliberately NOT Firebase, so it never touches Firestore document
+// size limits and doesn't depend on the Blaze-plan-only Storage product. Cloudinary's free tier
+// supports "unsigned" uploads straight from browser JS with no backend/API-secret needed, which is
+// exactly what a static, backend-less site like this one can use safely. Fill these in from
+// Cloudinary → Settings → Upload → Add upload preset (set it to "Unsigned").
+const CLOUDINARY_CLOUD_NAME = 'YOUR_CLOUD_NAME';
+const CLOUDINARY_UPLOAD_PRESET = 'YOUR_UPLOAD_PRESET';
+const cloudinaryConfigured = CLOUDINARY_CLOUD_NAME !== 'YOUR_CLOUD_NAME' && CLOUDINARY_UPLOAD_PRESET !== 'YOUR_UPLOAD_PRESET';
 
-let app, db, storage;
+let app, db;
 let firestoreFns = {};
-let storageFns = {};
 const isConfigured = firebaseConfig && typeof firebaseConfig === 'object';
 
 if(isConfigured){
   const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
   const fs = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
-  const st = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js");
   const au = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
   firestoreFns = fs;
-  storageFns = st;
   app = initializeApp(firebaseConfig);
   // Offline persistence: writes (new visits, approvals) apply to a local IndexedDB cache instantly,
   // regardless of signal, and the SDK syncs them to the server automatically the moment connectivity
@@ -864,9 +869,8 @@ if(isConfigured){
     console.warn('Offline persistence unavailable, falling back to online-only Firestore:', e);
     db = fs.getFirestore(app);
   }
-  storage = st.getStorage(app);
-  // Anonymous auth — required now that Firestore/Storage rules check request.auth != null instead of
-  // being wide open to the internet (the change this whole feature exists for). This is invisible to
+  // Anonymous auth — required now that Firestore rules check request.auth != null instead of being
+  // wide open to the internet (the change this whole feature exists for). This is invisible to
   // the person using the app: no login screen, no password, just a background signed-in session that
   // lets real app traffic through while a stranger hitting the database URL directly gets rejected.
   // Every read/write anywhere below this point waits for this to resolve first, since it's a top-level
@@ -874,19 +878,24 @@ if(isConfigured){
   try{
     await au.signInAnonymously(au.getAuth(app));
   }catch(e){
-    console.error('Anonymous sign-in failed — Firestore/Storage requests will be rejected until this succeeds:', e);
+    console.error('Anonymous sign-in failed — Firestore requests will be rejected until this succeeds:', e);
   }
 } else {
   document.getElementById('setup-screen').style.display = 'block';
   document.getElementById('app').style.display = 'none';
 }
 
-/* ============================= PHOTO STORAGE (Firebase Storage, not Firestore) =============================
+/* ============================= PHOTO STORAGE (Cloudinary, not Firebase) =============================
    Photos are captured as base64 data URLs (see capturePhoto/snapPhoto) so the in-app camera preview and
    local draft-recovery work offline. But they are never written to Firestore as base64 — right before a
-   visit is created, each photo is uploaded to Storage and only the resulting download URL is saved on the
-   visit document. This keeps visit documents small (Firestore caps a document at 1MiB) and means every
-   dashboard/list load doesn't have to download every photo just to render text. */
+   visit is created, each photo is uploaded to Cloudinary and only the resulting URL is saved on the
+   visit document. This keeps visit documents small (Firestore caps a document at 1MiB, and every large
+   embedded photo also gets re-downloaded on every dashboard/list/approval load) and is why this uses
+   Cloudinary rather than Firebase Storage: Storage requires the paid Blaze plan and was never actually
+   enabled on this project, so every "upload" attempt was silently failing and falling back to embedding
+   the full photo in Firestore instead — which is what was driving both the huge data usage (every list
+   load re-downloading every embedded photo) and the app crashing on weaker devices trying to process
+   those bloated documents. */
 function dataUrlToBlob(dataUrl){
   const [header, base64] = dataUrl.split(',');
   const mimeMatch = /data:(.*?);/.exec(header);
@@ -897,12 +906,7 @@ function dataUrlToBlob(dataUrl){
   return new Blob([bytes], { type: mime });
 }
 async function uploadVisitPhoto(dataUrl, visitId, idx){
-  const { ref, uploadBytes, getDownloadURL } = storageFns;
-  const blob = dataUrlToBlob(dataUrl);
-  const path = `visit-photos/${visitId}/${idx}-${Date.now()}.jpg`;
-  const fileRef = ref(storage, path);
-  await withTimeout(uploadBytes(fileRef, blob, { contentType: blob.type || 'image/jpeg' }), PHOTO_UPLOAD_TIMEOUT_MS);
-  return await withTimeout(getDownloadURL(fileRef), PHOTO_UPLOAD_TIMEOUT_MS);
+  return await uploadToCloudinary(dataUrl);
 }
 // Per-photo cap so a stalled upload (weak in-store signal) can't leave the merchandiser staring at
 // "Uploading & submitting…" forever — better to fall back than to hang indefinitely.
@@ -933,17 +937,109 @@ async function migrateLegacyPhotos(){
   const targets = findLegacyPhotoVisits();
   if(targets.length===0){ showToast('No legacy embedded photos found — everything is already in Storage'); return; }
   if(!confirm(`Move photos out of Firestore and into Storage for ${targets.length} older visit(s)? Each photo gets uploaded and the visit record rewritten with a link instead. This can take a while for a lot of visits — leave this tab open until it finishes.`)) return;
-  let done = 0;
+  let done = 0, firstError = null;
   for(const v of targets){
     try{
       const newPhotos = await uploadVisitPhotos(v.photos, v.id);
       await visitUpdate(v.id, { photos: newPhotos });
       done++;
       showToast(`Migrated ${done}/${targets.length}…`);
-    }catch(e){ console.error('Photo migration failed for visit', v.id, e); }
+    }catch(e){ console.error('Photo migration failed for visit', v.id, e); if(!firstError) firstError = e; }
   }
-  showToast(`Migration finished — ${done}/${targets.length} visit(s) updated ✓`);
+  if(done===0 && firstError){
+    // Every single attempt failed the same way — almost certainly means Storage itself isn't
+    // reachable (not enabled on the project, wrong bucket, or a rules/billing issue), not that these
+    // particular photos are somehow bad. Say so plainly instead of a flat "0 migrated" that reads
+    // like the tool just quietly did nothing.
+    showToast("Migration couldn't upload anything — Storage isn't reachable (likely not enabled on this Firebase project yet). Your photos are safe as-is; nothing was changed.");
+  } else {
+    showToast(`Migration finished — ${done}/${targets.length} visit(s) updated ✓`);
+  }
   render();
+}
+
+/* ============================= EXECUTION GALLERY (Cloudinary, not Firebase) =============================
+   A small curated set of "best execution" photos per branch — up to GALLERY_MAX_PHOTOS — kept entirely
+   separate from visit photos and from Firebase Storage. Images go to Cloudinary (free tier, unsigned
+   upload preset, no backend needed); only the resulting URLs are written to Firestore, in their own
+   `galleries` collection, one doc per account/branch. This is what makes it work even though regular
+   Firebase Storage isn't enabled on this project — different service entirely, and text-only in Firestore
+   so document-size limits are a non-issue. */
+const GALLERY_MAX_PHOTOS = 5;
+async function uploadToCloudinary(dataUrl){
+  if(!cloudinaryConfigured) throw new Error('Cloudinary not configured — set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET');
+  const blob = dataUrlToBlob(dataUrl);
+  const form = new FormData();
+  form.append('file', blob);
+  form.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+  const res = await withTimeout(fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, { method:'POST', body: form }), PHOTO_UPLOAD_TIMEOUT_MS);
+  if(!res.ok) throw new Error('Cloudinary upload failed: ' + res.status);
+  const json = await res.json();
+  return json.secure_url;
+}
+function watchGalleries(){
+  if(!isConfigured) return;
+  const { collection, onSnapshot } = firestoreFns;
+  onSnapshot(collection(db, 'galleries'), snap => {
+    const galleries = {};
+    snap.forEach(d => { galleries[d.id] = d.data(); });
+    State.galleries = galleries;
+    if(!isTypingNow()) render();
+  });
+}
+async function galleryAddPhoto(accountId, accountName, branch, url){
+  const { doc, setDoc, getDoc } = firestoreFns;
+  const ref = doc(db, 'galleries', accountId);
+  const existing = await withTimeout(getDoc(ref), 20000);
+  const photos = existing.exists() ? (existing.data().photos||[]) : [];
+  if(photos.length >= GALLERY_MAX_PHOTOS) throw new Error('gallery-full');
+  photos.push({ url, uploadedBy: identityLabel(), uploadedAt: Date.now() });
+  await withTimeout(setDoc(ref, { accountId, accountName, branch, photos }), 20000);
+}
+async function galleryRemovePhoto(accountId, url){
+  const { doc, setDoc, getDoc } = firestoreFns;
+  const ref = doc(db, 'galleries', accountId);
+  const existing = await withTimeout(getDoc(ref), 20000);
+  if(!existing.exists()) return;
+  const photos = (existing.data().photos||[]).filter(p=>p.url!==url);
+  await withTimeout(setDoc(ref, { ...existing.data(), photos }), 20000);
+}
+async function markGalleryTarget(accountId, accountName, branch){
+  if(!cloudinaryConfigured){ showToast('Execution Gallery needs Cloudinary set up first — see Manage SKUs for setup notes.'); return; }
+  const existing = (State.galleries && State.galleries[accountId] && State.galleries[accountId].photos) || [];
+  if(existing.length >= GALLERY_MAX_PHOTOS){ showToast(`Already at the ${GALLERY_MAX_PHOTOS}-photo limit — remove one first.`); return; }
+  State.galleryTarget = { accountId, accountName, branch };
+  State.cameraMode = 'gallery';
+  if(await openCamera()) return;
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment';
+  inp.onchange = async () => {
+    const file = inp.files[0]; if(!file) return;
+    showToast('Processing photo…');
+    const dataUrl = await compressImage(file, 800, 0.7);
+    finishGalleryPhoto(dataUrl);
+  };
+  inp.click();
+}
+async function finishGalleryPhoto(dataUrl){
+  const target = State.galleryTarget;
+  if(!target){ return; }
+  State.arrivalPending = true; render(); // reuse the same "pending" flag/spinner styling — not an arrival, just avoids a second State field for a one-off busy state
+  try{
+    const url = await uploadToCloudinary(dataUrl);
+    await galleryAddPhoto(target.accountId, target.accountName, target.branch, url);
+    showToast('Added to execution gallery ✓');
+  }catch(e){
+    console.error('Gallery upload failed', e);
+    showToast(e.message==='gallery-full' ? `Already at the ${GALLERY_MAX_PHOTOS}-photo limit.` : 'Could not upload — check Cloudinary is configured and try again.');
+  } finally {
+    State.arrivalPending = false; State.galleryTarget = null; render();
+  }
+}
+async function removeGalleryPhotoPrompt(accountId, url){
+  if(!confirm('Remove this photo from the execution gallery?')) return;
+  try{ await galleryRemovePhoto(accountId, url); showToast('Removed ✓'); }
+  catch(e){ console.error(e); showToast('Could not remove — try again.'); }
 }
 
 /* ============================= STORAGE HELPERS (Firestore) ============================= */
@@ -1330,6 +1426,8 @@ const State = {
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
   cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
+  galleries: {}, galleryTarget: null,
+  merchDirectory: {}, routeCycleRows: null, routeCyclePreview: null, newMerchName: '', newMerchCode: '',
   draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null },
   arrivals: [], arrivalPending: false,
   toast: null,
@@ -1490,11 +1588,14 @@ async function loadAll(){
   } else {
     State.accounts = accDoc.list;
   }
+  const dirDoc = await refGet('merchDirectory');
+  State.merchDirectory = (dirDoc && dirDoc.list) ? dirDoc.list : {};
 
   await loadLocations();
   watchVisits();
   watchDelegations();
   watchArrivals();
+  watchGalleries();
   setInterval(checkLongOnsiteArrivals, 5*60*1000); // periodic — nothing in Firestore changes while someone's just sitting "active", so this can't be event-driven like the other notifications
   State.loaded = true;
   if(hasSavedSession) restoreDraftIfAny();
@@ -1531,7 +1632,17 @@ function attemptMerchandiserLogin(name){
 }
 function attemptMerchEmpidLogin(){
   const id = State.loginPassword.trim();
-  if(!VALID_EMPIDS.has(id)){ State.loginError='EMPID not recognized — check with your supervisor.'; render(); return; }
+  // If the route cycle directory has a specific code on file for this name, that code must match
+  // exactly — not just be any code from the old flat list, which let anyone log in as anyone. Names
+  // not yet in the directory (not uploaded/added yet) fall back to the old behavior so nobody already
+  // using the app gets locked out mid-transition.
+  const dir = State.merchDirectory || {};
+  const bound = Object.entries(dir).find(([,info])=>info.name===State.pendingMerchName);
+  if(bound){
+    if(bound[0] !== id){ State.loginError='EMPID does not match the code on file for this name — check with your supervisor.'; render(); return; }
+  } else if(!VALID_EMPIDS.has(id)){
+    State.loginError='EMPID not recognized — check with your supervisor.'; render(); return;
+  }
   State.role='merchandiser'; State.name=State.pendingMerchName; State.tab='home'; State.navContext='field';
   State.pendingMerchName=null; State.loginPassword='';
   saveMe(); restoreDraftIfAny(); render();
@@ -1862,6 +1973,7 @@ function retakePhoto(){ State.cameraPreview = null; render(); }
 function confirmCameraPhoto(){
   if(!State.cameraPreview) return;
   if(State.cameraMode === 'arrival') finishArrival(State.cameraPreview);
+  else if(State.cameraMode === 'gallery') finishGalleryPhoto(State.cameraPreview);
   else addCapturedPhoto(State.cameraPreview);
   closeCamera();
 }
@@ -1876,7 +1988,7 @@ function cameraOverlayHtml(){
   return `<div class="cam-overlay">
     <div class="cam-top-bar">
       <button class="cam-close-btn" onclick="closeCamera()">✕</button>
-      <span class="cam-hint">${State.cameraPreview ? 'Review photo / مراجعة الصورة' : (State.cameraMode==='arrival' ? 'Confirm your location / أكد موقعك' : 'Line up the shelf / صوّر الرف')}</span>
+      <span class="cam-hint">${State.cameraPreview ? 'Review photo / مراجعة الصورة' : (State.cameraMode==='arrival' ? 'Confirm your location / أكد موقعك' : State.cameraMode==='gallery' ? 'Capture great execution / التقط تنفيذاً رائعاً' : 'Line up the shelf / صوّر الرف')}</span>
       <span style="width:38px"></span>
     </div>
     <div class="cam-video-wrap">
@@ -2690,7 +2802,23 @@ function screenAccounts(){
             ${statusChip(b.sos>=15?'on':'watch', `SOS ${fmt(b.sos)}% (${fmt(shahdFacingsAbs)} / ${fmt(catFacingsAbs)} facings)`)}
             ${statusChip('neutral', `Merch: ${acct?acct.merch:'—'}`)}
             ${statusChip('neutral', `Supervisor: ${acct?acct.sup:'—'}`)}
-          </div>` : ''}`;
+          </div>
+          ${(() => {
+            const canManageGallery = State.role==='merch_head' || State.role==='trade_marketing';
+            const gallery = acct ? ((State.galleries[acct.id] && State.galleries[acct.id].photos) || []) : [];
+            if(!acct) return '';
+            return `<div style="margin:0 0 10px">
+              <div class="hint" style="font-weight:700;margin-bottom:6px">📸 Execution gallery (${gallery.length}/${GALLERY_MAX_PHOTOS})</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                ${gallery.map(p=>`<div style="position:relative">
+                  <img src="${p.url}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;cursor:pointer" onclick="window.open('${p.url}')"/>
+                  ${canManageGallery ? `<button class="remove-x" style="position:absolute;top:-6px;right:-6px;background:var(--red);color:#fff;border-radius:50%;width:20px;height:20px;padding:0;font-size:13px;line-height:20px" onclick="removeGalleryPhotoPrompt('${acct.id}','${p.url.replace(/'/g,"\\'")}')">✕</button>` : ''}
+                </div>`).join('')}
+                ${canManageGallery && gallery.length<GALLERY_MAX_PHOTOS ? `<button class="btn btn-ghost btn-sm" onclick="markGalleryTarget('${acct.id}','${c.name.replace(/'/g,"\\'")}','${b.branch.replace(/'/g,"\\'")}')">＋ Add photo</button>` : ''}
+                ${!canManageGallery && gallery.length===0 ? `<p class="hint">No execution photos yet.</p>` : ''}
+              </div>
+            </div>`;
+          })()}` : ''}`;
         }).join('') : ''}
       </div>`;
     }).join('')}
@@ -3319,6 +3447,108 @@ async function exportExcel(){
   }
 }
 
+/* ============================= ROUTE CYCLE UPLOAD (accounts + merchandiser directory) =============================
+   Parses the route cycle export (same columns as C3A's ERP route cycle report) and upserts it into the
+   account list and a code→name merchandiser/supervisor directory. Matches existing accounts by
+   name+branch so historical visits (which reference an account's internal id, not this file's customer
+   number) keep working; unmatched rows become new accounts. Merch Head / Trade Marketing only. */
+const ROUTE_CYCLE_COLUMNS = {
+  custId: 'CUSTOMER_NUMBER_LOCATION_ID', name: 'Customer Name', branch: 'Customer_Address_ERP',
+  channel: 'Channel', region: 'Region name', merchCode: 'Merchandiser code', merchName: 'Merchandiser Arabic name',
+  supCode: 'Supervisor code', supName: 'Supervisor Arabic name', active: 'Merchandizer active',
+};
+async function handleRouteCycleFile(inputEl){
+  const file = inputEl.files[0]; if(!file) return;
+  try{
+    await loadXlsxLib();
+    const buf = await file.arrayBuffer();
+    const wb = window.XLSX.read(buf, { type:'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = window.XLSX.utils.sheet_to_json(ws, { defval:'' });
+    if(rows.length===0){ showToast('No rows found in that file'); return; }
+    if(!(ROUTE_CYCLE_COLUMNS.name in rows[0]) || !(ROUTE_CYCLE_COLUMNS.merchCode in rows[0])){
+      showToast("That file doesn't look like a route cycle export — expected columns like \"Customer Name\" and \"Merchandiser code\" weren't found.");
+      return;
+    }
+    State.routeCycleRows = rows;
+    const merchCodes = new Set(rows.map(r=>String(r[ROUTE_CYCLE_COLUMNS.merchCode]||'').trim()).filter(Boolean));
+    let newAccounts = 0, updatedAccounts = 0;
+    rows.forEach(row => {
+      const name = String(row[ROUTE_CYCLE_COLUMNS.name]||'').trim();
+      const branch = String(row[ROUTE_CYCLE_COLUMNS.branch]||'').trim();
+      if(!name || !branch) return;
+      const matched = State.accounts.find(a => a.name.trim().toLowerCase()===name.toLowerCase() && a.branch.trim().toLowerCase()===branch.toLowerCase());
+      if(matched) updatedAccounts++; else newAccounts++;
+    });
+    State.routeCyclePreview = { rowCount: rows.length, merchCount: merchCodes.size, newAccounts, updatedAccounts };
+    render();
+  }catch(e){
+    console.error(e);
+    showToast("Could not read that file — make sure it's a valid .xlsx export.");
+  } finally {
+    inputEl.value = '';
+  }
+}
+function cancelRouteCycleUpload(){ State.routeCycleRows = null; State.routeCyclePreview = null; render(); }
+async function applyRouteCycleUpload(){
+  if(!State.routeCycleRows) return;
+  if(!confirm(`Apply ${State.routeCycleRows.length} rows? This updates the account list and merchandiser directory — existing data for matched accounts will be overwritten with values from the file.`)) return;
+  try{
+    const directoryUpdates = {};
+    State.routeCycleRows.forEach(row => {
+      const name = String(row[ROUTE_CYCLE_COLUMNS.name]||'').trim();
+      const branch = String(row[ROUTE_CYCLE_COLUMNS.branch]||'').trim();
+      if(!name || !branch) return;
+      const channel = String(row[ROUTE_CYCLE_COLUMNS.channel]||'').trim();
+      const region = String(row[ROUTE_CYCLE_COLUMNS.region]||'').trim();
+      const merchCode = String(row[ROUTE_CYCLE_COLUMNS.merchCode]||'').trim();
+      const merchName = String(row[ROUTE_CYCLE_COLUMNS.merchName]||'').trim();
+      const supCode = String(row[ROUTE_CYCLE_COLUMNS.supCode]||'').trim();
+      const supName = String(row[ROUTE_CYCLE_COLUMNS.supName]||'').trim();
+      const active = String(row[ROUTE_CYCLE_COLUMNS.active]||'').trim().toLowerCase() !== 'no';
+      const custId = row[ROUTE_CYCLE_COLUMNS.custId] != null ? String(row[ROUTE_CYCLE_COLUMNS.custId]).trim() : '';
+
+      let acct = State.accounts.find(a => a.name.trim().toLowerCase()===name.toLowerCase() && a.branch.trim().toLowerCase()===branch.toLowerCase());
+      if(acct){
+        if(channel) acct.channel = channel;
+        if(region) acct.region = region;
+        if(merchName) acct.merch = merchName;
+        if(supName) acct.sup = supName;
+        if(merchCode) acct.merchCode = merchCode;
+        if(supCode) acct.supCode = supCode;
+        if(custId) acct.customerId = custId;
+      } else {
+        State.accounts.push({ id:'acc_'+uid(), name, branch, channel, region, merch: merchName, sup: supName, merchCode, supCode, customerId: custId, target: 0 });
+      }
+      if(merchCode && merchName) directoryUpdates[merchCode] = { name: merchName, active };
+      if(supCode && supName) directoryUpdates[supCode] = { name: supName, active: true };
+    });
+    await refSet('accounts', State.accounts, REF_DATA_VERSION);
+    State.merchDirectory = { ...State.merchDirectory, ...directoryUpdates };
+    await refSet('merchDirectory', State.merchDirectory, REF_DATA_VERSION);
+    const preview = State.routeCyclePreview;
+    showToast(`Applied ✓ — ${preview.newAccounts} new account${preview.newAccounts===1?'':'s'}, ${preview.updatedAccounts} updated, ${Object.keys(directoryUpdates).length} merchandiser/supervisor codes recorded.`);
+    State.routeCycleRows = null; State.routeCyclePreview = null;
+    render();
+  }catch(e){
+    console.error(e);
+    showToast('Could not apply the file — check your connection and try again.');
+  }
+}
+function setNewMerchName(v){ State.newMerchName = v; }
+function setNewMerchCode(v){ State.newMerchCode = v; }
+async function addMerchandiserManually(){
+  const name = State.newMerchName.trim(), code = State.newMerchCode.trim();
+  if(!name || !code){ showToast('Enter both a name and a code'); return; }
+  try{
+    State.merchDirectory = { ...State.merchDirectory, [code]: { name, active:true } };
+    await refSet('merchDirectory', State.merchDirectory, REF_DATA_VERSION);
+    State.newMerchName=''; State.newMerchCode='';
+    showToast(`${name} added with code ${code} ✓`);
+    render();
+  }catch(e){ console.error(e); showToast('Could not save — try again.'); }
+}
+
 /* ---- Team ---- */
 function screenTeam(){
   const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
@@ -3754,10 +3984,50 @@ function screenSkus(){
       `; })()}
     </div>` : ''}
     ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
-    <div class="sectitle">Move legacy photos to Storage / نقل الصور القديمة</div>
+    <div class="sectitle">Route cycle &amp; merchandiser codes / دورة الزيارات وأكواد المندوبين</div>
+    <div class="card">
+      <h3>Upload route cycle file</h3>
+      <p class="hint" style="margin-bottom:10px">Upload the route cycle export (.xlsx) to update the account list — customer, branch, channel, region, and which merchandiser/supervisor covers each — and to record each merchandiser's own code, so logins get checked against the right person instead of any code from a shared list. Matches existing accounts by name + branch; anything not matched becomes a new account.</p>
+      <input type="file" accept=".xlsx,.xls" onchange="handleRouteCycleFile(this)"/>
+      ${State.routeCyclePreview ? `
+      <div class="verify-row" style="margin-top:10px">
+        ${statusChip('neutral', `${State.routeCyclePreview.rowCount} rows`)}
+        ${statusChip('neutral', `${State.routeCyclePreview.merchCount} merchandiser codes`)}
+        ${statusChip('on', `${State.routeCyclePreview.newAccounts} new accounts`)}
+        ${statusChip('watch', `${State.routeCyclePreview.updatedAccounts} updated`)}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-primary btn-sm" onclick="applyRouteCycleUpload()">Apply</button>
+        <button class="btn btn-ghost btn-sm" onclick="cancelRouteCycleUpload()">Cancel</button>
+      </div>` : ''}
+    </div>
+    <div class="card">
+      <h3>Add one merchandiser</h3>
+      <p class="hint" style="margin-bottom:10px">For a single new hire without waiting on a full route cycle file — name and code, straight into the login directory.</p>
+      <div class="row2">
+        <div><label>Name</label><input type="text" value="${State.newMerchName}" oninput="setNewMerchName(this.value)" placeholder="e.g. أحمد محمد"/></div>
+        <div><label>Code</label><input type="text" inputmode="numeric" value="${State.newMerchCode}" oninput="setNewMerchCode(this.value)" placeholder="e.g. 5123"/></div>
+      </div>
+      <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="addMerchandiserManually()">Add</button>
+      ${Object.keys(State.merchDirectory||{}).length ? `<p class="hint" style="margin-top:10px">${Object.keys(State.merchDirectory).length} merchandisers/supervisors currently bound to a specific code.</p>` : `<p class="hint" style="margin-top:10px">No one bound to a specific code yet — logins still accept any code from the old shared list until this directory has entries.</p>`}
+    </div>` : ''}
+    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
+    <div class="sectitle">Execution Gallery setup / إعداد معرض التنفيذ</div>
+    <div class="card" style="border-color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">
+      <h3 style="color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">${cloudinaryConfigured ? 'Cloudinary connected ✓' : 'Cloudinary not set up yet'}</h3>
+      ${cloudinaryConfigured ? `
+      <p class="hint">The "📸 Execution gallery" section on each branch (in Customers) is live — up to ${GALLERY_MAX_PHOTOS} curated photos per branch, stored in Cloudinary rather than Firebase.</p>
+      ` : `
+      <p class="hint" style="margin-bottom:8px">The Execution Gallery feature (up to ${GALLERY_MAX_PHOTOS} curated photos per branch, on the Customers tab) needs a free Cloudinary account to store images — kept separate from Firebase on purpose. Two values need to be set in the app's code:</p>
+      <p class="hint">1. Sign up free at cloudinary.com. 2. Settings → Upload → add an upload preset, set it to "Unsigned". 3. Send the Cloud name and preset name so they can be added to the code.</p>
+      `}
+    </div>` : ''}
+    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
+    <div class="sectitle">Move legacy photos to Cloudinary / نقل الصور القديمة</div>
     <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">${findLegacyPhotoVisits().length} visit(s) still have photos embedded in the database</h3>
-      <p class="hint" style="margin-bottom:10px">New visits already upload photos to Firebase Storage instead of saving them inside the visit record. This one-time tool moves photos out of older visit records too, shrinking them and speeding up every dashboard/list load. Safe to run more than once — already-migrated visits are skipped automatically.</p>
+      <p class="hint" style="margin-bottom:10px">New visits already upload photos to Cloudinary instead of saving them inside the visit record. This one-time tool moves photos out of older visit records too, shrinking them and speeding up every dashboard/list load — this is the biggest single fix for slow loading and heavy data usage on this app, so it's worth running once Cloudinary is connected. Safe to run more than once — already-migrated visits are skipped automatically.</p>
+      <p class="hint" style="margin-bottom:10px">${cloudinaryConfigured ? 'Cloudinary is connected — ready to run.' : "Needs Cloudinary set up first (see the card above) — until then this will report that nothing could be uploaded rather than silently finishing at 0. Photos are safe either way; embedded-in-Firestore is how they've been stored all along."}</p>
       <button class="btn btn-primary btn-sm" onclick="migrateLegacyPhotos()">Migrate now</button>
     </div>` : ''}
     ${State.role==='trade_marketing' ? `
@@ -3974,7 +4244,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
