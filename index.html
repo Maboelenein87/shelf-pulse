@@ -1432,7 +1432,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
 
 /* ============================= APP STATE ============================= */
 const State = {
-  role: null, name: '', tab: 'home', navContext: 'field',
+  role: null, name: '', merchCode: null, tab: 'home', navContext: 'field',
   skus: [], accounts: [], visits: [], locations: {}, loaded: false,
   selectedBranchAccountId: null, selectedBranchName: null,
   cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
@@ -1580,7 +1580,7 @@ async function loadAll(){
   if(!isConfigured){ State.loaded = true; return; }
   const me = localStorage.getItem('shelfpulse_me');
   let hasSavedSession = false;
-  if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
+  if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
 
   const skusDoc = await refGet('skus');
   if(!skusDoc || skusDoc.version !== REF_DATA_VERSION){
@@ -1631,7 +1631,7 @@ async function recordLocationLearning(visit){
     await setDoc(doc(db, 'meta', 'locations'), { byAccount: { [visit.accountId]: entry } }, { merge: true });
   }catch(e){ console.error('location learning failed', e); }
 }
-function saveMe(){ localStorage.setItem('shelfpulse_me', JSON.stringify({role:State.role, name:State.name})); }
+function saveMe(){ localStorage.setItem('shelfpulse_me', JSON.stringify({role:State.role, name:State.name, merchCode:State.merchCode||null})); }
 function logout(){ State.role=null; State.name=''; State.tab='home'; localStorage.removeItem('shelfpulse_me'); render(); }
 function selectLoginRole(key){ State.loginRole = key; State.loginPassword=''; State.loginError=''; render(); }
 function backToLoginMenu(){ State.loginRole = null; State.loginError=''; render(); }
@@ -1653,7 +1653,7 @@ function attemptMerchEmpidLogin(){
   } else if(!VALID_EMPIDS.has(id)){
     State.loginError='EMPID not recognized — check with your supervisor.'; render(); return;
   }
-  State.role='merchandiser'; State.name=State.pendingMerchName; State.tab='home'; State.navContext='field';
+  State.role='merchandiser'; State.name=State.pendingMerchName; State.merchCode=id; State.tab='home'; State.navContext='field';
   State.pendingMerchName=null; State.loginPassword='';
   saveMe(); restoreDraftIfAny(); render();
 }
@@ -2178,7 +2178,7 @@ function supervisorOfMerch(merchName){
   return best;
 }
 function myMerchandisers(){
-  const all = [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))];
+  const all = [...new Set(State.accounts.map(a=>(a.merch||'').trim()).filter(Boolean))];
   if(State.role==='supervisor') return all.filter(n=>supervisorOfMerch(n)===State.name);
   return all;
 }
@@ -2410,9 +2410,22 @@ function screenNewVisit(){
 }
 function myAccounts(){
   if(State.role==='merchandiser'){
-    const own = State.accounts.filter(a=>(a.merch||'').trim()===State.name.trim());
-    const delegatedIds = new Set(State.delegations.filter(x=>x.toMerch===State.name && x.date===State.draft.date).map(x=>x.accountId));
-    const delegated = State.accounts.filter(a=>delegatedIds.has(a.id) && (a.merch||'').trim()!==State.name.trim());
+    // Matched by code first (stable — doesn't drift with inconsistent Arabic name spelling across
+    // imported account rows for the same real person), falling back to a trimmed name match for
+    // accounts/delegations from before codes were tracked. This is what was silently breaking
+    // delegation: the old code compared toMerch to State.name with a strict, untrimmed ===, right
+    // next to an "own accounts" check that already trimmed both sides defensively — a name-string
+    // variant that didn't exactly match (extra space, different row's spelling) just vanished.
+    const own = State.accounts.filter(a =>
+      (a.merchCode && State.merchCode && a.merchCode===State.merchCode) ||
+      (a.merch||'').trim()===State.name.trim()
+    );
+    const ownIds = new Set(own.map(a=>a.id));
+    const delegatedIds = new Set(State.delegations.filter(x => x.date===State.draft.date && (
+      (x.toMerchCode && State.merchCode && x.toMerchCode===State.merchCode) ||
+      (x.toMerch||'').trim()===State.name.trim()
+    )).map(x=>x.accountId));
+    const delegated = State.accounts.filter(a=>delegatedIds.has(a.id) && !ownIds.has(a.id));
     return [...own, ...delegated];
   }
   return State.accounts;
@@ -3788,7 +3801,15 @@ async function delegateApply(){
   const ids = [...State.delegateSelected];
   if(!ids.length){ showToast('Select at least one store to delegate'); return; }
   const accounts = ids.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
-  if(!confirm(`Delegate ${accounts.length} store(s) to ${State.delegateTarget} for ${State.delegateDate} only? The store${accounts.length>1?'s':''} stay${accounts.length>1?'':'s'} on the original merchandiser's route afterwards, and credit goes to whoever actually submits the visit.`)) return;
+  // State.delegateTarget is "code:5662" when the target has a known merchandiser code (preferred —
+  // matches reliably on their device regardless of which name-string variant this dropdown shows),
+  // or "name:Ahmed…" for someone without a code yet, matched the old way as a fallback.
+  const isCode = State.delegateTarget.startsWith('code:');
+  const toMerchCode = isCode ? State.delegateTarget.slice(5) : null;
+  const toMerchName = isCode
+    ? ((State.merchDirectory && State.merchDirectory[toMerchCode] && State.merchDirectory[toMerchCode].name) || toMerchCode)
+    : State.delegateTarget.slice(5);
+  if(!confirm(`Delegate ${accounts.length} store(s) to ${toMerchName} for ${State.delegateDate} only? The store${accounts.length>1?'s':''} stay${accounts.length>1?'':'s'} on the original merchandiser's route afterwards, and credit goes to whoever actually submits the visit.`)) return;
   showToast('Delegating…');
   try{
     for(const a of accounts){
@@ -3796,7 +3817,7 @@ async function delegateApply(){
       for(const existing of delegationsForAccountDate(a.id, State.delegateDate)){ await delegationDelete(existing.id); }
       await delegationCreate({
         id: uid(), accountId: a.id, accountName: a.name, branch: a.branch,
-        date: State.delegateDate, toMerch: State.delegateTarget, fromMerch: a.merch||'',
+        date: State.delegateDate, toMerch: toMerchName, toMerchCode, fromMerch: (a.merch||'').trim(), fromMerchCode: a.merchCode||null,
         createdBy: identityLabel(), createdAt: Date.now(),
       });
     }
@@ -3844,7 +3865,21 @@ function activeDelegationsHtml(){
     </div>`).join('');
 }
 function screenDelegate(){
-  const merchOptions = [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))].sort();
+  // Grouped by merchandiser code where the account has one, so the same real person — who might have
+  // slightly inconsistent name spelling across different imported account rows — only ever appears
+  // once here, and delegating to them reaches their device reliably (matched by code, not by
+  // whichever name-string variant happened to get picked).
+  const byCode = {};
+  const plainNames = new Set();
+  State.accounts.forEach(a=>{
+    if(a.merchCode){
+      if(!byCode[a.merchCode]) byCode[a.merchCode] = (State.merchDirectory && State.merchDirectory[a.merchCode] && State.merchDirectory[a.merchCode].name) || (a.merch||'').trim() || a.merchCode;
+    } else if(a.merch && a.merch.trim()) plainNames.add(a.merch.trim());
+  });
+  const merchOptions = [
+    ...Object.entries(byCode).map(([code,name])=>({value:'code:'+code, label:`${name} (${code})`})),
+    ...[...plainNames].map(n=>({value:'name:'+n, label:n})),
+  ].sort((a,b)=>a.label.localeCompare(b.label));
   return `<div class="screen">
     <h1>${bi('Delegate visits','نقل الزيارة لمنسق اخر')}</h1>
     <p class="lede">One-off only — hand a specific store to another merchandiser for a single date, e.g. coverage gaps or when someone's unavailable. The store stays on its regular merchandiser's route and target afterwards; whoever actually submits the visit gets the credit.</p>
@@ -3854,7 +3889,7 @@ function screenDelegate(){
       <label style="margin-top:10px">${bi('Delegate selected stores to','نقل الزيارات المحددة الى')}</label>
       <select onchange="delegateSetTarget(this.value)">
         <option value="">— ${bi('Choose merchandiser','اختر المندوب')} —</option>
-        ${merchOptions.map(m=>`<option value="${m.replace(/"/g,'&quot;')}" ${State.delegateTarget===m?'selected':''}>${m}</option>`).join('')}
+        ${merchOptions.map(m=>`<option value="${m.value.replace(/"/g,'&quot;')}" ${State.delegateTarget===m.value?'selected':''}>${m.label}</option>`).join('')}
       </select>
       <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="delegateApply()">${bi('Delegate selected stores','نقل المتاجر المحددة')} (${State.delegateSelected.size})</button>
     </div>
