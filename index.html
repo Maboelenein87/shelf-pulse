@@ -844,8 +844,8 @@ const firebaseConfig = {
 // supports "unsigned" uploads straight from browser JS with no backend/API-secret needed, which is
 // exactly what a static, backend-less site like this one can use safely. Fill these in from
 // Cloudinary → Settings → Upload → Add upload preset (set it to "Unsigned").
-const CLOUDINARY_CLOUD_NAME = 'YOUR_CLOUD_NAME';
-const CLOUDINARY_UPLOAD_PRESET = 'YOUR_UPLOAD_PRESET';
+const CLOUDINARY_CLOUD_NAME = 'jewxx79t';
+const CLOUDINARY_UPLOAD_PRESET = 'Shelf_pulse';
 const cloudinaryConfigured = CLOUDINARY_CLOUD_NAME !== 'YOUR_CLOUD_NAME' && CLOUDINARY_UPLOAD_PRESET !== 'YOUR_UPLOAD_PRESET';
 
 let app, db;
@@ -2402,7 +2402,7 @@ function skuLineHtml(it, idx){
   return `<div class="sku-line">
     <div class="sku-line-head" onclick="toggleLine(${idx})">
       <div>
-        <div class="sku-line-title">${sku.name || '—'}</div>
+        <div class="sku-line-title">${sku.name || '—'}${sku.nameAr ? ` <span dir="rtl" lang="ar" style="opacity:.75">/ ${sku.nameAr}</span>` : ''}</div>
         <div class="sku-line-meta">${sku.category||''} · Stock ${fmt(c.actualShelfStock)} · Vel ${fmt(c.velocity,1)}/d</div>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
@@ -3793,7 +3793,7 @@ function editLineHtml(it, idx){
   return `<div class="sku-line">
     <div class="sku-line-head" onclick="toggleEditLine(${idx})">
       <div>
-        <div class="sku-line-title">${sku.name || '—'}</div>
+        <div class="sku-line-title">${sku.name || '—'}${sku.nameAr ? ` <span dir="rtl" lang="ar" style="opacity:.75">/ ${sku.nameAr}</span>` : ''}</div>
         <div class="sku-line-meta">${sku.category||''} · Price ${it.actualPrice||'—'} EGP (RSP ${sku.rsp||'—'}) · ${c.priceLbl}</div>
       </div>
       <div style="font-size:14px">${open?'−':'+'}</div>
@@ -3913,10 +3913,13 @@ function screenSkus(){
     ${State.skus.map((s,idx)=>`
       <div class="card">
         <div class="row2">
-          <div><label>SKU name / اسم المنتج</label><input type="text" value="${s.name}" oninput="skuField(${idx},'name',this.value)"/></div>
-          <div><label>Category / الفئة</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
+          <div><label>SKU name (English) / اسم المنتج بالإنجليزي</label><input type="text" value="${s.name}" oninput="skuField(${idx},'name',this.value)"/></div>
+          <div><label>SKU name (Arabic) / اسم المنتج بالعربي</label><input type="text" dir="rtl" value="${s.nameAr||''}" oninput="skuField(${idx},'nameAr',this.value)" placeholder="اكتب الاسم بالعربي"/></div>
         </div>
-        <label>RSP (EGP) / السعر الموصى به</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/>
+        <div class="row2">
+          <div><label>Category / الفئة</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
+          <div><label>RSP (EGP) / السعر الموصى به</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/></div>
+        </div>
         <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removeSku(${idx})">Remove SKU</button>
       </div>`).join('')}
     <button class="btn btn-line" onclick="addSku()">＋ Add SKU</button>
@@ -4134,7 +4137,7 @@ function openVisit(id){
   alert(`${v.accountName} · ${v.branch}\n${v.date} · ${v.auditor}\nStatus: ${v.status}\n\nAvg SUC ${fmt(agg.avgSfr)}% · Avg SOS ${fmt(agg.avgSos)}%\nOSA ${fmt(agg.osaPct)}% · Price OK ${fmt(agg.priceOkPct)}%\nData complete ${fmt(agg.visitDonePct)}%` + (v.reviewNote ? `\nNote: ${v.reviewNote}` : ''));
 }
 function skuField(idx,field,val){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus[idx][field] = val; saveSkus(); }
-function addSku(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.push({id:'sku_'+uid(), name:'New SKU', category:'', rsp:0}); saveSkus(); render(); }
+function addSku(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.push({id:'sku_'+uid(), name:'New SKU', nameAr:'', category:'', rsp:0}); saveSkus(); render(); }
 function removeSku(idx){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.splice(idx,1); saveSkus(); render(); }
 
 let renderTimer=null;
