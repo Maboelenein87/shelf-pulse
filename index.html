@@ -3865,6 +3865,34 @@ async function confirmMergeGroup(sig, allIds, keepId){
   if(State.__dupConfirm) delete State.__dupConfirm[sig];
   await mergeAccountGroup(selectedIds, keepId);
 }
+/* ---- Manual merge — full control for picking any set of accounts yourself, for the cases the
+   automatic duplicate detection above doesn't catch (e.g. names/branches too different for it to
+   link, but you know they're the same physical store). Search, add as many as you like, and the
+   most-recently-visited one is suggested as the one to keep — override with the radio if needed. ---- */
+function setManualMergeSearch(v){ State.__manualMergeSearch = v; render(); }
+function manualMergeAdd(accountId){
+  State.__manualMergeSelected = State.__manualMergeSelected || [];
+  if(!State.__manualMergeSelected.includes(accountId)) State.__manualMergeSelected.push(accountId);
+  State.__manualMergeSearch = '';
+  render();
+}
+function manualMergeRemove(accountId){
+  State.__manualMergeSelected = (State.__manualMergeSelected||[]).filter(id=>id!==accountId);
+  if(State.__manualMergeKeep===accountId) State.__manualMergeKeep = null;
+  render();
+}
+function setManualMergeKeep(accountId){ State.__manualMergeKeep = accountId; render(); }
+function startManualMergeConfirm(){ State.__manualMergeConfirm = true; render(); }
+function cancelManualMergeConfirm(){ State.__manualMergeConfirm = false; render(); }
+async function confirmManualMerge(){
+  const selected = [...(State.__manualMergeSelected||[])];
+  const keepId = State.__manualMergeKeep || [...selected].sort((a,b)=>latestVisitTimeForAccount(b)-latestVisitTimeForAccount(a))[0];
+  State.__manualMergeConfirm = false;
+  await mergeAccountGroup(selected, keepId);
+  State.__manualMergeSelected = [];
+  State.__manualMergeKeep = null;
+  State.__manualMergeSearch = '';
+}
 function setNewMerchName(v){ State.newMerchName = v; }
 function setNewMerchCode(v){ State.newMerchCode = v; }
 async function addMerchandiserManually(){
@@ -4373,6 +4401,59 @@ function screenSkus(){
       ${Object.keys(State.merchDirectory||{}).length ? `<p class="hint" style="margin-top:10px">${Object.keys(State.merchDirectory).length} merchandisers/supervisors currently bound to a specific code.</p>` : `<p class="hint" style="margin-top:10px">No one bound to a specific code yet — logins still accept any code from the old shared list until this directory has entries.</p>`}
     </div>
     <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Manual merge</h3>
+      <p class="hint" style="margin-bottom:10px">Didn't find a match below? Search and pick any accounts yourself — add as many as belong to the same physical store, in any combination, and the one with the most recent visit is suggested as the one to keep.</p>
+      <input type="text" placeholder="Search accounts by name or branch…" value="${State.__manualMergeSearch||''}" oninput="setManualMergeSearch(this.value)" style="margin-bottom:8px"/>
+      ${(() => {
+        const q = (State.__manualMergeSearch||'').trim().toLowerCase();
+        const selected = State.__manualMergeSelected || [];
+        if(!q) return '';
+        const matches = State.accounts.filter(a=>!selected.includes(a.id) && ((a.name||'').toLowerCase().includes(q) || (a.branch||'').toLowerCase().includes(q))).slice(0,8);
+        if(matches.length===0) return `<p class="hint">No matching accounts</p>`;
+        return matches.map(a=>{
+          const lv = latestVisitTimeForAccount(a.id);
+          return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line)">
+            <span>${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}</span>
+            <button class="btn btn-ghost btn-sm" onclick="manualMergeAdd('${a.id}')">+ Add</button>
+          </div>`;
+        }).join('');
+      })()}
+      ${(() => {
+        const selected = State.__manualMergeSelected || [];
+        const accts = selected.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
+        if(accts.length===0) return `<p class="hint" style="margin-top:8px">No accounts picked yet — search above to add some.</p>`;
+        const suggested = [...accts].sort((a,b)=>latestVisitTimeForAccount(b.id)-latestVisitTimeForAccount(a.id))[0];
+        const keepId = State.__manualMergeKeep || (suggested?suggested.id:null);
+        const confirming = State.__manualMergeConfirm;
+        const keepAcct = State.accounts.find(a=>a.id===keepId);
+        return `
+          <div style="margin-top:10px">
+            <p class="hint" style="margin-bottom:6px">${accts.length} account${accts.length===1?'':'s'} picked — pick which one to keep:</p>
+            ${accts.map(a=>{
+              const lv = latestVisitTimeForAccount(a.id);
+              const isMostRecent = suggested && a.id===suggested.id;
+              return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+                <input type="radio" name="manualmergekeep" ${a.id===keepId?'checked':''} onchange="setManualMergeKeep('${a.id}')"/>
+                <span style="flex:1">${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}${isMostRecent?' — most recent':''}</span>
+                <button class="btn btn-ghost btn-sm" onclick="manualMergeRemove('${a.id}')">Remove</button>
+              </div>`;
+            }).join('')}
+            ${confirming ? `
+              <div style="margin-top:8px;padding:8px;background:#FBF3E4;border-radius:6px">
+                <p class="hint" style="margin-bottom:6px">Merge ${accts.length-1} account(s) into "${keepAcct?keepAcct.name:''} · ${keepAcct?keepAcct.branch:''}"? Visits, delegations, and gallery photos move over. This can't be undone.</p>
+                <div style="display:flex;gap:8px">
+                  <button class="btn btn-danger btn-sm" onclick="confirmManualMerge()">Yes, merge</button>
+                  <button class="btn btn-ghost btn-sm" onclick="cancelManualMergeConfirm()">Cancel</button>
+                </div>
+              </div>
+            ` : `
+              <button class="btn btn-danger btn-sm" style="margin-top:8px" ${accts.length<2?'disabled':''} onclick="startManualMergeConfirm()">Merge these ${accts.length}</button>
+            `}
+          </div>
+        `;
+      })()}
+    </div>
+    <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">Duplicate accounts</h3>
       ${(() => {
         const dismissed = loadDismissedDupGroups();
@@ -4659,7 +4740,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
