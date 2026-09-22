@@ -1297,6 +1297,59 @@ function findSuspiciousSos(){
   });
   return candidates.sort((a,b)=>(b.shahdSum-b.catTotal)-(a.shahdSum-a.catTotal));
 }
+// SUC/SOS monitor — unlike the counting-error checks above (which catch an impossible relationship
+// between two fields on the SAME visit), these catch a visit whose own SUC or SOS reading, taken at
+// face value, is past what's realistically plausible — dedicated space more than fully filled, or a
+// share of category shelf well above the known ~20% average. Same "review, don't auto-fix" reasoning
+// as the fast-visit flag: there's no single correct value to fall back to.
+// Scoped to each branch's LATEST visit only, using the same code-based branch identity as
+// computeCustomerAnalysis/computeOpportunities — an old visit's bad reading is superseded the moment
+// a newer visit exists for that same physical branch (even under a different duplicate account), so
+// there's nothing to flag or clean up about it once it's no longer the one "in effect".
+const SUC_MONITOR_MAX = 100; // business rule: can't legitimately fill more than 100% of dedicated Shahd space
+const SOS_MONITOR_MAX = 20; // business rule: known network average is ~20% — anything past that is inflated
+function findLatestVisitPerBranch(visits){
+  const accountsById = {};
+  State.accounts.forEach(a=>{ accountsById[a.id] = a; });
+  const latestByBranch = {};
+  const sorted = [...(visits || State.visits)].filter(v=>v.status!=='rejected').sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0));
+  sorted.forEach(v=>{
+    const custName = canonicalCustomerName(v.accountName);
+    const acct = accountsById[v.accountId];
+    const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
+    latestByBranch[custName+'||'+branchKey] = v; // overwritten each pass — ends on the latest visit for this branch
+  });
+  return Object.values(latestByBranch);
+}
+function findInflatedSucVisits(){
+  const candidates = [];
+  findLatestVisitPerBranch().forEach(v=>{
+    try{
+      const agg = visitAggregate(v);
+      if(agg.avgSfr > SUC_MONITOR_MAX){
+        candidates.push({ visitId:v.id, account:v.accountName, branch:v.branch, date:v.date, auditor:v.auditor, status:v.status, value:agg.avgSfr });
+      }
+    }catch(e){ console.error('Skipping malformed visit in SUC monitor:', v && v.id, e); }
+  });
+  return candidates.sort((a,b)=>b.value-a.value);
+}
+function findInflatedSosVisits(){
+  const candidates = [];
+  findLatestVisitPerBranch().forEach(v=>{
+    try{
+      const agg = visitAggregate(v);
+      if(agg.avgSos > SOS_MONITOR_MAX){
+        candidates.push({ visitId:v.id, account:v.accountName, branch:v.branch, date:v.date, auditor:v.auditor, status:v.status, value:agg.avgSos });
+      }
+    }catch(e){ console.error('Skipping malformed visit in SOS monitor:', v && v.id, e); }
+  });
+  return candidates.sort((a,b)=>b.value-a.value);
+}
+async function deleteOneVisit(visitId){
+  const v = State.visits.find(x=>x.id===visitId);
+  if(!v){ showToast('Visit not found'); return; }
+  await deleteVisitList([v], `this one visit (${v.accountName} · ${v.branch} · ${v.date})`);
+}
 // Review-only flag — unlike price/capacity there's no "correct value" to auto-fix to, since duration
 // is derived from timestamps, not a typed field. Surfaced inline on a visit during approval review
 // (see the "too fast to be real" chip) rather than as a standing list — arrivedAt-based detection in
@@ -2716,14 +2769,24 @@ function dashPhotos(approved){
 function dashOverview(approved){
   const aggs = approved.map(v=>visitAggregate(v));
   const avg = f => aggs.reduce((s,a)=>s+f(a),0)/aggs.length;
+  // SUC/SOS/OSA/Price-matching are "current state" figures — like the Customers screen and the SUC/SOS
+  // monitor, they're built from each branch's LATEST visit only (code-based identity, so a duplicate
+  // account doesn't let a stale reading dodge being superseded), not blended across every historical
+  // visit. Averaging in every past visit was exactly what made the network-wide numbers look far more
+  // inflated than what's actually true today. Visit-count-based figures below (verified %, duration)
+  // are a different kind of metric — about the visiting itself, not the shelf's current state — so
+  // those stay as an average across every visit, same as visit counts elsewhere in the app.
+  const latestVisits = findLatestVisitPerBranch(approved);
+  const latestAggs = latestVisits.map(v=>visitAggregate(v));
+  const avgLatest = f => latestAggs.length ? latestAggs.reduce((s,a)=>s+f(a),0)/latestAggs.length : 0;
   const stockSummary = computeNetworkStockSummary(approved);
   const durations = approved.map(visitDurationMinutes).filter(m=>m!==null);
   const avgDuration = durations.length ? durations.reduce((s,m)=>s+m,0)/durations.length : null;
   return `<div class="kpi-grid">
-    <div class="kpi accent"><div class="num">${fmt(avg(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf utilization (SUC) / متوسط تعبئة الرف</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf (SOS) / متوسط حصة الرف</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.osaPct))}%</div><div class="lbl">On-shelf availability (OSA) / التوافر على الرف</div></div>
-    <div class="kpi"><div class="num">${fmt(avg(a=>a.priceOkPct))}%</div><div class="lbl">Price matching RSP / مطابقة السعر</div></div>
+    <div class="kpi accent"><div class="num">${fmt(avgLatest(a=>a.avgSfr))}%</div><div class="lbl">Avg shelf utilization (SUC) / متوسط تعبئة الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avgLatest(a=>a.avgSos))}%</div><div class="lbl">Avg share of shelf (SOS) / متوسط حصة الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avgLatest(a=>a.osaPct))}%</div><div class="lbl">On-shelf availability (OSA) / التوافر على الرف</div></div>
+    <div class="kpi"><div class="num">${fmt(avgLatest(a=>a.priceOkPct))}%</div><div class="lbl">Price matching RSP / مطابقة السعر</div></div>
     <div class="kpi accent"><div class="num">${fmt(stockSummary.totalStock)}</div><div class="lbl">Total stock on hand (grand total) / إجمالي المخزون</div></div>
     <div class="kpi"><div class="num">${fmt(stockSummary.avgCoverage,1)}d</div><div class="lbl">Avg stock coverage / تغطية المخزون</div></div>
     <div class="kpi"><div class="num">${fmt(aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
@@ -2981,12 +3044,20 @@ function screenAccounts(){
   </div>`;
 }
 function computeNetworkStockSummary(approved){
+  const accountsById = {};
+  State.accounts.forEach(a=>{ accountsById[a.id] = a; });
   const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0));
-  const stats = {}; // key: account|branch|sku -> {latestStock, velSum, velN}
+  const stats = {}; // key: customer||branchCode||sku -> {latestStock, velSum, velN}
   sorted.forEach(v=>{
+    const custName = canonicalCustomerName(v.accountName);
+    const acct = accountsById[v.accountId];
+    const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
     (v.items||[]).forEach(it=>{
       const c = computeItem(it);
-      const key = v.accountName+'|'+v.branch+'|'+it.skuId;
+      // Same code-based branch identity as everywhere else — otherwise a duplicate account for the
+      // same physical store double-counts its stock into the network total instead of just showing
+      // the one true latest reading.
+      const key = custName+'||'+branchKey+'||'+it.skuId;
       stats[key] = stats[key] || { latestStock:0, velSum:0, velN:0 };
       stats[key].latestStock = c.actualShelfStock;
       if(c.velocity>0){ stats[key].velSum += c.velocity; stats[key].velN++; }
@@ -4424,9 +4495,35 @@ function manageBackendFacingsHtml(){
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
     </div>
+    <div class="sectitle">SUC and SOS monitor / رصد نسب الاستغلال والمساحة</div>
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">SUC over ${SUC_MONITOR_MAX}% — latest visit per branch</h3>
+      ${(() => {
+        const cands = findInflatedSucVisits();
+        if(cands.length===0) return `<p class="hint">No branch's latest visit is over ${SUC_MONITOR_MAX}% SUC right now.</p>`;
+        return `
+        <p class="hint" style="margin-bottom:10px">${cands.length} branch${cands.length===1?'':'es'} currently show more than ${SUC_MONITOR_MAX}% of dedicated Shahd space filled, based on each branch's most recent visit — not physically possible, and a strong sign of a counting or data-entry error. Older visits at a branch aren't listed here even if they were also over: once a newer visit exists, it's the one in effect and the old reading no longer matters.</p>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>Auditor</th><th>SUC</th><th>Status</th><th></th></tr>
+        ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.auditor}</td><td style="color:var(--red);font-weight:700">${fmt(c.value)}%</td><td><span class="status-badge status-${c.status}">${c.status}</span></td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Edit</button>${State.role==='trade_marketing'?` <button class="btn btn-danger btn-sm" onclick="deleteOneVisit('${c.visitId}')">Delete</button>`:''}</td></tr>`).join('')}
+        </table></div>
+        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
+      `; })()}
+    </div>
+    <div class="card" style="border-color:var(--red);margin-top:10px">
+      <h3 style="color:var(--red)">SOS over ${SOS_MONITOR_MAX}% — latest visit per branch</h3>
+      ${(() => {
+        const cands = findInflatedSosVisits();
+        if(cands.length===0) return `<p class="hint">No branch's latest visit is over ${SOS_MONITOR_MAX}% SOS right now.</p>`;
+        return `
+        <p class="hint" style="margin-bottom:10px">${cands.length} branch${cands.length===1?'':'es'} currently show Shahd holding more than ${SOS_MONITOR_MAX}% of the total category shelf — above the known ~${SOS_MONITOR_MAX}% network average — based on each branch's most recent visit. Older visits at a branch aren't listed here even if they were also over: once a newer visit exists, it's the one in effect.</p>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>Auditor</th><th>SOS</th><th>Status</th><th></th></tr>
+        ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.auditor}</td><td style="color:var(--red);font-weight:700">${fmt(c.value)}%</td><td><span class="status-badge status-${c.status}">${c.status}</span></td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Edit</button>${State.role==='trade_marketing'?` <button class="btn btn-danger btn-sm" onclick="deleteOneVisit('${c.visitId}')">Delete</button>`:''}</td></tr>`).join('')}
+        </table></div>
+        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
+      `; })()}
+    </div>
   `;
 }
-
 function manageBackendUploadsHtml(){
   return `
     <div class="card">
@@ -4820,7 +4917,7 @@ Object.assign(window, {
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
-  setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx
+  setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx, deleteOneVisit
 });
 
 /* ============================= INIT ============================= */
