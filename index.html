@@ -3733,28 +3733,66 @@ async function applyRouteCycleUpload(){
    customer code, the other blank, or carrying a different code from an earlier bad import — never
    got compared and slipped through as separate "customers" on the Dashboard. This compares every
    account's branch text regardless of whether a code is present, and flags the group whenever the
-   codes disagree (including one side blank) or the name text disagrees. ---- */
+   codes disagree (including one side blank) or the name text disagrees — but only when the
+   differing names still look like the same chain (share a non-generic word), so two genuinely
+   different retailers that happen to have a store at the same mall (e.g. Carrefour and Spinneys
+   both at City Stars) don't get grouped together just because the branch text matches. ---- */
+const CHAIN_NAME_STOPWORDS = new Set(['سوبر','ماركت','هايبر','سوق','مول','ستور','ماركة','سنتر','market','super','hyper','mart']);
+function chainNameCoreTokens(name){
+  return new Set((name||'').trim().toLowerCase().split(/\s+/).filter(w=>w && !CHAIN_NAME_STOPWORDS.has(w)));
+}
 function findDuplicateAccountGroups(){
-  const byCode = {};
-  State.accounts.forEach(a=>{ if(a.customerId){ (byCode[a.customerId] = byCode[a.customerId]||[]).push(a); } });
   const groups = [];
   const flaggedIds = new Set();
+  // Pass 1: same customer code — always reliable regardless of name text.
+  const byCode = {};
+  State.accounts.forEach(a=>{ if(a.customerId){ (byCode[a.customerId] = byCode[a.customerId]||[]).push(a); } });
   Object.values(byCode).forEach(list=>{
     if(list.length>1){ groups.push({ reason:'Same customer code', accounts:list }); list.forEach(a=>flaggedIds.add(a.id)); }
   });
+  // Pass 2: within each remaining same-branch-text bucket, cluster accounts by chain-name similarity
+  // (union-find) rather than requiring the whole bucket to agree — a bucket can genuinely contain
+  // several different retailers that share one mall/branch name (e.g. Carrefour and Spinneys both at
+  // City Stars) alongside one real duplicate pair for a third chain, and each cluster needs judging
+  // on its own. Two accounts link if they share a customer code, an exact name, or a non-generic
+  // name word; singleton clusters (nothing else in the bucket looks like the same chain) are dropped.
   const byBranch = {};
-  State.accounts.forEach(a=>{ const key = (a.branch||'').trim().toLowerCase(); if(key){ (byBranch[key] = byBranch[key]||[]).push(a); } });
+  State.accounts.forEach(a=>{ if(flaggedIds.has(a.id)) return; const key = (a.branch||'').trim().toLowerCase(); if(key){ (byBranch[key] = byBranch[key]||[]).push(a); } });
   Object.values(byBranch).forEach(list=>{
     if(list.length<2) return;
-    const codes = new Set(list.map(a=>a.customerId||''));
-    const names = new Set(list.map(a=>a.name.trim().toLowerCase()));
-    // Skip a group every member of which was already grouped above (a clean same-code duplicate) —
-    // otherwise flag whenever codes disagree (including a blank alongside a real one) or names disagree.
-    if((codes.size>1 || names.size>1) && !list.every(a=>flaggedIds.has(a.id))){
-      groups.push({ reason: codes.size>1 ? 'Same branch, different or missing customer code' : 'Same branch, different name spelling — no code on file to confirm', accounts:list });
+    const parent = list.map((_,i)=>i);
+    const find = i => { while(parent[i]!==i){ parent[i]=parent[parent[i]]; i=parent[i]; } return i; };
+    const union = (i,j) => { const ri=find(i), rj=find(j); if(ri!==rj) parent[ri]=rj; };
+    const tokenSets = list.map(a=>chainNameCoreTokens(a.name));
+    const normNames = list.map(a=>a.name.trim().toLowerCase());
+    for(let i=0;i<list.length;i++){
+      for(let j=i+1;j<list.length;j++){
+        const sameCode = list[i].customerId && list[j].customerId && list[i].customerId===list[j].customerId;
+        const sameName = normNames[i]===normNames[j];
+        const sharedToken = [...tokenSets[i]].some(t=>tokenSets[j].has(t));
+        if(sameCode || sameName || sharedToken) union(i,j);
+      }
     }
+    const clusters = {};
+    list.forEach((a,i)=>{ const r=find(i); (clusters[r]=clusters[r]||[]).push(a); });
+    Object.values(clusters).forEach(cluster=>{
+      if(cluster.length<2) return;
+      const codes = new Set(cluster.map(a=>a.customerId||''));
+      groups.push({ reason: codes.size>1 ? 'Same branch, different or missing customer code' : 'Same branch, different name spelling — no code on file to confirm', accounts:cluster });
+    });
   });
   return groups;
+}
+function dupGroupSignature(ids){ return [...ids].sort().join('|'); }
+function loadDismissedDupGroups(){
+  try{ return new Set(JSON.parse(localStorage.getItem('shelfpulse_dup_dismissed')||'[]')); }catch(e){ return new Set(); }
+}
+function dismissDuplicateGroup(ids){
+  const dismissed = loadDismissedDupGroups();
+  dismissed.add(dupGroupSignature(ids));
+  try{ localStorage.setItem('shelfpulse_dup_dismissed', JSON.stringify([...dismissed])); }catch(e){}
+  showToast('Dismissed — won\'t show again unless the group changes');
+  render();
 }
 function latestVisitTimeForAccount(accountId){
   let max = 0;
@@ -3765,7 +3803,7 @@ async function mergeAccountGroup(accountIds, keepId){
   const keepAcct = State.accounts.find(a=>a.id===keepId);
   if(!keepAcct){ showToast('Could not find the account to keep'); return; }
   const dupIds = accountIds.filter(id=>id!==keepId);
-  if(!confirm(`Merge ${dupIds.length} duplicate(s) into "${keepAcct.name} · ${keepAcct.branch}"? Every visit, delegation, and gallery photo tied to the duplicates moves over — this can take a while for accounts with a lot of history and can't be undone.`)) return;
+  if(dupIds.length===0){ showToast('Nothing selected to merge'); return; }
   showToast('Merging…');
   try{
     for(const oldId of dupIds){
@@ -3799,6 +3837,33 @@ async function mergeAccountGroup(accountIds, keepId){
     console.error(e);
     showToast('Something went wrong partway through — check the account list before re-running.');
   }
+}
+function setDupKeep(sig, accountId){
+  State.__dupKeep = State.__dupKeep || {};
+  State.__dupKeep[sig] = accountId;
+  render();
+}
+function toggleDupExclude(sig, accountId){
+  State.__dupExclude = State.__dupExclude || {};
+  State.__dupExclude[sig] = State.__dupExclude[sig] || {};
+  if(State.__dupExclude[sig][accountId]) delete State.__dupExclude[sig][accountId];
+  else State.__dupExclude[sig][accountId] = true;
+  render();
+}
+function startMergeConfirm(sig){
+  State.__dupConfirm = State.__dupConfirm || {};
+  State.__dupConfirm[sig] = true;
+  render();
+}
+function cancelMergeConfirm(sig){
+  if(State.__dupConfirm) delete State.__dupConfirm[sig];
+  render();
+}
+async function confirmMergeGroup(sig, allIds, keepId){
+  const excludeMap = (State.__dupExclude && State.__dupExclude[sig]) || {};
+  const selectedIds = allIds.filter(id=>id===keepId || !excludeMap[id]);
+  if(State.__dupConfirm) delete State.__dupConfirm[sig];
+  await mergeAccountGroup(selectedIds, keepId);
 }
 function setNewMerchName(v){ State.newMerchName = v; }
 function setNewMerchCode(v){ State.newMerchCode = v; }
@@ -4310,20 +4375,52 @@ function screenSkus(){
     <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">Duplicate accounts</h3>
       ${(() => {
-        const groups = findDuplicateAccountGroups();
+        const dismissed = loadDismissedDupGroups();
+        const groups = findDuplicateAccountGroups().filter(g=>!dismissed.has(dupGroupSignature(g.accounts.map(a=>a.id))));
         if(groups.length===0) return `<p class="hint">No duplicate accounts detected right now.</p>`;
         return `
-        <p class="hint" style="margin-bottom:10px">${groups.length} likely duplicate group${groups.length===1?'':'s'} found — same customer code, or same branch with a different name spelling (e.g. "Seoudi" vs "Seoudi Market"). Pick which one to keep; its name/branch text becomes the one everyone else's visits get relabeled to. Everything else in the group — visits, delegations, gallery photos — moves onto the kept account, and the duplicates are removed.</p>
-        ${groups.map((g,gi)=>{
+        <p class="hint" style="margin-bottom:10px">${groups.length} likely duplicate group${groups.length===1?'':'s'} found — same customer code, or same branch with a similar name (e.g. "Seoudi" vs "Seoudi Market"). Pick which one to keep — its name/branch and last-visit date become the merged record's. Untick anyone in the list who doesn't actually belong (e.g. a different chain that happens to share a mall), then merge just the rest. If the whole group is wrong, dismiss it instead.</p>
+        ${groups.map((g)=>{
           const ids = g.accounts.map(a=>a.id);
+          const sig = dupGroupSignature(ids);
           const suggested = [...g.accounts].sort((a,b)=>latestVisitTimeForAccount(b.id)-latestVisitTimeForAccount(a.id))[0];
+          const keepId = (State.__dupKeep && State.__dupKeep[sig]) || suggested.id;
+          const excludeMap = (State.__dupExclude && State.__dupExclude[sig]) || {};
+          const selectedCount = g.accounts.filter(a=>a.id!==keepId && !excludeMap[a.id]).length;
+          const keepAcct = State.accounts.find(a=>a.id===keepId);
+          const confirming = State.__dupConfirm && State.__dupConfirm[sig];
           return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px">
             <p class="hint" style="margin-bottom:6px">${g.reason}</p>
-            ${g.accounts.map(a=>`<label style="display:flex;align-items:center;gap:8px;padding:4px 0">
-              <input type="radio" name="dupgroup${gi}" ${a.id===suggested.id?'checked':''} onchange="State.__dupKeep=State.__dupKeep||{};State.__dupKeep['${gi}']='${a.id}'"/>
-              <span>${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${latestVisitTimeForAccount(a.id)?new Date(latestVisitTimeForAccount(a.id)).toLocaleDateString():'none'}</span>
-            </label>`).join('')}
-            <button class="btn btn-danger btn-sm" style="margin-top:6px" onclick="mergeAccountGroup(${JSON.stringify(ids).replace(/"/g,'&quot;')}, (State.__dupKeep&&State.__dupKeep['${gi}'])||'${suggested.id}')">Merge this group</button>
+            ${g.accounts.map(a=>{
+              const isKeep = a.id===keepId;
+              const lastVisit = latestVisitTimeForAccount(a.id);
+              const lastVisitLabel = lastVisit ? new Date(lastVisit).toLocaleDateString() : 'none';
+              const infoText = `${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lastVisitLabel}`;
+              return isKeep
+                ? `<label style="display:flex;align-items:center;gap:8px;padding:4px 0">
+                    <input type="radio" name="dupkeep_${sig}" checked onchange="setDupKeep('${sig}','${a.id}')"/>
+                    <span style="font-weight:600">${infoText} — keeping this one</span>
+                  </label>`
+                : `<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+                    <input type="radio" name="dupkeep_${sig}" onchange="setDupKeep('${sig}','${a.id}')"/>
+                    <input type="checkbox" ${excludeMap[a.id]?'':'checked'} onchange="toggleDupExclude('${sig}','${a.id}')"/>
+                    <span${excludeMap[a.id]?' style="color:var(--soft)"':''}>${infoText}${excludeMap[a.id]?' — excluded, won\'t be touched':''}</span>
+                  </div>`;
+            }).join('')}
+            ${confirming ? `
+              <div style="margin-top:8px;padding:8px;background:#FBF3E4;border-radius:6px">
+                <p class="hint" style="margin-bottom:6px">Merge ${selectedCount} account(s) into "${keepAcct?keepAcct.name:''} · ${keepAcct?keepAcct.branch:''}"? Visits, delegations, and gallery photos move over. This can't be undone.</p>
+                <div style="display:flex;gap:8px">
+                  <button class="btn btn-danger btn-sm" onclick="confirmMergeGroup('${sig}', ${JSON.stringify(ids).replace(/"/g,'&quot;')}, '${keepId}')">Yes, merge ${selectedCount}</button>
+                  <button class="btn btn-ghost btn-sm" onclick="cancelMergeConfirm('${sig}')">Cancel</button>
+                </div>
+              </div>
+            ` : `
+              <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+                <button class="btn btn-danger btn-sm" ${selectedCount===0?'disabled':''} onclick="startMergeConfirm('${sig}')">Merge selected (${selectedCount})</button>
+                <button class="btn btn-ghost btn-sm" onclick="dismissDuplicateGroup(${JSON.stringify(ids).replace(/"/g,'&quot;')})">Not a duplicate — dismiss</button>
+              </div>
+            `}
           </div>`;
         }).join('')}
         `;
@@ -4562,7 +4659,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
-  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup,
+  applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
