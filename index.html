@@ -2724,23 +2724,64 @@ function dashOverview(approved){
   </div>`;
 }
 
+/* Canonical customer-name mapping — the same physical chain gets typed differently across
+   different route-cycle imports over time (e.g. "Seoudi" / "Seoudi Market" / "Market Seoudi"),
+   which fractures one real customer into several separate cards even after accounts are matched
+   on branch/code. This collapses known spelling variants onto one canonical display name before
+   grouping, so the Dashboard, Customers screen, PPT export, and Opportunities — everything that
+   reads through computeCustomerAnalysis below — show one unified customer right away. It only
+   affects how visits are grouped for display; it doesn't rename the underlying account records,
+   so running the account-merge cleanup is still worth doing to keep new imports and galleries
+   (which key off accountId, not this) consistent too. Add more chains/variants here as needed. */
+const CUSTOMER_NAME_ALIASES = {
+  'سعودي': ['سعودي', 'سعودى', 'سعودي سوبر ماركت', 'سوبر ماركت سعودي', 'سعودى سوبر ماركت', 'سوبر ماركت سعودى'],
+};
+const CUSTOMER_NAME_CANONICAL_LOOKUP = (() => {
+  const lookup = {};
+  Object.entries(CUSTOMER_NAME_ALIASES).forEach(([canon, variants])=>{
+    variants.forEach(v=>{ lookup[v] = canon; });
+  });
+  return lookup;
+})();
+function canonicalCustomerName(name){
+  const n = (name||'').trim();
+  return CUSTOMER_NAME_CANONICAL_LOOKUP[n] || n;
+}
 /* Shared aggregation used by both on-screen Customer Analysis and the PPT export */
 function computeCustomerAnalysis(approved){
   const byCustomer = {};
+  // A branch's true identity is its account's customer/location code (CUSTOMER_NUMBER_LOCATION_ID),
+  // not its free-text name — two account records for the exact same physical store can end up with
+  // different branch text, or even a different customer-name spelling, if they were created from
+  // different imports (e.g. "سعودي سيتي ستارز" and "سعودي سوبر ماركت سيتي ستارز" sharing one code).
+  // Resolving each visit's account here means both feed into the SAME branch bucket below, so its
+  // "current state" figures (SUC/SOS/stock/last-visited) come from whichever of the two has the
+  // truly most recent visit, while velocity stays a trend built from both accounts' full history
+  // combined rather than losing whichever one didn't "win". Falls back to branch text only for
+  // accounts that don't have a code on file yet.
+  const accountsById = {};
+  State.accounts.forEach(a=>{ accountsById[a.id] = a; });
   const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0)); // process oldest→newest so "latest" tracking below stays correct
   sorted.forEach(v=>{
    try{
     const agg = visitAggregate(v);
-    byCustomer[v.accountName] = byCustomer[v.accountName] || { name:v.accountName, branches:{}, skuStats:{}, photos:[] };
-    const c = byCustomer[v.accountName];
-    c.branches[v.branch] = c.branches[v.branch] || { branch:v.branch, priceOk:0, priceN:0, visits:0, skuStats:{}, lastVisitDate:null, latestSfr:0, latestSos:0, latestOsaPct:0, latestCatFacingsTotal:0, latestShahdSpaceTotal:0, latestShahdFacingsTotal:0, latestExtraDisplay:false };
-    const b = c.branches[v.branch];
+    const custName = canonicalCustomerName(v.accountName);
+    byCustomer[custName] = byCustomer[custName] || { name:custName, branches:{}, photos:[] };
+    const c = byCustomer[custName];
+    const acct = accountsById[v.accountId];
+    const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
+    c.branches[branchKey] = c.branches[branchKey] || { branch:v.branch, visits:0, lastVisitDate:null, latestSfr:0, latestSos:0, latestOsaPct:0, latestCatFacingsTotal:0, latestShahdSpaceTotal:0, latestShahdFacingsTotal:0, latestExtraDisplay:false, skuStats:{}, accountIds:new Set() };
+    const b = c.branches[branchKey];
+    b.accountIds.add(v.accountId);
     b.visits++;
-    // Every figure in the branch header — SUC%, SOS%, OSA%, and the absolute totals — now comes from
-    // this SAME single latest visit, not an average of one mixed with a snapshot of the other. That
-    // mismatch (a historical average shown next to a latest-only total) is what produced nonsense like
-    // "SOS 417%" sitting beside "Category facings: 70 · Shahd facings: 21" (which is actually 30%).
-    // `sorted` runs oldest→newest, so each later visit correctly overwrites the previous "latest".
+    // Every figure in the branch header — SUC%, SOS%, OSA%, and the absolute totals — plus every
+    // per-SKU reading below (price, stock, out-of-stock status), plus the branch LABEL itself, comes
+    // from this SAME single latest visit, not an average or a running tally mixed in from every
+    // historical visit (or every duplicate account) at this branch. `sorted` runs oldest→newest, so
+    // each later visit correctly overwrites the previous "latest". This keeps Price OK% and
+    // out-of-stock counts from being dragged down by an old bad reading that a later, corrected
+    // visit has since superseded — the same rule already applied to SUC/SOS/OSA.
+    b.branch = v.branch;
     b.lastVisitDate = v.date;
     b.latestSfr = agg.avgSfr; b.latestSos = agg.avgSos; b.latestOsaPct = agg.osaPct;
     b.latestCatFacingsTotal = agg.catFacingsTotal;
@@ -2751,19 +2792,11 @@ function computeCustomerAnalysis(approved){
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       const priceVal = parseFloat(it.actualPrice);
-      c.skuStats[sku.id] = c.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, sfrSum:0, sosSum:0, sosVsShahdSum:0, n:0, oosCount:0, priceOk:0, priceN:0, latestPrice:0, branchesCarrying:new Set() };
-      const s = c.skuStats[sku.id];
-      s.n++; s.sfrSum += (it.calc.sfr||0); s.sosSum += (it.calc.sos||0); s.sosVsShahdSum += (it.calc.sosVsShahd||0);
-      if(it.calc.osa==='N') s.oosCount++; else s.branchesCarrying.add(v.branch);
-      if(it.calc.velocity>0){ s.velSum += it.calc.velocity; s.velN++; }
-      if(!isNaN(priceVal) && priceVal>0){ s.latestPrice = priceVal; } // overwritten each pass — ends on the most recent visit's reading, not an average
-      if(it.calc.priceStatus!=='neutral'){ s.priceN++; if(it.calc.priceStatus==='on') s.priceOk++; b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; }
-
-      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, oosCount:0, n:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestSfr:0, latestSos:0, latestSosVsShahd:0, latestShahdFacings:0 };
+      b.skuStats[sku.id] = b.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0, velSum:0, velN:0, priceStatus:'neutral', latestPrice:0, latestStock:0, latestCapacity:0, latestSfr:0, latestSos:0, latestSosVsShahd:0, latestShahdFacings:0, isOos:false };
       const bs = b.skuStats[sku.id];
-      bs.n++; if(it.calc.osa==='N') bs.oosCount++;
-      if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; }
-      if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // latest reading, not an average
+      if(it.calc.velocity>0){ bs.velSum += it.calc.velocity; bs.velN++; } // velocity stays a genuine trend across visits, not a "latest" snapshot
+      bs.isOos = it.calc.osa==='N'; // overwritten each pass — reflects only the latest visit's stock check, not every past one
+      if(!isNaN(priceVal) && priceVal>0){ bs.latestPrice = priceVal; bs.priceStatus = it.calc.priceStatus; } // overwritten each pass — ends on the most recent visit's reading, not an average
       bs.latestStock = it.calc.actualShelfStock; // overwritten each pass — ends on the most recent visit's reading
       bs.latestCapacity = parseFloat(it.actualCapacity) || 0; // facings actually on shelf, latest visit
       bs.latestShahdFacings = parseFloat(it.shahdFacings) || 0; // this SKU's own facing count, latest visit
@@ -2781,45 +2814,59 @@ function computeCustomerAnalysis(approved){
    }catch(e){ console.error('Skipping malformed visit in customer analysis:', v && v.id, e); }
   });
   return Object.values(byCustomer).map(c=>{
-    const branches = Object.values(c.branches).map(b=>({
-      branch:b.branch, sfr:b.latestSfr, sos:b.latestSos, osaPct:b.latestOsaPct, lastVisitDate:b.lastVisitDate,
-      priceOkPct: b.priceN?b.priceOk/b.priceN*100:0, visits:b.visits,
-      catFacingsTotal: b.latestCatFacingsTotal, shahdSpaceTotal: b.latestShahdSpaceTotal, shahdFacingsTotal: b.latestShahdFacingsTotal, extraDisplay: b.latestExtraDisplay,
-      skuList: Object.entries(b.skuStats).map(([skuId,s])=>{
-        const avgVel = s.velN?s.velSum/s.velN:0;
+    const branches = Object.values(c.branches).map(b=>{
+      const skuList = Object.entries(b.skuStats).map(([skuId,bs])=>{
+        const avgVel = bs.velN?bs.velSum/bs.velN:0;
         // Coverage uses the SAME average velocity shown as "Vel/d" (not a single latest-visit reading), paired with the latest stock count.
-        const coverageDays = avgVel>0 ? s.latestStock/avgVel : (s.latestStock>0 ? Infinity : 0);
+        const coverageDays = avgVel>0 ? bs.latestStock/avgVel : (bs.latestStock>0 ? Infinity : 0);
         return {
-          id:skuId, name:s.name, category:s.category, rsp:s.rsp,
+          id:skuId, name:bs.name, category:bs.category, rsp:bs.rsp,
           avgVel,
-          actualPrice: s.latestPrice||0,
-          priceStatus: s.priceStatus, oosCount:s.oosCount, n:s.n,
-          stock: s.latestStock, coverageDays, shahdFacings: s.latestShahdFacings,
-          capacity: s.latestCapacity, sfr: s.latestSfr, sos: s.latestSos, sosVsShahd: s.latestSosVsShahd,
+          actualPrice: bs.latestPrice||0,
+          priceStatus: bs.priceStatus||'neutral', isOos: bs.isOos, oosCount: bs.isOos?1:0, n:1,
+          stock: bs.latestStock||0, coverageDays, shahdFacings: bs.latestShahdFacings||0,
+          capacity: bs.latestCapacity||0, sfr: bs.latestSfr, sos: bs.latestSos, sosVsShahd: bs.latestSosVsShahd,
         };
-      }).sort((a,b2)=>b2.avgVel-a.avgVel),
-    }));
-    const skuList = Object.entries(c.skuStats).map(([skuId,s])=>{
-      const stockAcrossBranches = branches.reduce((sum,b)=>{
-        const match = b.skuList.find(x=>x.id===skuId); return sum + (match ? match.stock : 0);
-      },0);
-      const coverageVals = branches.map(b=>{ const match = b.skuList.find(x=>x.id===skuId); return match ? match.coverageDays : 0; }).filter(x=>x>0 && isFinite(x));
-      const hasInfiniteCoverage = branches.some(b=>{ const match = b.skuList.find(x=>x.id===skuId); return match && match.coverageDays === Infinity; });
-      // Utilization and SOS are averaged across branches' LATEST readings (already latest-only, from
-      // the branch rollup above) — not across every historical visit. A branch that had a bad input
-      // months ago and has since been visited correctly isn't still dragged down by that old number.
-      const branchReadings = branches.map(b=>b.skuList.find(x=>x.id===skuId)).filter(Boolean);
-      const sfrVals = branchReadings.map(x=>x.sfr).filter(v=>v!=null);
-      const sosVsShahdVals = branchReadings.map(x=>x.sosVsShahd).filter(v=>v!=null);
+      }).sort((a,b2)=>b2.avgVel-a.avgVel);
+      // Price OK% for this branch, from each SKU's LATEST reading here — not a tally that keeps
+      // counting every historical visit. A bad price entry from months ago no longer drags this down
+      // once a later visit corrected it.
+      const pricedSkus = skuList.filter(s=>s.priceStatus!=='neutral');
+      const priceOkPct = pricedSkus.length ? pricedSkus.filter(s=>s.priceStatus==='on').length/pricedSkus.length*100 : 0;
       return {
-        name:s.name, category:s.category, rsp:s.rsp,
-        avgVelPerStore: s.velN?s.velSum/s.velN:0, totalVelNetwork: s.velSum,
+        branch:b.branch, sfr:b.latestSfr, sos:b.latestSos, osaPct:b.latestOsaPct, lastVisitDate:b.lastVisitDate,
+        priceOkPct, visits:b.visits, accountIds:[...b.accountIds],
+        catFacingsTotal: b.latestCatFacingsTotal, shahdSpaceTotal: b.latestShahdSpaceTotal, shahdFacingsTotal: b.latestShahdFacingsTotal, extraDisplay: b.latestExtraDisplay,
+        skuList,
+      };
+    });
+    const skuIds = new Set();
+    branches.forEach(b=>b.skuList.forEach(s=>skuIds.add(s.id)));
+    const skuList = [...skuIds].map(skuId=>{
+      // Every network-wide figure below is built from each branch's LATEST reading of this SKU
+      // (`readings`, already latest-only from the branch rollup above) — not from every historical
+      // visit at every branch. A branch that had a bad reading months ago and has since been visited
+      // correctly isn't still dragged down by that old number.
+      const readings = branches.map(b=>b.skuList.find(x=>x.id===skuId)).filter(Boolean);
+      const meta = readings[0];
+      const velVals = readings.filter(r=>r.avgVel>0).map(r=>r.avgVel);
+      const totalVelNetwork = velVals.reduce((a,b2)=>a+b2,0);
+      const stockAcrossBranches = readings.reduce((s,r)=>s+(r.stock||0),0);
+      const coverageVals = readings.map(r=>r.coverageDays).filter(x=>x>0 && isFinite(x));
+      const hasInfiniteCoverage = readings.some(r=>r.coverageDays===Infinity);
+      const sfrVals = readings.map(r=>r.sfr).filter(v=>v!=null);
+      const sosVsShahdVals = readings.map(r=>r.sosVsShahd).filter(v=>v!=null);
+      const pricedReadings = readings.filter(r=>r.priceStatus!=='neutral');
+      const oosCount = readings.filter(r=>r.isOos).length;
+      return {
+        name: meta.name, category: meta.category, rsp: meta.rsp,
+        avgVelPerStore: velVals.length ? velVals.reduce((a,b2)=>a+b2,0)/velVals.length : 0, totalVelNetwork,
         sfr: sfrVals.length ? sfrVals.reduce((a,b2)=>a+b2,0)/sfrVals.length : null,
-        osaPct: (s.n-s.oosCount)/s.n*100,
+        osaPct: readings.length ? (readings.length-oosCount)/readings.length*100 : 0,
         sosVsShahd: sosVsShahdVals.length ? sosVsShahdVals.reduce((a,b2)=>a+b2,0)/sosVsShahdVals.length : null,
-        priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
-        actualPrice: s.latestPrice||0,
-        oosCount:s.oosCount, visits:s.n, coverage:s.branchesCarrying.size,
+        priceOkPct: pricedReadings.length ? pricedReadings.filter(r=>r.priceStatus==='on').length/pricedReadings.length*100 : 0,
+        actualPrice: meta.actualPrice||0,
+        oosCount, visits: readings.length, coverage: readings.length - oosCount,
         totalStock: stockAcrossBranches, avgCoverageDays: coverageVals.length ? coverageVals.reduce((a,b2)=>a+b2,0)/coverageVals.length : (hasInfiniteCoverage ? Infinity : 0),
       };
     }).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
@@ -3063,25 +3110,35 @@ function dashCategories(approved){
   </div>`;
 }
 
-/* Opportunity detection: same SKU performs very differently across branches */
+/* Opportunity detection: same SKU performs very differently across branches. Uses the SAME identity
+   resolution as computeCustomerAnalysis — canonical customer name + code-based branch key — so two
+   duplicate accounts for the same physical branch are one entry here too, not two competing ones
+   (which could otherwise flag a branch as "underperforming" against its own duplicate record). */
 function computeOpportunities(approved){
   const bySku = {};
-  approved.forEach(v=>{
+  const accountsById = {};
+  State.accounts.forEach(a=>{ accountsById[a.id] = a; });
+  const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0)); // oldest→newest, so the latest-only tracking below stays correct
+  sorted.forEach(v=>{
     const agg = visitAggregate(v);
+    const custName = canonicalCustomerName(v.accountName);
+    const acct = accountsById[v.accountId];
+    const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
+    const groupKey = custName+'||'+branchKey; // stable join key — same identity as computeCustomerAnalysis's branch buckets
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, byAccount:{} };
-      const key = v.accountName+' · '+v.branch;
-      bySku[sku.id].byAccount[key] = bySku[sku.id].byAccount[key] || { velSum:0, velN:0, oosCount:0, visits:0, priceStatus:it.calc.priceStatus };
-      const a = bySku[sku.id].byAccount[key];
+      bySku[sku.id].byAccount[groupKey] = bySku[sku.id].byAccount[groupKey] || { velSum:0, velN:0, isOos:false, visits:0, label:'' };
+      const a = bySku[sku.id].byAccount[groupKey];
       a.visits++;
-      if(it.calc.osa==='N') a.oosCount++;
-      if(it.calc.velocity>0){ a.velSum += it.calc.velocity; a.velN++; }
+      a.label = custName+' · '+v.branch; // overwritten each pass — ends on the latest visit's branch text, matching the label computeCustomerAnalysis shows for this same branch
+      a.isOos = it.calc.osa==='N'; // overwritten each pass — reflects only the latest visit's stock check, not a historical rate across every visit
+      if(it.calc.velocity>0){ a.velSum += it.calc.velocity; a.velN++; } // velocity stays a genuine trend across visits (and across a merged duplicate account's own history), not a "latest" snapshot
     });
   });
   const opportunities = [];
   Object.values(bySku).forEach(sku=>{
-    const accounts = Object.entries(sku.byAccount).map(([acc,a])=>({acc, vel: a.velN?a.velSum/a.velN:0, oosRate: a.oosCount/a.visits, ...a}));
+    const accounts = Object.values(sku.byAccount).map(a=>({acc:a.label, vel: a.velN?a.velSum/a.velN:0, isOos:a.isOos}));
     const selling = accounts.filter(a=>a.vel>0);
     if(selling.length < 2) return;
     const best = selling.reduce((m,a)=>a.vel>m.vel?a:m, selling[0]);
@@ -3090,7 +3147,9 @@ function computeOpportunities(approved){
       if(best.vel<=0) return;
       if(a.vel > 0 && a.vel < best.vel*0.5){
         opportunities.push({ type:'underperform', sku: sku.name, category: sku.category, branch: a.acc, velocity: a.vel, benchmark: best.vel, benchmarkBranch: best.acc, gap: best.vel - a.vel });
-      } else if(a.oosRate >= 0.5 && best.vel >= 1){
+      } else if(a.isOos && best.vel >= 1){
+        // OOS trigger is the LATEST visit's stock check only, not "OOS in at least half of past visits" —
+        // an old stockout that a later visit already resolved no longer flags this as an opportunity.
         opportunities.push({ type:'oos', sku: sku.name, category: sku.category, branch: a.acc, velocity: 0, benchmark: best.vel, benchmarkBranch: best.acc, gap: best.vel });
       }
     });
@@ -3668,19 +3727,32 @@ async function applyRouteCycleUpload(){
     showToast('Could not apply the file — check your connection and try again.');
   }
 }
-/* ---- Duplicate account cleanup — code-based grouping (reliable) plus a same-branch/different-name
-   heuristic (likely, needs manual confirmation) for accounts predating the customer-code fix above. ---- */
+/* ---- Duplicate account cleanup — code-based grouping (reliable) plus a same-branch heuristic for
+   accounts whose codes disagree or are missing on one side. The old version only cross-checked
+   accounts that had NO code at all, so two accounts for the same physical branch — one carrying a
+   customer code, the other blank, or carrying a different code from an earlier bad import — never
+   got compared and slipped through as separate "customers" on the Dashboard. This compares every
+   account's branch text regardless of whether a code is present, and flags the group whenever the
+   codes disagree (including one side blank) or the name text disagrees. ---- */
 function findDuplicateAccountGroups(){
   const byCode = {};
   State.accounts.forEach(a=>{ if(a.customerId){ (byCode[a.customerId] = byCode[a.customerId]||[]).push(a); } });
-  const byBranch = {};
-  State.accounts.forEach(a=>{ if(!a.customerId){ const key = (a.branch||'').trim().toLowerCase(); if(key){ (byBranch[key] = byBranch[key]||[]).push(a); } } });
   const groups = [];
-  Object.values(byCode).forEach(list=>{ if(list.length>1) groups.push({ reason:'Same customer code', accounts:list }); });
+  const flaggedIds = new Set();
+  Object.values(byCode).forEach(list=>{
+    if(list.length>1){ groups.push({ reason:'Same customer code', accounts:list }); list.forEach(a=>flaggedIds.add(a.id)); }
+  });
+  const byBranch = {};
+  State.accounts.forEach(a=>{ const key = (a.branch||'').trim().toLowerCase(); if(key){ (byBranch[key] = byBranch[key]||[]).push(a); } });
   Object.values(byBranch).forEach(list=>{
     if(list.length<2) return;
+    const codes = new Set(list.map(a=>a.customerId||''));
     const names = new Set(list.map(a=>a.name.trim().toLowerCase()));
-    if(names.size>1) groups.push({ reason:'Same branch, different name spelling — no code on file to confirm', accounts:list });
+    // Skip a group every member of which was already grouped above (a clean same-code duplicate) —
+    // otherwise flag whenever codes disagree (including a blank alongside a real one) or names disagree.
+    if((codes.size>1 || names.size>1) && !list.every(a=>flaggedIds.has(a.id))){
+      groups.push({ reason: codes.size>1 ? 'Same branch, different or missing customer code' : 'Same branch, different name spelling — no code on file to confirm', accounts:list });
+    }
   });
   return groups;
 }
@@ -4084,8 +4156,14 @@ function screenBranchDetail(){
   if(!loc) return `<div class="screen">${emptyState('⚠️','Branch not found','')}<button class="btn btn-ghost" onclick="go('storemap')">Back to map</button></div>`;
   const approved = State.visits.filter(v=>v.status==='approved');
   const customers = computeCustomerAnalysis(approved);
-  const customerRow = customers.find(c=>c.name===loc.accountName);
-  const branchRow = customerRow ? customerRow.branches.find(b=>b.branch===loc.branch) : null;
+  // Matched by which account fed into a branch bucket, not by name/branch text — those get
+  // canonicalized and can end up showing a different account's label once a later visit from a
+  // duplicate-account branch becomes the "latest" one, so text matching here would silently miss it.
+  let customerRow = null, branchRow = null;
+  for(const cust of customers){
+    const found = cust.branches.find(b=>b.accountIds && b.accountIds.includes(State.selectedBranchAccountId));
+    if(found){ customerRow = cust; branchRow = found; break; }
+  }
   const photos = [];
   approved.forEach(v=>{ if(v.accountId===State.selectedBranchAccountId && v.branch===loc.branch) visitPhotos(v).forEach(p=>photos.push({photo:p, date:v.date})); });
 
