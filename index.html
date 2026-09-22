@@ -1076,8 +1076,18 @@ function isTypingNow(){
 const SHORT_COMPLETION_MINUTES = 20;
 function watchVisits(){
   if(!isConfigured) return;
-  const { collection, onSnapshot, query, orderBy } = firestoreFns;
-  const q = query(collection(db, 'visits'), orderBy('submittedAt', 'desc'));
+  const { collection, onSnapshot, query, orderBy, where } = firestoreFns;
+  // Merchandisers have no manage tabs at all (see ROLES.merchandiser) — the only visit-related
+  // screens they ever see are "New visit" and "My visits", both scoped to their own submissions.
+  // Downloading and live-syncing every visit ever submitted by the whole network — including every
+  // photo attached to it — to a merchandiser's phone is the single biggest driver of both slow
+  // loading and mobile data use for that role, so their listener is scoped to their own visits only.
+  // (No orderBy here deliberately — pairing an equality filter with orderBy on a different field
+  // needs a composite Firestore index; sorting the small resulting set client-side avoids that.)
+  const isMerchandiserOnly = State.role === 'merchandiser';
+  const q = isMerchandiserOnly
+    ? query(collection(db, 'visits'), where('auditor', '==', identityLabel()))
+    : query(collection(db, 'visits'), orderBy('submittedAt', 'desc'));
   let firstSnapshot = true;
   onSnapshot(q, snap => {
     const conf = roleConf();
@@ -1094,6 +1104,7 @@ function watchVisits(){
     }
     const visits = [];
     snap.forEach(d => visits.push({ id: d.id, ...d.data() }));
+    if(isMerchandiserOnly) visits.sort((a,b)=>(b.submittedAt||0)-(a.submittedAt||0)); // replaces the orderBy we skipped above
     State.visits = visits;
     firstSnapshot = false;
     // Never yank the screen out from under someone mid-keystroke — the data is still updated,
@@ -1287,15 +1298,11 @@ function findSuspiciousSos(){
   return candidates.sort((a,b)=>(b.shahdSum-b.catTotal)-(a.shahdSum-a.catTotal));
 }
 // Review-only flag — unlike price/capacity there's no "correct value" to auto-fix to, since duration
-// is derived from timestamps, not a typed field. This just surfaces visits worth a second look.
+// is derived from timestamps, not a typed field. Surfaced inline on a visit during approval review
+// (see the "too fast to be real" chip) rather than as a standing list — arrivedAt-based detection in
+// the Arrivals tab already flags this live, and a persistent list here just accumulated old visits
+// that a new one at the same branch never cleared.
 const SHORT_VISIT_MINUTES = 2; // business rule: can't realistically photograph, count facings, and check prices in under this
-function findSuspiciouslyShortVisits(){
-  return State.visits
-    .map(v => ({ v, mins: visitDurationMinutes(v) }))
-    .filter(x => x.mins !== null && x.mins < SHORT_VISIT_MINUTES)
-    .map(x => ({ visitId:x.v.id, account:x.v.accountName, branch:x.v.branch, date:x.v.date, auditor:x.v.auditor, status:x.v.status, mins:x.mins }))
-    .sort((a,b)=>a.mins-b.mins);
-}
 async function applyCapacityFix(c){
   const visit = State.visits.find(v=>v.id===c.visitId); if(!visit) return;
   const newItems = (visit.items||[]).map(it => it.skuId===c.skuId ? {...it, actualCapacity: String(c.closing)} : it);
@@ -1418,8 +1425,8 @@ const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
   supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','accounts','team','scorecard','allvisits','delegate'] },
-  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
-  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap','managebackend'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','accounts','scorecard','allvisits','storemap','managebackend'] },
   commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','accounts','scorecard','allvisits','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
@@ -3869,7 +3876,25 @@ async function confirmMergeGroup(sig, allIds, keepId){
    automatic duplicate detection above doesn't catch (e.g. names/branches too different for it to
    link, but you know they're the same physical store). Search, add as many as you like, and the
    most-recently-visited one is suggested as the one to keep — override with the radio if needed. ---- */
-function setManualMergeSearch(v){ State.__manualMergeSearch = v; render(); }
+function setManualMergeSearch(v){
+  State.__manualMergeSearch = v;
+  const el = document.getElementById('manual-merge-results');
+  if(el) el.innerHTML = manualMergeResultsHtml(); // targeted update — leaves the input itself untouched so the keyboard never closes mid-type
+}
+function manualMergeResultsHtml(){
+  const q = (State.__manualMergeSearch||'').trim().toLowerCase();
+  const selected = State.__manualMergeSelected || [];
+  if(!q) return '';
+  const matches = State.accounts.filter(a=>!selected.includes(a.id) && ((a.name||'').toLowerCase().includes(q) || (a.branch||'').toLowerCase().includes(q))).slice(0,8);
+  if(matches.length===0) return `<p class="hint">No matching accounts</p>`;
+  return matches.map(a=>{
+    const lv = latestVisitTimeForAccount(a.id);
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line)">
+      <span>${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}</span>
+      <button class="btn btn-ghost btn-sm" onclick="manualMergeAdd('${a.id}')">+ Add</button>
+    </div>`;
+  }).join('');
+}
 function manualMergeAdd(accountId){
   State.__manualMergeSelected = State.__manualMergeSelected || [];
   if(!State.__manualMergeSelected.includes(accountId)) State.__manualMergeSelected.push(accountId);
@@ -4292,9 +4317,42 @@ function screenBranchDetail(){
   </div>`;
 }
 
-function screenSkus(){
+/* ---- Manage Backend — split into sub-tabs (SKUs, Prices, Facings & Stocks, Uploads, Merging,
+   Deletion, Photos) instead of one long crowded page. Only reachable by trade_marketing/merch_head
+   (canEditRef), so the per-section role checks that used to wrap everything here were redundant and
+   have been dropped; Deletion keeps its own stricter trade_marketing-only check. ---- */
+function screenManageBackend(){
+  const sub = State.manageBackendSub || 'skus';
+  const subs = [
+    {id:'skus', label:'SKUs'},
+    {id:'prices', label:'Prices'},
+    {id:'facings', label:'Facings & Stocks'},
+    {id:'uploads', label:'Uploads'},
+    {id:'merging', label:'Merging'},
+    {id:'deletion', label:'Deletion'},
+    {id:'photos', label:'Photos'},
+  ];
+  const bodies = {
+    skus: manageBackendSkusHtml,
+    prices: manageBackendPricesHtml,
+    facings: manageBackendFacingsHtml,
+    uploads: manageBackendUploadsHtml,
+    merging: manageBackendMergingHtml,
+    deletion: manageBackendDeletionHtml,
+    photos: manageBackendPhotosHtml,
+  };
   return `<div class="screen">
-    <h1>Manage SKUs / إدارة المنتجات</h1>
+    <h1>Manage Backend / إدارة النظام</h1>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
+      ${subs.map(s=>`<button class="btn ${sub===s.id?'btn-primary':'btn-ghost'} btn-sm" onclick="setManageBackendSub('${s.id}')">${s.label}</button>`).join('')}
+    </div>
+    ${(bodies[sub] || manageBackendSkusHtml)()}
+  </div>`;
+}
+function setManageBackendSub(id){ State.manageBackendSub = id; render(); }
+
+function manageBackendSkusHtml(){
+  return `
     <p class="lede">Edit the reference list merchandisers audit against. (${State.accounts.length} accounts loaded from route plan — ask me to add more.)</p>
     ${State.skus.map((s,idx)=>`
       <div class="card">
@@ -4309,8 +4367,11 @@ function screenSkus(){
         <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removeSku(${idx})">Remove SKU</button>
       </div>`).join('')}
     <button class="btn btn-line" onclick="addSku()">＋ Add SKU</button>
-    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
-    <div class="sectitle">Fix suspicious prices / تصحيح الأسعار</div>
+  `;
+}
+
+function manageBackendPricesHtml(){
+  return `
     <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">Impossible prices (over ${MAX_PLAUSIBLE_PRICE} EGP)</h3>
       ${(() => {
@@ -4327,6 +4388,11 @@ function screenSkus(){
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
     </div>
+  `;
+}
+
+function manageBackendFacingsHtml(){
+  return `
     <div class="sectitle">Fix impossible capacity / تصحيح الكمية المستحيلة</div>
     <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">Facings filled exceed closing stock</h3>
@@ -4358,22 +4424,11 @@ function screenSkus(){
         ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
       `; })()}
     </div>
-    <div class="sectitle">Suspiciously fast visits / زيارات سريعة بشكل مريب</div>
-    <div class="card" style="border-color:var(--amber)">
-      <h3 style="color:var(--amber)">Under ${SHORT_VISIT_MINUTES} minutes, photo to submit</h3>
-      ${(() => {
-        const cands = findSuspiciouslyShortVisits();
-        if(cands.length===0) return `<p class="hint">No suspiciously fast visits detected right now.</p>`;
-        return `
-        <p class="hint" style="margin-bottom:10px">${cands.length} visit${cands.length===1?'':'s'} took under ${SHORT_VISIT_MINUTES} minutes from the location photo to submission — not enough time to genuinely audit a shelf. Worth a manual look before trusting the data or the visit-compliance credit.</p>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>Auditor</th><th>Duration</th><th>Status</th><th></th></tr>
-        ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.auditor}</td><td style="color:var(--red);font-weight:700">${fmtDuration(c.mins)}</td><td><span class="status-badge status-${c.status}">${c.status}</span></td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; review</button></td></tr>`).join('')}
-        </table></div>
-        ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}
-      `; })()}
-    </div>` : ''}
-    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
-    <div class="sectitle">Route cycle &amp; merchandiser codes / دورة الزيارات وأكواد المندوبين</div>
+  `;
+}
+
+function manageBackendUploadsHtml(){
+  return `
     <div class="card">
       <h3>Upload route cycle file</h3>
       <p class="hint" style="margin-bottom:10px">Upload the route cycle export (.xlsx) to update the account list — customer, branch, channel, region, and which merchandiser/supervisor covers each — and to record each merchandiser's own code, so logins get checked against the right person instead of any code from a shared list. Matches existing accounts by name + branch; anything not matched becomes a new account.</p>
@@ -4400,59 +4455,15 @@ function screenSkus(){
       <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="addMerchandiserManually()">Add</button>
       ${Object.keys(State.merchDirectory||{}).length ? `<p class="hint" style="margin-top:10px">${Object.keys(State.merchDirectory).length} merchandisers/supervisors currently bound to a specific code.</p>` : `<p class="hint" style="margin-top:10px">No one bound to a specific code yet — logins still accept any code from the old shared list until this directory has entries.</p>`}
     </div>
-    <div class="card" style="border-color:var(--amber)">
-      <h3 style="color:var(--amber)">Manual merge</h3>
-      <p class="hint" style="margin-bottom:10px">Didn't find a match below? Search and pick any accounts yourself — add as many as belong to the same physical store, in any combination, and the one with the most recent visit is suggested as the one to keep.</p>
-      <input type="text" placeholder="Search accounts by name or branch…" value="${State.__manualMergeSearch||''}" oninput="setManualMergeSearch(this.value)" style="margin-bottom:8px"/>
-      ${(() => {
-        const q = (State.__manualMergeSearch||'').trim().toLowerCase();
-        const selected = State.__manualMergeSelected || [];
-        if(!q) return '';
-        const matches = State.accounts.filter(a=>!selected.includes(a.id) && ((a.name||'').toLowerCase().includes(q) || (a.branch||'').toLowerCase().includes(q))).slice(0,8);
-        if(matches.length===0) return `<p class="hint">No matching accounts</p>`;
-        return matches.map(a=>{
-          const lv = latestVisitTimeForAccount(a.id);
-          return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line)">
-            <span>${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}</span>
-            <button class="btn btn-ghost btn-sm" onclick="manualMergeAdd('${a.id}')">+ Add</button>
-          </div>`;
-        }).join('');
-      })()}
-      ${(() => {
-        const selected = State.__manualMergeSelected || [];
-        const accts = selected.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
-        if(accts.length===0) return `<p class="hint" style="margin-top:8px">No accounts picked yet — search above to add some.</p>`;
-        const suggested = [...accts].sort((a,b)=>latestVisitTimeForAccount(b.id)-latestVisitTimeForAccount(a.id))[0];
-        const keepId = State.__manualMergeKeep || (suggested?suggested.id:null);
-        const confirming = State.__manualMergeConfirm;
-        const keepAcct = State.accounts.find(a=>a.id===keepId);
-        return `
-          <div style="margin-top:10px">
-            <p class="hint" style="margin-bottom:6px">${accts.length} account${accts.length===1?'':'s'} picked — pick which one to keep:</p>
-            ${accts.map(a=>{
-              const lv = latestVisitTimeForAccount(a.id);
-              const isMostRecent = suggested && a.id===suggested.id;
-              return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
-                <input type="radio" name="manualmergekeep" ${a.id===keepId?'checked':''} onchange="setManualMergeKeep('${a.id}')"/>
-                <span style="flex:1">${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}${isMostRecent?' — most recent':''}</span>
-                <button class="btn btn-ghost btn-sm" onclick="manualMergeRemove('${a.id}')">Remove</button>
-              </div>`;
-            }).join('')}
-            ${confirming ? `
-              <div style="margin-top:8px;padding:8px;background:#FBF3E4;border-radius:6px">
-                <p class="hint" style="margin-bottom:6px">Merge ${accts.length-1} account(s) into "${keepAcct?keepAcct.name:''} · ${keepAcct?keepAcct.branch:''}"? Visits, delegations, and gallery photos move over. This can't be undone.</p>
-                <div style="display:flex;gap:8px">
-                  <button class="btn btn-danger btn-sm" onclick="confirmManualMerge()">Yes, merge</button>
-                  <button class="btn btn-ghost btn-sm" onclick="cancelManualMergeConfirm()">Cancel</button>
-                </div>
-              </div>
-            ` : `
-              <button class="btn btn-danger btn-sm" style="margin-top:8px" ${accts.length<2?'disabled':''} onclick="startManualMergeConfirm()">Merge these ${accts.length}</button>
-            `}
-          </div>
-        `;
-      })()}
-    </div>
+  `;
+}
+
+function setMergeBrowseIdx(i){ State.__mergeBrowseIdx = i; render(); }
+function manageBackendMergingHtml(){
+  const customerNames = [...new Set(State.accounts.map(a=>canonicalCustomerName(a.name)))].sort((a,b)=>a.localeCompare(b));
+  const browseIdx = State.__mergeBrowseIdx;
+  const browseName = (browseIdx!=null) ? customerNames[browseIdx] : null;
+  return `
     <div class="card" style="border-color:var(--amber)">
       <h3 style="color:var(--amber)">Duplicate accounts</h3>
       ${(() => {
@@ -4506,28 +4517,72 @@ function screenSkus(){
         }).join('')}
         `;
       })()}
-    </div>` : ''}
-    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
-    <div class="sectitle">Execution Gallery setup / إعداد معرض التنفيذ</div>
-    <div class="card" style="border-color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">
-      <h3 style="color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">${cloudinaryConfigured ? 'Cloudinary connected ✓' : 'Cloudinary not set up yet'}</h3>
-      ${cloudinaryConfigured ? `
-      <p class="hint">The "📸 Execution gallery" section on each branch (in Customers) is live — up to ${GALLERY_MAX_PHOTOS} curated photos per branch, stored in Cloudinary rather than Firebase.</p>
-      ` : `
-      <p class="hint" style="margin-bottom:8px">The Execution Gallery feature (up to ${GALLERY_MAX_PHOTOS} curated photos per branch, on the Customers tab) needs a free Cloudinary account to store images — kept separate from Firebase on purpose. Two values need to be set in the app's code:</p>
-      <p class="hint">1. Sign up free at cloudinary.com. 2. Settings → Upload → add an upload preset, set it to "Unsigned". 3. Send the Cloud name and preset name so they can be added to the code.</p>
-      `}
-    </div>` : ''}
-    ${(State.role==='trade_marketing' || State.role==='merch_head') ? `
-    <div class="sectitle">Move legacy photos to Cloudinary / نقل الصور القديمة</div>
+    </div>
     <div class="card" style="border-color:var(--amber)">
-      <h3 style="color:var(--amber)">${findLegacyPhotoVisits().length} visit(s) still have photos embedded in the database</h3>
-      <p class="hint" style="margin-bottom:10px">New visits already upload photos to Cloudinary instead of saving them inside the visit record. This one-time tool moves photos out of older visit records too, shrinking them and speeding up every dashboard/list load — this is the biggest single fix for slow loading and heavy data usage on this app, so it's worth running once Cloudinary is connected. Safe to run more than once — already-migrated visits are skipped automatically.</p>
-      <p class="hint" style="margin-bottom:10px">${cloudinaryConfigured ? 'Cloudinary is connected — ready to run.' : "Needs Cloudinary set up first (see the card above) — until then this will report that nothing could be uploaded rather than silently finishing at 0. Photos are safe either way; embedded-in-Firestore is how they've been stored all along."}</p>
-      <button class="btn btn-primary btn-sm" onclick="migrateLegacyPhotos()">Migrate now</button>
-    </div>` : ''}
-    ${State.role==='trade_marketing' ? `
-    <div class="sectitle">Danger zone / منطقة الخطر</div>
+      <h3 style="color:var(--amber)">Browse by customer</h3>
+      <p class="hint" style="margin-bottom:8px">${customerNames.length} customer${customerNames.length===1?'':'s'} — tap one to see its branches and add any of them below.</p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;max-height:160px;overflow-y:auto;margin-bottom:10px">
+        ${customerNames.map((name,i)=>`<button class="btn ${i===browseIdx?'btn-primary':'btn-ghost'} btn-sm" onclick="setMergeBrowseIdx(${i})">${name}</button>`).join('')}
+      </div>
+      ${browseName ? (() => {
+        const selected = State.__manualMergeSelected || [];
+        const accts = State.accounts.filter(a=>canonicalCustomerName(a.name)===browseName && !selected.includes(a.id));
+        if(accts.length===0) return `<p class="hint">All of this customer's branches are already in your selection below.</p>`;
+        return accts.map(a=>{
+          const lv = latestVisitTimeForAccount(a.id);
+          return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line)">
+            <span>${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}</span>
+            <button class="btn btn-ghost btn-sm" onclick="manualMergeAdd('${a.id}')">+ Add</button>
+          </div>`;
+        }).join('');
+      })() : ''}
+    </div>
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Search</h3>
+      <p class="hint" style="margin-bottom:10px">Or search and pick any accounts yourself — add as many as belong to the same physical store, in any combination, and the one with the most recent visit is suggested as the one to keep.</p>
+      <input type="text" placeholder="Search accounts by name or branch…" value="${State.__manualMergeSearch||''}" oninput="setManualMergeSearch(this.value)" style="margin-bottom:8px"/>
+      <div id="manual-merge-results">${manualMergeResultsHtml()}</div>
+      ${(() => {
+        const selected = State.__manualMergeSelected || [];
+        const accts = selected.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
+        if(accts.length===0) return `<p class="hint" style="margin-top:8px">No accounts picked yet — browse or search above to add some.</p>`;
+        const suggested = [...accts].sort((a,b)=>latestVisitTimeForAccount(b.id)-latestVisitTimeForAccount(a.id))[0];
+        const keepId = State.__manualMergeKeep || (suggested?suggested.id:null);
+        const confirming = State.__manualMergeConfirm;
+        const keepAcct = State.accounts.find(a=>a.id===keepId);
+        return `
+          <div style="margin-top:10px">
+            <p class="hint" style="margin-bottom:6px">${accts.length} account${accts.length===1?'':'s'} picked — pick which one to keep:</p>
+            ${accts.map(a=>{
+              const lv = latestVisitTimeForAccount(a.id);
+              const isMostRecent = suggested && a.id===suggested.id;
+              return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+                <input type="radio" name="manualmergekeep" ${a.id===keepId?'checked':''} onchange="setManualMergeKeep('${a.id}')"/>
+                <span style="flex:1">${a.name} · ${a.branch}${a.customerId?' (code '+a.customerId+')':' (no code)'} — last visit ${lv?new Date(lv).toLocaleDateString():'none'}${isMostRecent?' — most recent':''}</span>
+                <button class="btn btn-ghost btn-sm" onclick="manualMergeRemove('${a.id}')">Remove</button>
+              </div>`;
+            }).join('')}
+            ${confirming ? `
+              <div style="margin-top:8px;padding:8px;background:#FBF3E4;border-radius:6px">
+                <p class="hint" style="margin-bottom:6px">Merge ${accts.length-1} account(s) into "${keepAcct?keepAcct.name:''} · ${keepAcct?keepAcct.branch:''}"? Visits, delegations, and gallery photos move over. This can't be undone.</p>
+                <div style="display:flex;gap:8px">
+                  <button class="btn btn-danger btn-sm" onclick="confirmManualMerge()">Yes, merge</button>
+                  <button class="btn btn-ghost btn-sm" onclick="cancelManualMergeConfirm()">Cancel</button>
+                </div>
+              </div>
+            ` : `
+              <button class="btn btn-danger btn-sm" style="margin-top:8px" ${accts.length<2?'disabled':''} onclick="startManualMergeConfirm()">Merge these ${accts.length}</button>
+            `}
+          </div>
+        `;
+      })()}
+    </div>
+  `;
+}
+
+function manageBackendDeletionHtml(){
+  if(State.role !== 'trade_marketing') return `<p class="hint">Only Trade Marketing & Market Development can delete visits.</p>`;
+  return `
     <div class="card" style="border-color:var(--red)">
       <h3 style="color:var(--red)">Selective cleanup</h3>
       <p class="hint" style="margin-bottom:10px">Delete only visits of a specific status, or wipe everything. Each action asks for confirmation and cannot be undone.</p>
@@ -4564,9 +4619,30 @@ function screenSkus(){
         <button class="btn btn-danger btn-sm" style="margin-top:10px" onclick="deleteSelectedCleanupVisits()" ${State.cleanupSelected.size===0?'disabled':''}>Delete ${State.cleanupSelected.size} selected</button>
         ` : ''}`;
       })() : ''}
-    </div>` : ''}
-  </div>`;
+    </div>
+  `;
 }
+
+function manageBackendPhotosHtml(){
+  return `
+    <div class="card" style="border-color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">
+      <h3 style="color:${cloudinaryConfigured?'var(--green)':'var(--amber)'}">${cloudinaryConfigured ? 'Cloudinary connected ✓' : 'Cloudinary not set up yet'}</h3>
+      ${cloudinaryConfigured ? `
+      <p class="hint">The "📸 Execution gallery" section on each branch (in Customers) is live — up to ${GALLERY_MAX_PHOTOS} curated photos per branch, stored in Cloudinary rather than Firebase.</p>
+      ` : `
+      <p class="hint" style="margin-bottom:8px">The Execution Gallery feature (up to ${GALLERY_MAX_PHOTOS} curated photos per branch, on the Customers tab) needs a free Cloudinary account to store images — kept separate from Firebase on purpose. Two values need to be set in the app's code:</p>
+      <p class="hint">1. Sign up free at cloudinary.com. 2. Settings → Upload → add an upload preset, set it to "Unsigned". 3. Send the Cloud name and preset name so they can be added to the code.</p>
+      `}
+    </div>
+    <div class="card" style="border-color:var(--amber);margin-top:10px">
+      <h3 style="color:var(--amber)">${findLegacyPhotoVisits().length} visit(s) still have photos embedded in the database</h3>
+      <p class="hint" style="margin-bottom:10px">New visits already upload photos to Cloudinary instead of saving them inside the visit record. This one-time tool moves photos out of older visit records too, shrinking them and speeding up every dashboard/list load — this is the biggest single fix for slow loading and heavy data usage on this app, so it's worth running once Cloudinary is connected. Safe to run more than once — already-migrated visits are skipped automatically.</p>
+      <p class="hint" style="margin-bottom:10px">${cloudinaryConfigured ? 'Cloudinary is connected — ready to run.' : "Needs Cloudinary set up first (see the card above) — until then this will report that nothing could be uploaded rather than silently finishing at 0. Photos are safe either way; embedded-in-Firestore is how they've been stored all along."}</p>
+      <button class="btn btn-primary btn-sm" onclick="migrateLegacyPhotos()">Migrate now</button>
+    </div>
+  `;
+}
+
 
 /* ============================= EVENT HANDLERS ============================= */
 function go(tab){ State.tab = tab; render(); window.scrollTo(0,0); }
@@ -4657,6 +4733,7 @@ function navHtml(){
     allvisits: {id:'allvisits', ico:'🗂', lbl:bi('All Visits','كل الزيارات')},
     storemap: {id:'storemap', ico:'🗺️', lbl:bi('Store Map','الخريطة')},
     delegate: {id:'delegate', ico:'🔁', lbl:bi('Delegate','نقل الزيارة')},
+    managebackend: {id:'managebackend', ico:'⚙', lbl:bi('Manage Backend','إدارة النظام')},
   };
   const manageTabs = (conf.manageTabs||[]).map(k=>manageTabDefs[k]);
   const tabs = State.navContext==='field' ? fieldTabs : manageTabs;
@@ -4687,7 +4764,7 @@ function render(){
     else if(State.tab==='dashboard') body = screenDashboard();
     else if(State.tab==='team') body = screenTeam();
     else if(State.tab==='scorecard') body = screenScorecard();
-    else if(State.tab==='skus') body = screenSkus();
+    else if(State.tab==='skus' || State.tab==='managebackend') body = screenManageBackend();
     else if(State.tab==='allvisits') body = screenAllVisits();
     else if(State.tab==='storemap') body = screenStoreMap();
     else if(State.tab==='branchdetail') body = screenBranchDetail();
@@ -4723,7 +4800,7 @@ function render(){
           <button class="${State.navContext==='manage'?'active':''}" onclick="setNavContext('manage')">Management</button>
         </div>
       </div>` : ''}
-      ${conf.canEditRef ? `<div style="margin-top:8px;position:relative;z-index:1"><button class="btn-sm" style="background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:9px;padding:6px 12px;font-size:11.5px;font-weight:700;cursor:pointer" onclick="go('skus')">⚙ Manage SKUs</button></div>` : ''}
+      ${conf.canEditRef ? `<div style="margin-top:8px;position:relative;z-index:1"><button class="btn-sm" style="background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:9px;padding:6px 12px;font-size:11.5px;font-weight:700;cursor:pointer" onclick="go('managebackend')">⚙ Manage Backend</button></div>` : ''}
     </div>
     ${body}
     ${navHtml()}
@@ -4743,7 +4820,7 @@ Object.assign(window, {
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
-  setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits
+  setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx
 });
 
 /* ============================= INIT ============================= */
