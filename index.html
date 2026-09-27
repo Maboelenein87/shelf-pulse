@@ -1468,6 +1468,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    shelf to audit. They're deliberately excluded from Store Map: that map is built from visit-photo
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 const ECOMM_MERCH_CODE = '7073'; // Fayrouz Mahmoud Azmy Khalaf Mehran — the sole ECOMM data-entry merchandiser
+const ECOMM_MERCH_NAME = 'Fayrouz Mahmoud Azmy Khalaf Mehran';
 function isEcommMerch(){ return State.role==='merchandiser' && State.merchCode===ECOMM_MERCH_CODE; }
 // Trade Marketing gets full edit access alongside Fayrouz (can add and correct any dark store's data
 // directly); Merch Head and Commercial see the ECOMM dashboard read-only — no submit/edit UI is ever
@@ -2422,7 +2423,12 @@ function screenLogin(){
       <label>Your name</label>
       <select onchange="attemptMerchandiserLogin(this.value)">
         <option value="">Select your name…</option>
-        ${merchNames.map(n=>`<option value="${n}">${n}</option>`).join('')}
+        <optgroup label="Field merchandisers">
+          ${merchNames.map(n=>`<option value="${n}">${n}</option>`).join('')}
+        </optgroup>
+        <optgroup label="ECOMM merchandisers">
+          <option value="${ECOMM_MERCH_NAME}">${ECOMM_MERCH_NAME}</option>
+        </optgroup>
       </select>
       <p class="hint" style="margin-top:8px">You'll be asked for your EMPID next.</p>
     </div>
