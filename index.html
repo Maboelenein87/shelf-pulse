@@ -1027,7 +1027,8 @@ async function deleteVisitPhotoPrompt(visitId, photoUrl){
 }
 
 /* ============================= STORAGE HELPERS (Firestore) ============================= */
-const REF_DATA_VERSION = 4; // bump this whenever DEFAULT_SKUS/DEFAULT_ACCOUNTS change, to force a refresh
+const ACCOUNTS_DATA_VERSION = 4; // bump ONLY when DEFAULT_ACCOUNTS changes — kept separate from SKUS_DATA_VERSION on purpose
+const SKUS_DATA_VERSION = 4; // bump ONLY when DEFAULT_SKUS changes — a shared single version number was exactly why bumping it for new ECOMM accounts once silently wiped out live-edited SKUs too; these are now independent so that can't happen again
 async function refGet(name){
   if(!isConfigured) return null;
   const { doc, getDoc } = firestoreFns;
@@ -1630,8 +1631,8 @@ async function loadAll(){
   if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
 
   const skusDoc = await refGet('skus');
-  if(!skusDoc || skusDoc.version !== REF_DATA_VERSION){
-    await refSet('skus', DEFAULT_SKUS, REF_DATA_VERSION);
+  if(!skusDoc || skusDoc.version !== SKUS_DATA_VERSION){
+    await refSet('skus', DEFAULT_SKUS, SKUS_DATA_VERSION);
     State.skus = DEFAULT_SKUS;
   } else {
     State.skus = skusDoc.list;
@@ -1639,8 +1640,8 @@ async function loadAll(){
   SKU_MAP = {}; State.skus.forEach(s=>SKU_MAP[s.id]=s);
 
   const accDoc = await refGet('accounts');
-  if(!accDoc || accDoc.version !== REF_DATA_VERSION){
-    await refSet('accounts', DEFAULT_ACCOUNTS, REF_DATA_VERSION);
+  if(!accDoc || accDoc.version !== ACCOUNTS_DATA_VERSION){
+    await refSet('accounts', DEFAULT_ACCOUNTS, ACCOUNTS_DATA_VERSION);
     State.accounts = DEFAULT_ACCOUNTS;
   } else {
     State.accounts = accDoc.list;
@@ -1732,7 +1733,7 @@ function attemptPasswordLogin(){
     State.loginRole=null; State.loginPassword=''; saveMe(); restoreDraftIfAny(); render();
   } else { State.loginError='Incorrect password.'; render(); }
 }
-async function saveSkus(){ await refSet('skus', State.skus, REF_DATA_VERSION); SKU_MAP={}; State.skus.forEach(s=>SKU_MAP[s.id]=s); }
+async function saveSkus(){ await refSet('skus', State.skus, SKUS_DATA_VERSION); SKU_MAP={}; State.skus.forEach(s=>SKU_MAP[s.id]=s); }
 
 /* ============================= DRAFT PERSISTENCE (crash/network recovery) ============================= */
 function saveDraftLocal(){
@@ -4181,9 +4182,9 @@ async function applyRouteCycleUpload(){
       if(merchCode && merchName) directoryUpdates[merchCode] = { name: merchName, active };
       if(supCode && supName) directoryUpdates[supCode] = { name: supName, active: true };
     });
-    await refSet('accounts', State.accounts, REF_DATA_VERSION);
+    await refSet('accounts', State.accounts, ACCOUNTS_DATA_VERSION);
     State.merchDirectory = { ...State.merchDirectory, ...directoryUpdates };
-    await refSet('merchDirectory', State.merchDirectory, REF_DATA_VERSION);
+    await refSet('merchDirectory', State.merchDirectory, ACCOUNTS_DATA_VERSION);
     const preview = State.routeCyclePreview;
     showToast(`Applied ✓ — ${preview.newAccounts} new account${preview.newAccounts===1?'':'s'}, ${preview.updatedAccounts} updated, ${Object.keys(directoryUpdates).length} merchandiser/supervisor codes recorded.`);
     State.routeCycleRows = null; State.routeCyclePreview = null;
@@ -4296,7 +4297,7 @@ async function mergeAccountGroup(accountIds, keepId){
       }catch(e){ console.error(e); }
       State.accounts = State.accounts.filter(a=>a.id!==oldId);
     }
-    await refSet('accounts', State.accounts, REF_DATA_VERSION);
+    await refSet('accounts', State.accounts, ACCOUNTS_DATA_VERSION);
     showToast('Merged ✓');
     render();
   }catch(e){
@@ -4384,7 +4385,7 @@ async function addMerchandiserManually(){
   if(!name || !code){ showToast('Enter both a name and a code'); return; }
   try{
     State.merchDirectory = { ...State.merchDirectory, [code]: { name, active:true } };
-    await refSet('merchDirectory', State.merchDirectory, REF_DATA_VERSION);
+    await refSet('merchDirectory', State.merchDirectory, ACCOUNTS_DATA_VERSION);
     State.newMerchName=''; State.newMerchCode='';
     showToast(`${name} added with code ${code} ✓`);
     render();
@@ -4847,9 +4848,66 @@ function screenManageBackend(){
 }
 function setManageBackendSub(id){ State.manageBackendSub = id; render(); }
 
+function findOrphanedSkuIds(){
+  // Any skuId referenced in a real submitted visit that isn't in the current SKU list — almost always
+  // means the SKU list was reset from an older snapshot after this ID was added live (see
+  // SKUS_DATA_VERSION), not that the SKU was ever meant to disappear. Visit records never get touched
+  // by that reset, so the historical data is still there — it's just no longer linked to a name.
+  const info = {};
+  State.visits.forEach(v=>{
+    (v.items||[]).forEach(it=>{
+      if(!it.skuId || SKU_MAP[it.skuId]) return;
+      const cur = info[it.skuId] || { count:0, first:v.date, last:v.date, accounts:new Set() };
+      cur.count++;
+      if(!cur.first || v.date<cur.first) cur.first = v.date;
+      if(!cur.last || v.date>cur.last) cur.last = v.date;
+      cur.accounts.add(v.accountName);
+      info[it.skuId] = cur;
+    });
+  });
+  return Object.entries(info).map(([id,d])=>({ id, count:d.count, first:d.first, last:d.last, accountCount:d.accounts.size }))
+    .sort((a,b)=>b.count-a.count);
+}
+function setOrphanSkuField(id, field, val){
+  State.__orphanSkuDraft = State.__orphanSkuDraft || {};
+  State.__orphanSkuDraft[id] = State.__orphanSkuDraft[id] || { name:'', nameAr:'', category:'', rsp:'' };
+  State.__orphanSkuDraft[id][field] = val;
+}
+async function restoreOrphanedSku(id){
+  if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; }
+  const d = (State.__orphanSkuDraft && State.__orphanSkuDraft[id]) || {};
+  if(!d.name || !d.name.trim()){ showToast('Enter the SKU name first'); return; }
+  State.skus.push({ id, name:d.name.trim(), nameAr:(d.nameAr||'').trim(), category:(d.category||'').trim(), rsp:parseFloat(d.rsp)||0, exclusiveTo:'' });
+  await saveSkus();
+  if(State.__orphanSkuDraft) delete State.__orphanSkuDraft[id];
+  showToast('SKU restored — historical data reconnected ✓');
+  render();
+}
 function manageBackendSkusHtml(){
   const customerNames = [...new Set(State.accounts.map(a=>canonicalCustomerName(a.name)))].sort((a,b)=>a.localeCompare(b));
+  const orphans = findOrphanedSkuIds();
   return `
+    ${orphans.length ? `
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">⚠️ ${orphans.length} SKU${orphans.length===1?'':'s'} found in past visits but missing from this list</h3>
+      <p class="hint" style="margin-bottom:10px">These IDs are referenced by real submitted visits but have no matching entry above — usually means a SKU was added directly here and then lost in a later reference-data refresh. Nothing was deleted: fill in the name below and restore it, and every visit that used it reconnects immediately.</p>
+      ${orphans.map(o=>{
+        const d = (State.__orphanSkuDraft && State.__orphanSkuDraft[o.id]) || {};
+        return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px">
+          <p class="hint" style="margin-bottom:8px">Appears in ${o.count} visit line${o.count===1?'':'s'} across ${o.accountCount} account${o.accountCount===1?'':'s'} — ${o.first} to ${o.last}</p>
+          <div class="row2">
+            <div><label>SKU name (English)</label><input type="text" value="${d.name||''}" oninput="setOrphanSkuField('${o.id}','name',this.value)" placeholder="e.g. Marinated Wings 500gm"/></div>
+            <div><label>SKU name (Arabic)</label><input type="text" dir="rtl" value="${d.nameAr||''}" oninput="setOrphanSkuField('${o.id}','nameAr',this.value)" placeholder="اكتب الاسم بالعربي"/></div>
+          </div>
+          <div class="row2">
+            <div><label>Category</label><input type="text" value="${d.category||''}" oninput="setOrphanSkuField('${o.id}','category',this.value)"/></div>
+            <div><label>RSP (EGP)</label><input type="number" value="${d.rsp||''}" oninput="setOrphanSkuField('${o.id}','rsp',this.value)"/></div>
+          </div>
+          <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="restoreOrphanedSku('${o.id}')">Restore this SKU</button>
+        </div>`;
+      }).join('')}
+    </div>
+    ` : ''}
     <p class="lede">Edit the reference list merchandisers audit against. (${State.accounts.length} accounts loaded from route plan — ask me to add more.)</p>
     ${State.skus.map((s,idx)=>`
       <div class="card">
@@ -5344,7 +5402,8 @@ Object.assign(window, {
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx, deleteOneVisit,
-  pickEcommAccount, clearEcommAccount, setEcommAvailable, setEcommPrice, ecommPriceBlur, setEcommPlatform, backToEcommPlatforms, submitEcommVisit, toggleEcommPlatform, openEcommStoreFromDashboard
+  pickEcommAccount, clearEcommAccount, setEcommAvailable, setEcommPrice, ecommPriceBlur, setEcommPlatform, backToEcommPlatforms, submitEcommVisit, toggleEcommPlatform, openEcommStoreFromDashboard,
+  setOrphanSkuField, restoreOrphanedSku
 });
 
 /* ============================= INIT ============================= */
