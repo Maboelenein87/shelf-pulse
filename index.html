@@ -1910,7 +1910,6 @@ function pickEcommAccount(id){
     return priorItem ? { skuId: it.skuId, available: !!priorItem.available, actualPrice: priorItem.actualPrice ?? '' } : it;
   });
   State.ecommDraft = { accountId:a.id, accountName:a.name, branch:a.branch, date: todayStr(), items };
-  State.ecommAccountSearch = '';
   render();
 }
 function clearEcommAccount(){ State.ecommDraft = null; render(); }
@@ -1924,47 +1923,46 @@ function ecommPriceStatusFor(price, rsp){
   if(diffPct > 4) return 'watch';
   return 'off';
 }
-function setEcommAccountSearch(v){
-  State.ecommAccountSearch = v;
-  const el = document.getElementById('ecomm-account-search-area');
-  if(el) el.innerHTML = ecommAccountSearchAreaHtml(); // targeted update — leaves the input untouched so the keyboard never closes mid-type
+function ecommPlatformNames(){
+  return [...new Set(State.accounts.filter(a=>a.medium==='ecomm').map(a=>a.name))].sort((a,b)=>a.localeCompare(b));
 }
-function ecommAccountResultsHtml(){
-  const q = (State.ecommAccountSearch||'').toLowerCase();
-  const pool = State.accounts.filter(a=>a.medium==='ecomm');
-  const results = pool.filter(a => (a.name+' '+a.branch).toLowerCase().includes(q)).slice(0,8);
-  if(results.length===0) return `<p class="hint">No matches — try a different spelling.</p>`;
-  return `<div style="margin-top:8px">${results.map(a=>`
-    <div class="search-result" onclick="pickEcommAccount('${a.id}')">
-      <div><div class="sr-main">${a.name}</div><div class="sr-sub">${a.branch}</div></div>
-    </div>`).join('')}</div>`;
-}
-function ecommAccountSearchAreaHtml(){
-  if((State.ecommAccountSearch||'').length>1) return ecommAccountResultsHtml();
-  const pool = State.accounts.filter(a=>a.medium==='ecomm');
-  return `<p class="hint">Type at least 2 letters to search, or pick from the full list:</p>
-    <select onchange="if(this.value)pickEcommAccount(this.value)">
-      <option value="">Browse all ${pool.length} dark stores…</option>
-      ${[...pool].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}</option>`).join('')}
-    </select>`;
-}
+function setEcommPlatform(name){ State.ecommSelectedPlatform = name; render(); }
+function backToEcommPlatforms(){ State.ecommSelectedPlatform = null; render(); }
 function screenNewEcommVisit(){
   if(!canEditEcomm()) return `<div class="screen">${emptyState('🔒','View only','You have read-only access to ECOMM — ask Fayrouz or Trade Marketing to update this.')}</div>`;
   const d = State.ecommDraft;
   return `<div class="screen">
     ${State.tab==='ecommnewvisit' ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="go('ecomm')">← Back to ECOMM dashboard</button>` : ''}
     <h1>New ECOMM visit / زيارة إلكترونية جديدة</h1>
-    <p class="lede">Search a dark store, then just confirm availability and price for each SKU — no photos, no facings.</p>
+    <p class="lede">Pick a platform, then a dark store, then just confirm availability and price for each SKU — no photos, no facings.</p>
     <div class="card">
       <h3>Dark store / المتجر</h3>
       ${d ? `
         <div style="display:flex;justify-content:space-between;align-items:center">
           <div><div class="sr-main">${d.accountName}</div><div class="sr-sub">${d.branch}</div></div>
           <button class="btn btn-ghost btn-sm" onclick="clearEcommAccount()">Change</button>
-        </div>` : `
-        <input type="text" placeholder="Search dark store…" value="${State.ecommAccountSearch||''}" oninput="setEcommAccountSearch(this.value)"/>
-        <div id="ecomm-account-search-area">${ecommAccountSearchAreaHtml()}</div>
-      `}
+        </div>` : (!State.ecommSelectedPlatform ? `
+        <p class="hint" style="margin-bottom:10px">Choose a platform:</p>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${ecommPlatformNames().map(name=>{
+            const count = State.accounts.filter(a=>a.medium==='ecomm' && a.name===name).length;
+            return `<button class="btn btn-line" onclick="setEcommPlatform('${name}')">${name} (${count})</button>`;
+          }).join('')}
+        </div>
+      ` : (() => {
+        const stores = State.accounts.filter(a=>a.medium==='ecomm' && a.name===State.ecommSelectedPlatform).sort((a,b)=>a.branch.localeCompare(b.branch));
+        return `
+        <button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToEcommPlatforms()">← Back to platforms</button>
+        <p class="hint" style="margin-bottom:8px">${State.ecommSelectedPlatform} — ${stores.length} dark store${stores.length===1?'':'s'}</p>
+        ${stores.map(a=>`
+          <div class="search-result" style="display:flex;justify-content:space-between;align-items:center">
+            <div style="cursor:pointer;flex:1" onclick="pickEcommAccount('${a.id}')">
+              <div class="sr-main">${a.branch}</div>
+            </div>
+            <a href="?account=${a.id}" style="font-size:11px;color:var(--red);white-space:nowrap;margin-left:8px" title="Opens this dark store directly — use this link to jump straight in later">🔗 Direct link</a>
+          </div>`).join('')}
+        `;
+      })())}
     </div>
     ${d ? `
     <div class="sectitle">SKU checklist — ${d.items.length} to confirm</div>
@@ -2015,7 +2013,6 @@ async function submitEcommVisit(){
     };
     await visitCreate(visit);
     State.ecommDraft = null;
-    State.ecommAccountSearch = '';
     showToast('ECOMM visit saved ✓');
     State.tab = isEcommMerch() ? 'myvisits' : 'ecomm'; // Trade Marketing lands back on the dashboard; Fayrouz on her own visit list
   } catch(err){
@@ -5331,7 +5328,7 @@ Object.assign(window, {
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx, deleteOneVisit,
-  pickEcommAccount, clearEcommAccount, setEcommAvailable, setEcommPrice, ecommPriceBlur, setEcommAccountSearch, submitEcommVisit, toggleEcommPlatform, openEcommStoreFromDashboard
+  pickEcommAccount, clearEcommAccount, setEcommAvailable, setEcommPrice, ecommPriceBlur, setEcommPlatform, backToEcommPlatforms, submitEcommVisit, toggleEcommPlatform, openEcommStoreFromDashboard
 });
 
 /* ============================= INIT ============================= */
