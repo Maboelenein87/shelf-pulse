@@ -2367,6 +2367,22 @@ function targetForMerch(name){
 function achievedForMerch(name){
   return State.visits.filter(v=>v.auditor===name).length;
 }
+function normalizeArabicName(s){
+  // Strips characters that look identical in a route-cycle Excel export but aren't byte-identical —
+  // zero-width/bidi control marks, doubled or non-breaking spaces — any of which silently breaks a
+  // strict === match even though the name reads as exactly the same to a human. This is the actual
+  // cause of a merchandiser's approvals routing to nobody: supervisorOfMerch() below still finds the
+  // right supervisor name from the account data, but comparing it against the hardcoded login name
+  // with === fails on an invisible difference, so no supervisor ever matches — only merch_head/trade
+  // marketing, who see every approval unfiltered, ever see it.
+  return (s||'')
+    .replace(/[\u200B-\u200F\u202A-\u202E\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function isSameSupervisor(supValueFromAccount, loggedInSupervisorName){
+  return normalizeArabicName(supValueFromAccount) === normalizeArabicName(loggedInSupervisorName);
+}
 function supervisorOfMerch(merchName){
   const counts = {};
   State.accounts.forEach(a=>{ if((a.merch||'').trim()===(merchName||'').trim() && a.sup){ counts[a.sup]=(counts[a.sup]||0)+1; } });
@@ -2376,7 +2392,7 @@ function supervisorOfMerch(merchName){
 }
 function myMerchandisers(){
   const all = [...new Set(State.accounts.map(a=>(a.merch||'').trim()).filter(Boolean))];
-  if(State.role==='supervisor') return all.filter(n=>supervisorOfMerch(n)===State.name);
+  if(State.role==='supervisor') return all.filter(n=>isSameSupervisor(supervisorOfMerch(n), State.name));
   return all;
 }
 /* ============================= LOGIN SCREEN ============================= */
@@ -4494,7 +4510,7 @@ function onVisitSearch(v){
    Whoever actually submits the visit gets the credit (auditor = the submitter), so this is purely about letting
    someone else's account show up in the delegate's account list for that one day. ---- */
 function supervisorTeamAccounts(){
-  if(State.role==='supervisor') return State.accounts.filter(a=>supervisorOfMerch(a.merch)===State.name);
+  if(State.role==='supervisor') return State.accounts.filter(a=>isSameSupervisor(supervisorOfMerch(a.merch), State.name));
   return State.accounts;
 }
 function delegateSearchInput(v){
