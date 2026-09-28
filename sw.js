@@ -1,7 +1,7 @@
 /* Shelf Pulse service worker.
    Bump CACHE_NAME (e.g. 'shelf-pulse-v2') every time index.html is redeployed, so old caches get
    cleared out on activate and everyone picks up the new version on their next successful load. */
-const CACHE_NAME = 'shelf-pulse-v2';
+const CACHE_NAME = 'shelf-pulse-v3';
 const APP_SHELL = ['./', './index.html'];
 
 self.addEventListener('install', event => {

@@ -1198,6 +1198,22 @@ function notifyLongOnsite(a, mins){
     }
   }catch(e){ /* toast above still covers it */ }
 }
+function watchSkus(){
+  // Without this, a merchandiser's SKU list was only ever read once at page load — so anyone with the
+  // app already open kept the old list (old names, old prices, missing new launches) until they
+  // happened to fully reload. Now edits made in Manage Backend reach open sessions immediately.
+  if(!isConfigured) return;
+  const { doc, onSnapshot } = firestoreFns;
+  onSnapshot(doc(db, 'meta', 'skus'), snap => {
+    if(snap.metadata && snap.metadata.hasPendingWrites) return; // our own in-flight edit — State already has it
+    if(!snap.exists()) return;
+    const data = snap.data();
+    if(!data || !Array.isArray(data.list)) return;
+    State.skus = data.list;
+    SKU_MAP = {}; State.skus.forEach(s=>SKU_MAP[s.id]=s);
+    if(!isTypingNow()) render();
+  });
+}
 function watchDelegations(){
   if(!isConfigured) return;
   const { collection, onSnapshot } = firestoreFns;
@@ -1630,8 +1646,11 @@ async function loadAll(){
   let hasSavedSession = false;
   if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
 
+  // SKUs are managed live in Manage Backend, so the baked-in defaults are only a first-time seed —
+  // an existing list is NEVER overwritten by a version mismatch (that overwrite is what once wiped
+  // live-added SKUs, and an older cached copy of the app could re-trigger it every time it loaded).
   const skusDoc = await refGet('skus');
-  if(!skusDoc || skusDoc.version !== SKUS_DATA_VERSION){
+  if(!skusDoc || !Array.isArray(skusDoc.list)){
     await refSet('skus', DEFAULT_SKUS, SKUS_DATA_VERSION);
     State.skus = DEFAULT_SKUS;
   } else {
@@ -1640,7 +1659,7 @@ async function loadAll(){
   SKU_MAP = {}; State.skus.forEach(s=>SKU_MAP[s.id]=s);
 
   const accDoc = await refGet('accounts');
-  if(!accDoc || accDoc.version !== ACCOUNTS_DATA_VERSION){
+  if(!accDoc || (accDoc.version||0) < ACCOUNTS_DATA_VERSION){ // '<' not '!==' — an older cached copy of the app must never overwrite newer live data
     await refSet('accounts', DEFAULT_ACCOUNTS, ACCOUNTS_DATA_VERSION);
     State.accounts = DEFAULT_ACCOUNTS;
   } else {
@@ -1652,6 +1671,7 @@ async function loadAll(){
   await loadLocations();
   watchVisits();
   watchDelegations();
+  watchSkus();
   watchArrivals();
   watchGalleries();
   setInterval(checkLongOnsiteArrivals, 5*60*1000); // periodic — nothing in Firestore changes while someone's just sitting "active", so this can't be event-driven like the other notifications
@@ -2522,6 +2542,7 @@ function visitRowHtml(v){
 
 /* ---- New Visit ---- */
 function screenNewVisit(){
+  if(syncDraftItemsWithSkus()) saveDraftLocal();
   const d = State.draft;
   const hasAccount = !!d.accountName;
   const arrived = !!d.arrivalId;
@@ -5251,6 +5272,22 @@ function daysSinceLastVisitFor(accountId){
   if(!prior) return 7; // no prior visit on record — neutral fallback rather than 0, which would understate velocity
   const days = Math.round((new Date(todayStr()) - new Date(prior.date)) / 86400000);
   return days > 0 ? days : 1; // guard against a same-day repeat visit skewing the velocity denominator toward zero
+}
+function syncDraftItemsWithSkus(){
+  // A draft's SKU checklist used to be frozen the moment the account was picked and saved to the
+  // device — so anyone with an unfinished draft (or a draft restored on reopening the app) never saw
+  // SKUs added or re-added afterwards. This rebuilds the list from the current SKUs while keeping
+  // everything already typed for SKUs that are still applicable.
+  const d = State.draft;
+  if(!d || !d.accountId || !d.items || d.items.length===0) return false;
+  const custName = canonicalCustomerName(d.accountName);
+  const wanted = State.skus.filter(s => !s.exclusiveTo || s.exclusiveTo === custName);
+  const same = wanted.length===d.items.length && wanted.every((s,i)=>d.items[i].skuId===s.id);
+  if(same) return false;
+  const byId = {}; d.items.forEach(it=>{ byId[it.skuId] = it; });
+  const days = String(daysSinceLastVisitFor(d.accountId));
+  d.items = wanted.map(s => byId[s.id] || {skuId:s.id, opening:'', closing:'', deliveries:'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days, _open:false});
+  return true;
 }
 function pickAccount(id){
   const a = State.accounts.find(a=>a.id===id); if(!a) return;
