@@ -1040,6 +1040,37 @@ async function refSet(name, list, version){
   const { doc, setDoc } = firestoreFns;
   await setDoc(doc(db, 'meta', name), { list, version });
 }
+/* ---- Protected reference lists (SKUs, accounts) ----
+   Every write stamps the list with a revision and also saves a backup copy under a separate name.
+   An older cached copy of the app doesn't know about revisions: when it resets the list to its own
+   built-in defaults, the revision goes missing and no longer matches the backup — so the next
+   up-to-date copy that loads restores the list from the backup automatically. Backup is written
+   first, live second, so a load that lands between the two writes only ever restores the NEWER list. */
+async function refSetSafe(name, list, version){
+  if(!isConfigured) return;
+  const { doc, setDoc } = firestoreFns;
+  const rev = Date.now();
+  await setDoc(doc(db, 'meta', name+'_backup'), { list, rev, savedAt: rev });
+  await setDoc(doc(db, 'meta', name), { list, version, rev });
+}
+async function refLoadSafe(name, defaults, version){
+  const live = await refGet(name);
+  const backup = await refGet(name+'_backup');
+  const liveOk = !!(live && Array.isArray(live.list));
+  const backupOk = !!(backup && Array.isArray(backup.list) && backup.rev);
+  if(backupOk && (!liveOk || live.rev !== backup.rev)){
+    console.warn(`[${name}] live list didn't match its backup (rewritten by an older copy of the app) — restoring from backup`);
+    const { doc, setDoc } = firestoreFns;
+    await setDoc(doc(db, 'meta', name), { list: backup.list, version, rev: backup.rev });
+    return { list: backup.list, restored: liveOk };
+  }
+  if(liveOk){
+    if(!backupOk) await refSetSafe(name, live.list, version); // first run of this protection — the current list becomes the baseline
+    return { list: live.list, restored: false };
+  }
+  await refSetSafe(name, defaults, version); // nothing exists yet — first-time seed only
+  return { list: defaults, restored: false };
+}
 function isTypingNow(){
   const el = document.activeElement;
   return !!(el && (el.tagName==='INPUT' || el.tagName==='TEXTAREA'));
@@ -1209,6 +1240,7 @@ function watchSkus(){
     if(!snap.exists()) return;
     const data = snap.data();
     if(!data || !Array.isArray(data.list)) return;
+    if(!data.rev && State.skus && State.skus.length){ saveSkus(); return; } // rewritten by an older copy of the app — re-save what this session already has
     State.skus = data.list;
     SKU_MAP = {}; State.skus.forEach(s=>SKU_MAP[s.id]=s);
     if(!isTypingNow()) render();
@@ -1646,24 +1678,20 @@ async function loadAll(){
   let hasSavedSession = false;
   if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
 
-  // SKUs are managed live in Manage Backend, so the baked-in defaults are only a first-time seed —
-  // an existing list is NEVER overwritten by a version mismatch (that overwrite is what once wiped
-  // live-added SKUs, and an older cached copy of the app could re-trigger it every time it loaded).
-  const skusDoc = await refGet('skus');
-  if(!skusDoc || !Array.isArray(skusDoc.list)){
-    await refSet('skus', DEFAULT_SKUS, SKUS_DATA_VERSION);
-    State.skus = DEFAULT_SKUS;
-  } else {
-    State.skus = skusDoc.list;
-  }
+  // SKUs and accounts are managed live, so the baked-in defaults are only a first-time seed — an
+  // existing list is never replaced because of a version number.
+  const skuLoad = await refLoadSafe('skus', DEFAULT_SKUS, SKUS_DATA_VERSION);
+  State.skus = skuLoad.list;
   SKU_MAP = {}; State.skus.forEach(s=>SKU_MAP[s.id]=s);
 
-  const accDoc = await refGet('accounts');
-  if(!accDoc || (accDoc.version||0) < ACCOUNTS_DATA_VERSION){ // '<' not '!==' — an older cached copy of the app must never overwrite newer live data
-    await refSet('accounts', DEFAULT_ACCOUNTS, ACCOUNTS_DATA_VERSION);
-    State.accounts = DEFAULT_ACCOUNTS;
-  } else {
-    State.accounts = accDoc.list;
+  const accLoad = await refLoadSafe('accounts', DEFAULT_ACCOUNTS, ACCOUNTS_DATA_VERSION);
+  State.accounts = accLoad.list;
+  // The ECOMM dark stores only ever come from the built-in list. If a stale copy of the app reset the
+  // account list before the backup existed, they'd be missing — put them back (only when there are
+  // none at all, so an intentional merge/removal of a single store is never undone).
+  if(!State.accounts.some(a=>a.medium==='ecomm')){
+    const ecommDefaults = DEFAULT_ACCOUNTS.filter(a=>a.medium==='ecomm');
+    if(ecommDefaults.length){ State.accounts = [...State.accounts, ...ecommDefaults]; await saveAccounts(); }
   }
   const dirDoc = await refGet('merchDirectory');
   State.merchDirectory = (dirDoc && dirDoc.list) ? dirDoc.list : {};
@@ -1753,7 +1781,8 @@ function attemptPasswordLogin(){
     State.loginRole=null; State.loginPassword=''; saveMe(); restoreDraftIfAny(); render();
   } else { State.loginError='Incorrect password.'; render(); }
 }
-async function saveSkus(){ await refSet('skus', State.skus, SKUS_DATA_VERSION); SKU_MAP={}; State.skus.forEach(s=>SKU_MAP[s.id]=s); }
+async function saveAccounts(){ await refSetSafe('accounts', State.accounts, ACCOUNTS_DATA_VERSION); }
+async function saveSkus(){ await refSetSafe('skus', State.skus, SKUS_DATA_VERSION); SKU_MAP={}; State.skus.forEach(s=>SKU_MAP[s.id]=s); }
 
 /* ============================= DRAFT PERSISTENCE (crash/network recovery) ============================= */
 function saveDraftLocal(){
@@ -4203,7 +4232,7 @@ async function applyRouteCycleUpload(){
       if(merchCode && merchName) directoryUpdates[merchCode] = { name: merchName, active };
       if(supCode && supName) directoryUpdates[supCode] = { name: supName, active: true };
     });
-    await refSet('accounts', State.accounts, ACCOUNTS_DATA_VERSION);
+    await saveAccounts();
     State.merchDirectory = { ...State.merchDirectory, ...directoryUpdates };
     await refSet('merchDirectory', State.merchDirectory, ACCOUNTS_DATA_VERSION);
     const preview = State.routeCyclePreview;
@@ -4318,7 +4347,7 @@ async function mergeAccountGroup(accountIds, keepId){
       }catch(e){ console.error(e); }
       State.accounts = State.accounts.filter(a=>a.id!==oldId);
     }
-    await refSet('accounts', State.accounts, ACCOUNTS_DATA_VERSION);
+    await saveAccounts();
     showToast('Merged ✓');
     render();
   }catch(e){
