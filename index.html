@@ -3700,6 +3700,15 @@ async function exportPpt(){
     const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
     const aggs = approved.map(v=>visitAggregate(v));
     const avg = f => aggs.length ? aggs.reduce((s,a)=>s+f(a),0)/aggs.length : 0;
+    // SUC/SOS/OSA/Price-matching/stock-coverage must match the Dashboard tab exactly — both are
+    // "current state" figures built from each branch's LATEST visit only, never blended across every
+    // historical visit. This mirrors dashOverview()'s computation precisely; avg()/aggs above stay in
+    // use only for genuine full-history compliance metrics (visits verified %, data completeness),
+    // the same split the Dashboard itself makes.
+    const latestVisitsForPpt = findLatestVisitPerBranch(approved);
+    const latestAggsForPpt = latestVisitsForPpt.map(v=>visitAggregate(v));
+    const avgLatest = f => latestAggsForPpt.length ? latestAggsForPpt.reduce((s,a)=>s+f(a),0)/latestAggsForPpt.length : 0;
+    const stockSummaryForPpt = computeNetworkStockSummary(approved);
     const customers = computeCustomerAnalysis(approved);
     const { catRows, skuRows } = computeCategoryAnalysis(approved);
     const custOpps = computeCustomerOpportunities(approved);
@@ -3730,16 +3739,17 @@ async function exportPpt(){
 // ---------- Executive Summary ----------
     try {
 
+    // Wins/risks stay at network level — no customer named here on purpose, since the branch-level
+    // breakdown lives in the Customer Analysis section further on.
     const sortedByScoreCust = [...customers].sort((a,b)=>b.avgSfr-a.avgSfr);
     const bestCust = sortedByScoreCust[0], worstCust = sortedByScoreCust[sortedByScoreCust.length-1];
-    const topOppCustomer = custOpps[0];
     const worstPriceSku = [...skuRows].filter(r=>r.priceN>0).sort((a,b)=>a.priceOkPct-b.priceOkPct)[0];
     let s2 = pptx.addSlide();
     s2.addText('Executive Summary', { x:0.5, y:0.35, w:12, h:0.55, fontSize:28, bold:true, color:DARK });
     s2.addText(`${new Date().toLocaleDateString('en-GB',{weekday:'long', year:'numeric', month:'long', day:'numeric'})}`, { x:0.5, y:0.9, w:12, h:0.35, fontSize:12, color:SOFT });
     const headline = [
-      ['SUC', fmt(avg(a=>a.avgSfr))+'%'], ['SOS', fmt(avg(a=>a.avgSos))+'%'],
-      ['OSA', fmt(avg(a=>a.osaPct))+'%'], ['Price OK', fmt(avg(a=>a.priceOkPct))+'%'],
+      ['SUC', fmt(avgLatest(a=>a.avgSfr))+'%'], ['SOS', fmt(avgLatest(a=>a.avgSos))+'%'],
+      ['OSA', fmt(avgLatest(a=>a.osaPct))+'%'], ['Price OK', fmt(avgLatest(a=>a.priceOkPct))+'%'],
     ];
     headline.forEach((h,i)=>{
       const x = 0.5 + i*3.1;
@@ -3749,16 +3759,16 @@ async function exportPpt(){
     s2.addShape('line', { x:0.5, y:2.75, w:12.3, h:0, line:{color:LINE, width:1} });
     s2.addText('Key wins', { x:0.5, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:GREEN });
     const wins = [];
-    if(bestCust) wins.push(`${bestCust.name} leads on shelf utilization at ${fmt(bestCust.avgSfr)}% SUC.`);
+    if(bestCust) wins.push(`Best-performing branch network-wide reaches ${fmt(bestCust.avgSfr)}% SUC — see Customer Analysis for which one.`);
     const bestSku = skuRows[0];
     if(bestSku) wins.push(`${bestSku.name} is the network's top seller at ${fmt(bestSku.avgVelPerStore,1)} units/store/day.`);
-    if(avg(a=>a.priceOkPct) >= 80) wins.push(`Price compliance is healthy across the network at ${fmt(avg(a=>a.priceOkPct))}%.`);
+    if(avgLatest(a=>a.priceOkPct) >= 80) wins.push(`Price compliance is healthy across the network at ${fmt(avgLatest(a=>a.priceOkPct))}%.`);
     if(wins.length<3) wins.push(`${approved.length} verified visits captured so far this cycle.`);
     s2.addText(wins.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:0.5, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
     s2.addText('Key risks', { x:6.9, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:RED });
     const risks = [];
-    if(worstCust && worstCust.name!==bestCust?.name) risks.push(`${worstCust.name} lags at ${fmt(worstCust.avgSfr)}% SUC — needs attention.`);
-    if(topOppCustomer) risks.push(`${topOppCustomer.name} has the most flagged branches — ${topOppCustomer.totalIssues} issue(s) across ${topOppCustomer.branches.length} branch(es).`);
+    if(worstCust && worstCust.name!==bestCust?.name) risks.push(`Weakest branch network-wide sits at ${fmt(worstCust.avgSfr)}% SUC — see Customer Analysis for which one.`);
+    if(oppSummary.totalIssues>0) risks.push(`${oppSummary.totalIssues} issue(s) flagged across ${oppSummary.branchCount} branch(es) network-wide — see Customer Analysis for branch-level detail.`);
     if(worstPriceSku) risks.push(`${worstPriceSku.name} has the weakest price compliance at ${fmt(worstPriceSku.priceOkPct)}%.`);
     if(risks.length<3) risks.push(`Monitor OOS trends as visit volume grows.`);
     s2.addText(risks.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:6.9, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
@@ -3775,7 +3785,7 @@ async function exportPpt(){
     try{
       s3.addChart(pptx.ChartType.bar, [{
         name:'Score', labels:['SUC','SOS','OSA','Price OK','Data Complete'],
-        values:[avg(a=>a.avgSfr), avg(a=>a.avgSos), avg(a=>a.osaPct), avg(a=>a.priceOkPct), avg(a=>a.visitDonePct)].map(v=>+v.toFixed(1)),
+        values:[avgLatest(a=>a.avgSfr), avgLatest(a=>a.avgSos), avgLatest(a=>a.osaPct), avgLatest(a=>a.priceOkPct), avg(a=>a.visitDonePct)].map(v=>+v.toFixed(1)),
       }], { x:0.5, y:1.05, w:6.6, h:3.3, barDir:'bar', chartColors:[RED], showValue:true, dataLabelColor:DARK, dataLabelFontSize:10, catAxisLabelFontSize:11, valAxisMaxVal:100, showLegend:false, title:'Network KPIs (%)', titleFontSize:12, titleColor:DARK });
     }catch(e){ console.error('bar chart failed', e); }
     try{
@@ -3784,7 +3794,7 @@ async function exportPpt(){
       }], { x:7.3, y:1.05, w:5.5, h:3.3, chartColors:[GREEN, RED], showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', title:'Price Compliance', titleFontSize:12, titleColor:DARK });
     }catch(e){ console.error('doughnut chart failed', e); }
     s3.addText([
-      {text:`Avg stock coverage: ${fmt(avg(a=>a.avgCoverage),1)} days`, options:{bullet:true, breakLine:true}},
+      {text:`Avg stock coverage: ${fmt(stockSummaryForPpt.avgCoverage,1)} days`, options:{bullet:true, breakLine:true}},
       {text:`Visits verified with photo + GPS: ${fmt(aggs.length?aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100:0)}%`, options:{bullet:true, breakLine:true}},
     ], { x:0.5, y:4.6, w:12.3, h:0.8, fontSize:11.5, color:SOFT });
     footer(s3, 'KPI Overview');
@@ -3812,37 +3822,6 @@ async function exportPpt(){
     footer(s3b, 'Category Mix');
 
         } catch(e) { console.error('Category Mix slide failed', e); }
-// ---------- Customer Analysis ----------
-    try {
-
-    const custHeader = ['Customer','Branches','SUC%','SOS%','Stock','Days Cover','Top Seller (vel/store/d)','Most OOS','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-    const sortedCustomers = [...customers].sort((a,b)=>b.branchCount-a.branchCount);
-    const CUST_PER_PAGE = 18;
-    const custPages = [];
-    for(let i=0; i<sortedCustomers.length; i+=CUST_PER_PAGE) custPages.push(sortedCustomers.slice(i, i+CUST_PER_PAGE));
-    if(custPages.length===0) custPages.push([]);
-    const totalStockAll = customers.reduce((s,c)=>s+c.totalStock,0);
-    custPages.forEach((page, pageIdx)=>{
-     try{
-      let s4 = pptx.addSlide();
-      s4.addText(custPages.length>1 ? `Customer Analysis (${pageIdx+1}/${custPages.length})` : 'Customer Analysis', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-      s4.addText(`${customers.length} customers network-wide · Top seller / Most OOS "vel" = avg units/day per store`, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10, italic:true, color:SOFT });
-      const custRows = [custHeader];
-      page.forEach((c,i)=>{
-       try{
-        const fillC = i%2?'F6F2EF':'FFFFFF';
-        custRows.push([c.name, String(c.branchCount), fmt(c.avgSfr), fmt(c.avgSos), fmt(c.totalStock), fmtCoverage(c.avgCoverageDays), `${c.topSkuName} (${fmt(c.topSkuVel,1)})`, c.oosSkuName, fmt(c.priceOkPct)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-       }catch(e){ console.error('Skipping customer row', c && c.name, e); }
-      });
-      if(pageIdx===custPages.length-1){
-        custRows.push(['GRAND TOTAL','','','',fmt(totalStockAll),'','','',''].map(v=>({text:String(v), options:{bold:true, fill:{color:'FBEAEA'}}})));
-      }
-      s4.addTable(custRows, { x:0.5, y:1.2, w:12.3, fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.38 });
-      footer(s4, 'Customer Analysis');
-     }catch(e){ console.error('Skipping Customer Analysis page', pageIdx, e); }
-    });
-
-        } catch(e) { console.error('Customer Analysis slide failed', e); }
 // ---------- Category / SKU performance ----------
     try {
 
@@ -3888,214 +3867,80 @@ async function exportPpt(){
     footer(s5b, 'Best & Worst Performers');
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
-// ---------- Opportunities — Top Line (by customer, the 5 main checks) ----------
+// ---------- Customer Analysis ----------
     try {
 
-    let s6 = pptx.addSlide();
-    s6.addText('Opportunities — Top Line', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-    s6.addText('Every check compares a branch to its own numbers — never to another branch or a network average.', { x:0.5, y:0.95, w:12, h:0.4, fontSize:12, color:SOFT, italic:true });
-    const oppStatCard = (x,y,w,h,label,value,color) => {
-      try{ s6.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
-      s6.addText(String(value), { x, y:y+0.18, w, h:0.75, fontSize:30, bold:true, color, align:'center' });
-      s6.addText(label, { x:x+0.1, y:y+h-0.5, w:w-0.2, h:0.4, fontSize:10, color:SOFT, align:'center' });
-    };
-    const oppPoints = [
-      ['Low stock\n(< 3 days cover)', oppSummary.counts.lowstock, RED],
-      ['Price ≠ RSP', oppSummary.counts.price, AMBER],
-      [`Low SOS\n(< ${OPP_LOW_SOS_PCT}%)`, oppSummary.counts.sos, AMBER],
-      [`Low SUC\n(< ${OPP_LOW_SUC_PCT}%)`, oppSummary.counts.sfr, AMBER],
-      ['Overstock\n(> 3 weeks cover)', oppSummary.counts.overstock, AMBER],
-    ];
-    const oppCardW = 2.34;
-    oppPoints.forEach((p,i)=>{ oppStatCard(0.5 + i*(oppCardW+0.11), 1.45, oppCardW, 1.55, p[0], p[1], p[2]); });
-    s6.addText(`${oppSummary.totalIssues} total issue(s) flagged across ${oppSummary.branchCount} branch(es)`, { x:0.5, y:3.2, w:12, h:0.4, fontSize:12.5, bold:true, color:DARK });
-    s6.addText('By customer', { x:0.5, y:3.75, w:12, h:0.35, fontSize:14, bold:true, color:DARK });
-    if(custOpps.length===0){
-      s6.addText('No branches are currently flagged — everything is within normal ranges.', { x:0.5, y:4.2, w:12, h:0.5, fontSize:13, color:SOFT });
-    } else {
-      const custHeader = ['Customer','Branches flagged','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-      const custTable = [custHeader];
-      custOpps.slice(0,10).forEach((c,i)=>{
-        const fillC = i%2?'F6F2EF':'FFFFFF';
-        custTable.push([c.name, String(c.branches.length), String(c.totalIssues)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-      });
-      s6.addTable(custTable, { x:0.5, y:4.15, w:12.3, colW:[7.3,2.5,2.5], fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
-      if(custOpps.length>10) s6.addText(`+ ${custOpps.length-10} more customer(s) — see the branch-level pages that follow.`, { x:0.5, y:4.15+10*0.3+0.15, w:12, h:0.3, fontSize:9.5, italic:true, color:SOFT });
-    }
-    footer(s6, 'Opportunities — Top Line');
-
-        } catch(e) { console.error('Opportunities Top Line slide failed', e); }
-// ---------- Pricing vs RSP ----------
-    try {
-
-    let s7 = pptx.addSlide();
-    s7.addText('Priced Above RSP', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-    s7.addText('Overpricing can be why a SKU isn\'t selling — this list is every SKU checked, not just top sellers.', { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
-    const aboveCount = skuRows.reduce((s,r)=>s+r.priceAbove,0);
-    const notAboveCount = skuRows.reduce((s,r)=>s+(r.priceN-r.priceAbove),0);
-    const aboveIssues = skuRows.filter(r=>r.aboveRspPct > 0 && r.priceN > 0).sort((a,b)=>b.aboveRspPct-a.aboveRspPct);
-    try{
-      s7.addChart(pptx.ChartType.doughnut, [{
-        name:'Price status', labels:['Priced Above RSP','At or Below RSP'], values:[aboveCount, Math.max(0,notAboveCount)],
-      }], { x:0.5, y:1.3, w:5.5, h:3.8, chartColors:[RED, GREEN], showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', title:'Network — Checks Priced Above RSP', titleFontSize:12, titleColor:DARK });
-    }catch(e){ console.error('price doughnut failed', e); }
-    if(aboveIssues.length===0){
-      s7.addText('No SKUs are being priced above RSP right now.', { x:6.3, y:1.5, w:6.5, h:0.5, fontSize:13, color:SOFT });
-    } else {
-      const priceHeader = ['SKU','Category','% checks above RSP','Vel/store/d'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-      const priceTable = [priceHeader];
-      aboveIssues.slice(0,12).forEach((r,i)=>{
-        const fillC = i%2?'F6F2EF':'FFFFFF';
-        priceTable.push([r.name, r.category, fmt(r.aboveRspPct)+'%', r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-      });
-      s7.addTable(priceTable, { x:6.3, y:1.3, w:6.5, fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.36 });
-    }
-    footer(s7, 'Priced Above RSP');
-
-        } catch(e) { console.error('Pricing vs RSP slide failed', e); }
-// ---------- Branches Needing Attention (every flagged branch, as a table — same columns as the app) ----------
-    try {
-
-    // A real network can flag hundreds of branches with thousands of rows between them — more than
-    // any deck should try to paginate through. Capped to the worst branches by issue count, each
-    // shown as a proper table (highest-risk rows first, same columns the in-app Opportunities tab
-    // uses); the complete, unlimited, always-current list stays one tap away in the app itself.
-    const PPT_BRANCHES_CAP = 40;
-    const PPT_ROWS_PER_BRANCH = 12;
-    const flatBranches = [];
-    custOpps.forEach(c=>{ c.branches.forEach(b=>{
-      const count = b.skuRows.length + (b.sosLow?1:0) + (b.sfrLow?1:0);
-      flatBranches.push({ customer:c.name, branch:b.branch, sfr:b.sfr, sos:b.sos, sosLow:b.sosLow, sfrLow:b.sfrLow, skuRows:b.skuRows, count });
-    }); });
-    flatBranches.sort((a,b)=>b.count-a.count);
-    const branchesForPpt = flatBranches.slice(0, PPT_BRANCHES_CAP);
-
-    if(branchesForPpt.length===0){
-      let s6b = pptx.addSlide();
-      s6b.addText('Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-      s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
-      footer(s6b, 'Branches Needing Attention');
-    } else {
-      branchesForPpt.forEach((bb, idx) => {
-       try{
-        let s6b = pptx.addSlide();
-        s6b.addText(`${bb.customer} — ${bb.branch}`, { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
-        const flagBits = [];
-        if(bb.sosLow) flagBits.push(`⚠ SOS ${fmt(bb.sos)}% (below ${OPP_LOW_SOS_PCT}%)`);
-        if(bb.sfrLow) flagBits.push(`⚠ SUC ${fmt(bb.sfr)}% (below ${OPP_LOW_SUC_PCT}%)`);
-        s6b.addText(`SUC ${fmt(bb.sfr)}% · SOS ${fmt(bb.sos)}%${flagBits.length?'  ·  '+flagBits.join('  ·  '):''}  ·  branch ${idx+1}/${branchesForPpt.length} (worst by issue count)`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:10.5, italic:true, color:SOFT });
-        const rowsForSlide = bb.skuRows.slice(0, PPT_ROWS_PER_BRANCH);
-        const attHeader = ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk','Note'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-        const attRows = [attHeader];
-        const riskColorOf = r => r==='High'?RED:(r==='Medium'?AMBER:(r==='Low'?GREEN:DARK));
-        rowsForSlide.forEach((r,ri)=>{
-          const fillC = ri%2?'F6F2EF':'FFFFFF';
-          attRows.push([
-            r.sku, r.vel!=null?fmt(r.vel,1):'—', r.stock!=null?fmt(r.stock):'—',
-            r.coverageDays!=null?(isFinite(r.coverageDays)?fmt(r.coverageDays,1):'∞'):'—',
-            r.price!=null?fmt(r.price):'—', r.rsp!=null?fmt(r.rsp):'—',
-            r.stockStatus||'—', r.stockRisk||'—', r.priceVsRsp||'—', r.priceRisk||'—', r.note||'—',
-          ].map((v,ci)=>({text:String(v), options:{fill:{color:fillC}, color: ci===7?riskColorOf(r.stockRisk):(ci===9?riskColorOf(r.priceRisk):DARK), bold: ci===7||ci===9}})));
-        });
-        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.2,0.8,0.8,1.0,0.8,0.8,1.4,1.0,1.3,1.0,1.2], fontSize:8.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
-        if(bb.skuRows.length>PPT_ROWS_PER_BRANCH){
-          s6b.addText(`+ ${bb.skuRows.length-PPT_ROWS_PER_BRANCH} more SKU(s) for this branch — see the live Opportunities tab for the full list.`, { x:0.5, y:1.35+(rowsForSlide.length+1)*0.3+0.1, w:12, h:0.3, fontSize:9, italic:true, color:SOFT });
-        }
-        footer(s6b, 'Branches Needing Attention');
-       }catch(e){ console.error('Skipping branch attention slide', bb.branch, e); }
-      });
-      if(flatBranches.length>PPT_BRANCHES_CAP){
-        let s6c = pptx.addSlide();
-        s6c.addText('Branches Needing Attention — more branches', { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
-        s6c.addText(`${flatBranches.length-PPT_BRANCHES_CAP} more flagged branch(es) beyond the top ${PPT_BRANCHES_CAP} shown here — see the live Opportunities tab in the app for the complete, always-current list.`, { x:0.5, y:1.3, w:12, h:1, fontSize:13, color:SOFT });
-        footer(s6c, 'Branches Needing Attention');
-      }
-    }
-
-        } catch(e) { console.error('Branches Needing Attention slide failed', e); }
-// ---------- Per-account insights & recommendations (top 8 by visit volume) ----------
-    try {
-
-    function generateAccountInsights(c, custOpps){
-      const out = [];
-      if(c.avgSfr < 70) out.push(`Shelf utilization is low at ${fmt(c.avgSfr)}% — recommend a facing audit vs the planogram to close the gap.`);
-      else if(c.avgSfr >= 90) out.push(`Shelf utilization is strong at ${fmt(c.avgSfr)}% — maintain the current replenishment cadence.`);
-      else out.push(`Shelf utilization is moderate at ${fmt(c.avgSfr)}% — room to tighten replenishment consistency.`);
-      if(c.avgSos < 20) out.push(`Share of shelf is only ${fmt(c.avgSos)}% — worth negotiating additional facings with the category buyer.`);
-      else out.push(`Share of shelf holds at ${fmt(c.avgSos)}% — monitor competitor activity to defend this position.`);
-      if(c.topSkuName!=='—') out.push(`${c.topSkuName} is the strongest seller here at ${fmt(c.topSkuVel,1)} units/store/day — consider expanding its facing allocation.`);
-      if(c.oosSkuName!=='—' && c.oosCount>0) out.push(`${c.oosSkuName} went out of stock in ${c.oosCount} visit(s) — flag to supply chain for replenishment priority.`);
-      if(c.priceOkPct < 80) out.push(`Price compliance is only ${fmt(c.priceOkPct)}% vs RSP — audit shelf tags and correct mismatches with store management.`);
-      else out.push(`Price compliance is healthy at ${fmt(c.priceOkPct)}% vs RSP.`);
-      const myCustOpp = custOpps.find(co=>co.name===c.name);
-      if(myCustOpp && myCustOpp.branches.length){
-        const topBranch = [...myCustOpp.branches].sort((a,b)=>(b.skuRows.length+(b.sosLow?1:0)+(b.sfrLow?1:0))-(a.skuRows.length+(a.sosLow?1:0)+(a.sfrLow?1:0)))[0];
-        const topSkuRow = topBranch && topBranch.skuRows[0]; // already sorted High stock risk first
-        if(topSkuRow) out.push(`${topBranch.branch} (${topSkuRow.stockRisk||topSkuRow.priceRisk} risk): ${topSkuRow.sku} — ${topSkuRow.note}.`);
-        else if(topBranch && topBranch.sosLow) out.push(`${topBranch.branch}: SOS ${fmt(topBranch.sos)}% — below ${OPP_LOW_SOS_PCT}%.`);
-        else if(topBranch && topBranch.sfrLow) out.push(`${topBranch.branch}: SUC ${fmt(topBranch.sfr)}% — below ${OPP_LOW_SUC_PCT}%.`);
-      }
-      return out.slice(0,6);
-    }
-    const topAccountsForInsights = [...customers].sort((a,b)=>b.branchCount-a.branchCount).slice(0,25);
-    topAccountsForInsights.forEach(c=>{
+    const custHeader = ['Customer','Branches','SUC%','SOS%','Stock','Days Cover','Top Seller (vel/store/d)','Most OOS','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+    const sortedCustomers = [...customers].sort((a,b)=>b.branchCount-a.branchCount);
+    const CUST_PER_PAGE = 18;
+    const custPages = [];
+    for(let i=0; i<sortedCustomers.length; i+=CUST_PER_PAGE) custPages.push(sortedCustomers.slice(i, i+CUST_PER_PAGE));
+    if(custPages.length===0) custPages.push([]);
+    const totalStockAll = customers.reduce((s,c)=>s+c.totalStock,0);
+    custPages.forEach((page, pageIdx)=>{
      try{
-      const insights = generateAccountInsights(c, custOpps);
-      let sa = pptx.addSlide();
-      sa.addText(c.name, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
-      sa.addText(`${c.branchCount} branch(es) · SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}% — Insights & Recommendations`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:12, color:SOFT });
-      let y = 1.3;
-      insights.forEach((ins,idx)=>{
-        s_num_bg(sa, 0.5, y, 12.3, 0.5);
-        sa.addText(String(idx+1), { x:0.65, y:y+0.04, w:0.4, h:0.42, fontSize:13, bold:true, color:RED, valign:'middle' });
-        sa.addText(ins, { x:1.15, y:y+0.04, w:11.4, h:0.42, fontSize:10.5, color:DARK, valign:'middle' });
-        y += 0.56;
+      let s4 = pptx.addSlide();
+      s4.addText(custPages.length>1 ? `Customer Analysis (${pageIdx+1}/${custPages.length})` : 'Customer Analysis', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+      s4.addText(`${customers.length} customers network-wide · Top seller / Most OOS "vel" = avg units/day per store`, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10, italic:true, color:SOFT });
+      const custRows = [custHeader];
+      page.forEach((c,i)=>{
+       try{
+        const fillC = i%2?'F6F2EF':'FFFFFF';
+        custRows.push([c.name, String(c.branchCount), fmt(c.avgSfr), fmt(c.avgSos), fmt(c.totalStock), fmtCoverage(c.avgCoverageDays), `${c.topSkuName} (${fmt(c.topSkuVel,1)})`, c.oosSkuName, fmt(c.priceOkPct)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+       }catch(e){ console.error('Skipping customer row', c && c.name, e); }
       });
-      // Priced above RSP at THIS customer — fixed position (safe below the worst case of 6 insights above).
-      // Matching/Below rows are deliberately excluded — the only actionable pricing issue here is overpricing.
-      const aboveHere = c.skuList
-        .filter(s=>s.rsp>0 && s.actualPrice>0 && ((s.actualPrice-s.rsp)/s.rsp)*100 > 4)
-        .map(s=>({...s, diffPct: ((s.actualPrice-s.rsp)/s.rsp)*100}))
-        .sort((a,b)=>b.diffPct-a.diffPct).slice(0,4);
-      const ty = 4.9;
-      sa.addText('Priced Above RSP — Act Now', { x:0.5, y:ty, w:12.3, h:0.32, fontSize:13, bold:true, color:RED });
-      if(aboveHere.length){
-        const sellerHeader = ['SKU','Actual Price','RSP','% Above','Vel/store/d'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-        const sellerRows = [sellerHeader];
-        aboveHere.forEach((s,i)=>{
-          const fillC = i%2?'F6F2EF':'FFFFFF';
-          sellerRows.push([s.name, fmt(s.actualPrice)+' EGP', fmt(s.rsp)+' EGP', '+'+fmt(s.diffPct)+'%', s.avgVel>0?fmt(s.avgVel,1):'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-        });
-        sa.addTable(sellerRows, { x:0.5, y:ty+0.35, w:12.3, fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.32 });
-      } else {
-        sa.addText('No SKUs priced above RSP at this customer right now.', { x:0.5, y:ty+0.35, w:12.3, h:0.4, fontSize:11, italic:true, color:SOFT });
+      if(pageIdx===custPages.length-1){
+        custRows.push(['GRAND TOTAL','','','',fmt(totalStockAll),'','','',''].map(v=>({text:String(v), options:{bold:true, fill:{color:'FBEAEA'}}})));
       }
-      footer(sa, c.name);
-     }catch(e){ console.error('Skipping per-account slide for', c && c.name, e); }
+      s4.addTable(custRows, { x:0.5, y:1.2, w:12.3, fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.38 });
+      footer(s4, 'Customer Analysis');
+     }catch(e){ console.error('Skipping Customer Analysis page', pageIdx, e); }
     });
-    function s_num_bg(slide, x, y, w, h){
-      try{ slide.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
-    }
 
-        } catch(e) { console.error('Per-account insights & recommendations (top 8 by visit volume) slide failed', e); }
-// ---------- Photo appendix ----------
-    try {
-
-    const allPhotos = [];
-    approved.forEach(v=>visitPhotos(v).forEach(p=>allPhotos.push({photo:p, caption:`${v.accountName} · ${v.branch} · ${v.date}`})));
-    for(let i=0; i<allPhotos.length && i<12; i+=4){
-      const batch = allPhotos.slice(i, i+4);
-      let sp = pptx.addSlide();
-      sp.addText(i===0 ? 'Visit Verification Photos' : 'Visit Verification Photos (cont.)', { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
-      batch.forEach((p,idx)=>{
-        const x = 0.5 + idx*3.1;
-        try{ sp.addImage({ data: p.photo, x, y:1.1, w:2.9, h:2.9, sizing:{type:'cover', w:2.9, h:2.9} }); }catch(e){}
-        sp.addText(p.caption, { x, y:4.05, w:2.9, h:0.6, fontSize:9, color:SOFT });
+    // Each customer with more than 2 branches then gets its own branch-level detail slide(s),
+    // paginated so a large chain doesn't overflow one table. SUC/SOS/OSA/Price OK% here are each
+    // branch's own latest visit, same as everywhere else in the app. A customer with only 1-2
+    // branches is skipped here — a dedicated slide adds little over what the overview table above
+    // already shows for it — which is also what keeps this deck in the 40-50 slide range rather than
+    // ballooning to one slide per customer regardless of size, as it would with dozens of customers
+    // that only have a branch or two each.
+    const BRANCHES_PER_SLIDE = 20;
+    const CUST_DETAIL_MIN_BRANCHES = 3;
+    const branchHeader = ['Branch','SUC%','SOS%','OSA%','Price OK%','Visits','Last Visit'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+    const detailedCustomers = sortedCustomers.filter(c=>c.branchCount >= CUST_DETAIL_MIN_BRANCHES);
+    const smallCustomers = sortedCustomers.filter(c=>c.branchCount < CUST_DETAIL_MIN_BRANCHES);
+    detailedCustomers.forEach(c=>{
+     try{
+      const sortedBranches = [...c.branches].sort((a,b)=>a.branch.localeCompare(b.branch));
+      const branchPages = [];
+      for(let i=0; i<sortedBranches.length; i+=BRANCHES_PER_SLIDE) branchPages.push(sortedBranches.slice(i, i+BRANCHES_PER_SLIDE));
+      branchPages.forEach((page, pageIdx)=>{
+       try{
+        let sc = pptx.addSlide();
+        sc.addText(branchPages.length>1 ? `${c.name} (${pageIdx+1}/${branchPages.length})` : c.name, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
+        sc.addText(`${c.branchCount} branch(es) · network rollup: SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}%`, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10.5, italic:true, color:SOFT });
+        const branchRows = [branchHeader];
+        page.forEach((b,i)=>{
+          const fillC = i%2?'F6F2EF':'FFFFFF';
+          branchRows.push([b.branch, fmt(b.sfr), fmt(b.sos), fmt(b.osaPct), fmt(b.priceOkPct), String(b.visits), b.lastVisitDate||'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+        });
+        sc.addTable(branchRows, { x:0.5, y:1.3, w:12.3, fontSize:10, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.34 });
+        footer(sc, c.name);
+       }catch(e){ console.error('Skipping branch page for', c.name, pageIdx, e); }
       });
-      footer(sp, 'Appendix');
+     }catch(e){ console.error('Skipping customer branch detail', c && c.name, e); }
+    });
+    if(smallCustomers.length>0){
+     try{
+      let scN = pptx.addSlide();
+      scN.addText('Smaller Customers', { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
+      scN.addText(`${smallCustomers.length} customer(s) with only 1-2 branches each — fully covered in the overview table above; listed here for completeness.`, { x:0.5, y:0.85, w:12, h:0.4, fontSize:10.5, italic:true, color:SOFT });
+      scN.addText(smallCustomers.map(c=>`${c.name} (${c.branchCount})`).join('   ·   '), { x:0.5, y:1.4, w:12.3, h:5.5, fontSize:10, color:DARK, valign:'top' });
+      footer(scN, 'Smaller Customers');
+     }catch(e){ console.error('Smaller Customers slide failed', e); }
     }
 
-        } catch(e) { console.error('Photo appendix slide failed', e); }
+        } catch(e) { console.error('Customer Analysis slide failed', e); }
 // ---------- ECOMM (separate section — only added when there's ECOMM data to show) ----------
     try {
       const ecomm = computeEcommAnalysis();
