@@ -2663,10 +2663,17 @@ function screenNewVisit(){
         const filledTotal = d.items.reduce((s,it)=>s+(parseFloat(it.actualCapacity)||0),0);
         const spaceTotal = parseFloat(d.shahdSpaceTotal) || 0;
         const fillPct = spaceTotal>0 ? Math.min(150,(filledTotal/spaceTotal*100)) : 0;
+        const exceedsSpace = spaceTotal>0 && filledTotal>spaceTotal;
         return `<div class="verify-row" style="margin-top:10px">
           ${statusChip('neutral', `Filled so far / تم تعبئته: ${fmt(filledTotal)}`)}
           ${spaceTotal>0 ? statusChip(fillPct>=80?'on':'watch', `Total utilization / إجمالي التعبئة: ${fmt(fillPct)}%`) : statusChip('neutral','Enter dedicated space total to see utilization')}
-        </div>`;
+        </div>
+        ${exceedsSpace ? `
+        <p class="hint" style="color:var(--red);font-weight:700;margin:8px 0">⚠️ Actual space filled (${fmt(filledTotal)}) can't exceed the dedicated Shahd space (${fmt(spaceTotal)}) — recheck your counts, or confirm below if Shahd genuinely has extra display space beyond the main shelf.</p>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" ${d.extraDisplay?'checked':''} onchange="setExtraDisplay(this.checked)"/>
+          <span>We have extra display beyond the category shelf / لدينا عرض إضافي خارج رف الفئة</span>
+        </label>` : ''}`;
       })()}
     </div>
 
@@ -2782,6 +2789,7 @@ function approvalCardHtml(v){
   const shahdFacingsSum = countedItems.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
   const actualSpaceFilled = countedItems.reduce((s,it)=>s+(parseFloat(it.actualCapacity)||0),0);
   const exceedsCategory = agg.catFacingsTotal>0 && shahdFacingsSum>agg.catFacingsTotal;
+  const exceedsDedicatedSpace = agg.shahdSpaceTotal>0 && actualSpaceFilled>agg.shahdSpaceTotal;
   return `<div class="card">
     <div class="visit-row" style="border:none;padding:0 0 8px;">
       <div><div class="visit-main">${v.accountName} · ${v.branch}</div><div class="visit-sub">${v.date} · submitted by ${v.auditor}</div></div>
@@ -2796,9 +2804,10 @@ function approvalCardHtml(v){
       ${statusChip('neutral', `Category facings: ${fmt(agg.catFacingsTotal)}`)}
       ${statusChip(exceedsCategory?'off':'neutral', `Shahd facings: ${fmt(shahdFacingsSum)}`)}
       ${statusChip('neutral', `Dedicated Shahd space: ${fmt(agg.shahdSpaceTotal)}`)}
-      ${statusChip('neutral', `Actual space filled: ${fmt(actualSpaceFilled)}`)}
+      ${statusChip(exceedsDedicatedSpace?'off':'neutral', `Actual space filled: ${fmt(actualSpaceFilled)}`)}
       ${exceedsCategory && !v.extraDisplay ? statusChip('off','⚠️ Shahd facings exceed category — check before approving') : ''}
-      ${v.extraDisplay ? statusChip('watch','Extra display beyond category shelf confirmed') : ''}
+      ${exceedsDedicatedSpace && !v.extraDisplay ? statusChip('off','⚠️ Actual space filled exceeds dedicated Shahd space — check before approving') : ''}
+      ${(exceedsCategory || exceedsDedicatedSpace) && v.extraDisplay ? statusChip('watch','Extra display beyond category shelf confirmed') : ''}
     </div>
     ${visitPhotos(v).length ? `<div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:8px">${visitPhotos(v).map(p=>`<img src="${p}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;flex-shrink:0;cursor:pointer" onclick="window.open('${p}')"/>`).join('')}</div>` : ''}
     ${v.geo ? `<p class="hint">📍 ${v.geo.lat}, ${v.geo.lng} (±${v.geo.accuracy}m) · ${v.capturedAt?new Date(v.capturedAt).toLocaleString():''}</p>` : ''}
@@ -3543,77 +3552,49 @@ function dashCategories(approved){
    resolution as computeCustomerAnalysis — canonical customer name + code-based branch key — so two
    duplicate accounts for the same physical branch are one entry here too, not two competing ones
    (which could otherwise flag a branch as "underperforming" against its own duplicate record). */
-function computeOpportunities(approved){
-  const bySku = {};
-  const accountsById = {};
-  State.accounts.forEach(a=>{ accountsById[a.id] = a; });
-  const sorted = [...approved].sort((a,b)=>(a.submittedAt||0)-(b.submittedAt||0)); // oldest→newest, so the latest-only tracking below stays correct
-  sorted.forEach(v=>{
-    const agg = visitAggregate(v);
-    const custName = canonicalCustomerName(v.accountName);
-    const acct = accountsById[v.accountId];
-    const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
-    const groupKey = custName+'||'+branchKey; // stable join key — same identity as computeCustomerAnalysis's branch buckets
-    agg.items.forEach(it=>{
-      const sku = SKU_MAP[it.skuId]; if(!sku) return;
-      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, byAccount:{} };
-      bySku[sku.id].byAccount[groupKey] = bySku[sku.id].byAccount[groupKey] || { velSum:0, velN:0, isOos:false, visits:0, label:'' };
-      const a = bySku[sku.id].byAccount[groupKey];
-      a.visits++;
-      a.label = custName+' · '+v.branch; // overwritten each pass — ends on the latest visit's branch text, matching the label computeCustomerAnalysis shows for this same branch
-      a.isOos = it.calc.osa==='N'; // overwritten each pass — reflects only the latest visit's stock check, not a historical rate across every visit
-      if(it.calc.velocity>0){ a.velSum += it.calc.velocity; a.velN++; } // velocity stays a genuine trend across visits (and across a merged duplicate account's own history), not a "latest" snapshot
-    });
-  });
-  const opportunities = [];
-  Object.values(bySku).forEach(sku=>{
-    const accounts = Object.values(sku.byAccount).map(a=>({acc:a.label, vel: a.velN?a.velSum/a.velN:0, isOos:a.isOos}));
-    const selling = accounts.filter(a=>a.vel>0);
-    if(selling.length < 2) return;
-    const best = selling.reduce((m,a)=>a.vel>m.vel?a:m, selling[0]);
-    accounts.forEach(a=>{
-      if(a.acc===best.acc) return;
-      if(best.vel<=0) return;
-      if(a.vel > 0 && a.vel < best.vel*0.5){
-        opportunities.push({ type:'underperform', sku: sku.name, category: sku.category, branch: a.acc, velocity: a.vel, benchmark: best.vel, benchmarkBranch: best.acc, gap: best.vel - a.vel });
-      } else if(a.isOos && best.vel >= 1){
-        // OOS trigger is the LATEST visit's stock check only, not "OOS in at least half of past visits" —
-        // an old stockout that a later visit already resolved no longer flags this as an opportunity.
-        opportunities.push({ type:'oos', sku: sku.name, category: sku.category, branch: a.acc, velocity: 0, benchmark: best.vel, benchmarkBranch: best.acc, gap: best.vel });
-      }
-    });
-  });
-  return opportunities.sort((a,b)=>b.gap-a.gap);
-}
+/* ============================= OPPORTUNITIES (branch vs itself, kept deliberately simple) =============================
+   Every check compares a branch's own numbers against a fixed bar — never against another branch or
+   a network average, and never a cross-branch "best performer" comparison. Five checks only:
+   1. Low stock vs this branch's own sales — under 3 days of cover, using this branch's own velocity.
+   2. Price not matching RSP.
+   3. Low shelf share — SOS under 20%.
+   4. Low shelf utilization — SUC under 70%.
+   5. Overstock vs this branch's own sales — over 3 weeks (21 days) of cover. */
+const OPP_LOW_STOCK_DAYS = 3;
+const OPP_OVERSTOCK_DAYS = 21; // 3 weeks
+const OPP_LOW_SOS_PCT = 20;
+const OPP_LOW_SUC_PCT = 70;
 function computeCustomerOpportunities(approved){
   const customers = computeCustomerAnalysis(approved);
-  const netOpps = computeOpportunities(approved);
   return customers.map(c=>{
     const branches = c.branches.map(b=>{
       const issues = [];
-      if(b.sos < 15) issues.push({type:'sos', text:`Low share of shelf — only ${fmt(b.sos)}% SOS. Worth negotiating more facings with the category buyer.`});
-      if(b.sfr < 70) issues.push({type:'sfr', text:`Low shelf utilization — only ${fmt(b.sfr)}% SUC. Facing or replenishment gap.`});
-      if(b.priceOkPct < 70) issues.push({type:'price', text:`Price compliance only ${fmt(b.priceOkPct)}% — audit shelf tags vs RSP.`});
+      if(b.sos < OPP_LOW_SOS_PCT) issues.push({type:'sos', text:`Low shelf share — only ${fmt(b.sos)}% SOS (below ${OPP_LOW_SOS_PCT}%). Worth negotiating more facings with the category buyer.`});
+      if(b.sfr < OPP_LOW_SUC_PCT) issues.push({type:'sfr', text:`Low shelf utilization — only ${fmt(b.sfr)}% SUC (below ${OPP_LOW_SUC_PCT}%). Facing or replenishment gap.`});
       b.skuList.forEach(s=>{
-        if(isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<3) issues.push({type:'lowstock', text:`${s.name} is critically low — ${fmt(s.coverageDays,1)} days of stock left (${fmt(s.stock)} units). Restock urgently.`});
-        if(isFinite(s.coverageDays) && s.coverageDays>45) issues.push({type:'overstock', text:`${s.name} looks overstocked — ${fmt(s.coverageDays,1)} days of cover (${fmt(s.stock)} units). Consider pausing the next delivery or redistributing.`});
-      });
-      const key = c.name+' · '+b.branch;
-      netOpps.filter(o=>o.branch===key).forEach(o=>{
-        issues.push({type: o.type==='oos'?'oos':'underperform', text: `${o.sku} sells ${fmt(o.velocity,1)}/d here vs ${fmt(o.benchmark,1)}/d at ${o.benchmarkBranch} — potential to recover ~${fmt(o.gap,1)} units/day.`});
+        if(s.priceStatus && s.priceStatus!=='neutral' && s.priceStatus!=='on') issues.push({type:'price', text:`${s.name} priced at ${fmt(s.actualPrice)} EGP vs RSP ${fmt(s.rsp)} EGP — ${s.priceStatus==='watch'?'above':'below'} RSP.`});
+        if(s.stock===0 || (isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<OPP_LOW_STOCK_DAYS)) issues.push({type:'lowstock', text:`${s.name} is low vs this branch's own sales — ${s.stock===0?'out of stock':fmt(s.coverageDays,1)+' days of cover left'} (${fmt(s.stock)} units). Restock urgently.`});
+        if(isFinite(s.coverageDays) && s.coverageDays>OPP_OVERSTOCK_DAYS) issues.push({type:'overstock', text:`${s.name} looks overstocked vs this branch's own sales — ${fmt(s.coverageDays,1)} days of cover (${fmt(s.stock)} units). Consider pausing the next delivery or redistributing.`});
       });
       return { branch:b.branch, sfr:b.sfr, sos:b.sos, issues };
     }).filter(b=>b.issues.length>0);
     return { name:c.name, branches, totalIssues: branches.reduce((s,b)=>s+b.issues.length,0) };
   }).filter(c=>c.branches.length>0).sort((a,b)=>b.totalIssues-a.totalIssues);
 }
+// Network-wide counts of each of the 5 checks — the "top line" view before drilling into branches.
+function summarizeOpportunities(custOpps){
+  const counts = { lowstock:0, price:0, sos:0, sfr:0, overstock:0 };
+  let branchCount = 0;
+  custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchCount++; b.issues.forEach(i=>{ if(counts[i.type]!=null) counts[i.type]++; }); }); });
+  return { counts, branchCount, totalIssues: custOpps.reduce((s,c)=>s+c.totalIssues,0) };
+}
 function issueIcon(type){
-  return {lowstock:'🔴', overstock:'🟡', oos:'🔴', underperform:'🟠', sos:'🟠', sfr:'🟡', price:'🟠', data:'⚠️'}[type] || '•';
+  return {lowstock:'🔴', overstock:'🟡', sos:'🟠', sfr:'🟡', price:'🟠', data:'⚠️'}[type] || '•';
 }
 function dashOpportunities(approved){
   const rows = computeCustomerOpportunities(approved);
   if(rows.length===0) return emptyState('💡','No clear opportunities yet','Needs more approved visits to compare across branches.');
-  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch — low/high stock, weak SOS or SUC, cross-branch underperformance.</p>
+  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch — each one compared against its own numbers: low or high stock, price vs RSP, low SOS, low SUC.</p>
   ${rows.map(r=>{
     const open = State.expandedCategory === 'opp:'+r.name;
     return `<div class="card">
@@ -3669,7 +3650,8 @@ async function exportPpt(){
     const avg = f => aggs.length ? aggs.reduce((s,a)=>s+f(a),0)/aggs.length : 0;
     const customers = computeCustomerAnalysis(approved);
     const { catRows, skuRows } = computeCategoryAnalysis(approved);
-    const opps = computeOpportunities(approved);
+    const custOpps = computeCustomerOpportunities(approved);
+    const oppSummary = summarizeOpportunities(custOpps);
     const RED = 'C0272D', DARK = '201B1A', SOFT = '6B615E', LINE = 'E9E1DD', GREEN='1E7145', AMBER='B8860B';
     const CHART_COLORS = ['C0272D','8E1116','B8860B','1E7145','6B615E','D9A5A8','4A7C63','E0C46C'];
 
@@ -3698,7 +3680,7 @@ async function exportPpt(){
 
     const sortedByScoreCust = [...customers].sort((a,b)=>b.avgSfr-a.avgSfr);
     const bestCust = sortedByScoreCust[0], worstCust = sortedByScoreCust[sortedByScoreCust.length-1];
-    const topOpp = opps[0];
+    const topOppCustomer = custOpps[0];
     const worstPriceSku = [...skuRows].filter(r=>r.priceN>0).sort((a,b)=>a.priceOkPct-b.priceOkPct)[0];
     let s2 = pptx.addSlide();
     s2.addText('Executive Summary', { x:0.5, y:0.35, w:12, h:0.55, fontSize:28, bold:true, color:DARK });
@@ -3724,7 +3706,7 @@ async function exportPpt(){
     s2.addText('Key risks', { x:6.9, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:RED });
     const risks = [];
     if(worstCust && worstCust.name!==bestCust?.name) risks.push(`${worstCust.name} lags at ${fmt(worstCust.avgSfr)}% SUC — needs attention.`);
-    if(topOpp) risks.push(`${topOpp.sku} underperforms at ${topOpp.branch} vs ${topOpp.benchmarkBranch} — ~${fmt(topOpp.gap,1)} units/day recoverable.`);
+    if(topOppCustomer) risks.push(`${topOppCustomer.name} has the most flagged branches — ${topOppCustomer.totalIssues} issue(s) across ${topOppCustomer.branches.length} branch(es).`);
     if(worstPriceSku) risks.push(`${worstPriceSku.name} has the weakest price compliance at ${fmt(worstPriceSku.priceOkPct)}%.`);
     if(risks.length<3) risks.push(`Monitor OOS trends as visit volume grows.`);
     s2.addText(risks.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:6.9, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
@@ -3854,59 +3836,43 @@ async function exportPpt(){
     footer(s5b, 'Best & Worst Performers');
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
-// ---------- Opportunities & Threats ----------
+// ---------- Opportunities — Top Line (by customer, the 5 main checks) ----------
     try {
 
     let s6 = pptx.addSlide();
-    s6.addText('Opportunities & Threats', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-    s6.addText('Same SKU performing very differently across branches — distribution, facing, or OOS gaps.', { x:0.5, y:0.95, w:12, h:0.4, fontSize:12, color:SOFT, italic:true });
-    if(opps.length===0){
-      s6.addText('Not enough cross-branch data yet to identify opportunities.', { x:0.5, y:1.6, w:12, h:0.5, fontSize:13, color:SOFT });
+    s6.addText('Opportunities — Top Line', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+    s6.addText('Every check compares a branch to its own numbers — never to another branch or a network average.', { x:0.5, y:0.95, w:12, h:0.4, fontSize:12, color:SOFT, italic:true });
+    const oppStatCard = (x,y,w,h,label,value,color) => {
+      try{ s6.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
+      s6.addText(String(value), { x, y:y+0.18, w, h:0.75, fontSize:30, bold:true, color, align:'center' });
+      s6.addText(label, { x:x+0.1, y:y+h-0.5, w:w-0.2, h:0.4, fontSize:10, color:SOFT, align:'center' });
+    };
+    const oppPoints = [
+      ['Low stock\n(< 3 days cover)', oppSummary.counts.lowstock, RED],
+      ['Price ≠ RSP', oppSummary.counts.price, AMBER],
+      [`Low SOS\n(< ${OPP_LOW_SOS_PCT}%)`, oppSummary.counts.sos, AMBER],
+      [`Low SUC\n(< ${OPP_LOW_SUC_PCT}%)`, oppSummary.counts.sfr, AMBER],
+      ['Overstock\n(> 3 weeks cover)', oppSummary.counts.overstock, AMBER],
+    ];
+    const oppCardW = 2.34;
+    oppPoints.forEach((p,i)=>{ oppStatCard(0.5 + i*(oppCardW+0.11), 1.45, oppCardW, 1.55, p[0], p[1], p[2]); });
+    s6.addText(`${oppSummary.totalIssues} total issue(s) flagged across ${oppSummary.branchCount} branch(es)`, { x:0.5, y:3.2, w:12, h:0.4, fontSize:12.5, bold:true, color:DARK });
+    s6.addText('By customer', { x:0.5, y:3.75, w:12, h:0.35, fontSize:14, bold:true, color:DARK });
+    if(custOpps.length===0){
+      s6.addText('No branches are currently flagged — everything is within normal ranges.', { x:0.5, y:4.2, w:12, h:0.5, fontSize:13, color:SOFT });
     } else {
-      let y = 1.5;
-      opps.slice(0,8).forEach(o=>{
-        const tag = o.type==='oos' ? 'OUT OF STOCK' : 'UNDERPERFORMING';
-        const tagColor = o.type==='oos' ? RED : AMBER;
-        s6.addText(tag, { x:0.5, y, w:2.0, h:0.62, fontSize:9, bold:true, color:tagColor, fill:{color:'FBF9F8'}, valign:'middle', align:'center' });
-        s6.addText(`${o.sku} (${o.category}) — ${o.branch}: sells ${fmt(o.velocity,1)}/d vs ${fmt(o.benchmark,1)}/d at ${o.benchmarkBranch}. Opportunity ≈ ${fmt(o.gap,1)} units/day.`,
-          { x:2.6, y, w:10.2, h:0.62, fontSize:11, color:DARK, fill:{color:'FBF9F8'}, valign:'middle' });
-        y += 0.72;
+      const custHeader = ['Customer','Branches flagged','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+      const custTable = [custHeader];
+      custOpps.slice(0,10).forEach((c,i)=>{
+        const fillC = i%2?'F6F2EF':'FFFFFF';
+        custTable.push([c.name, String(c.branches.length), String(c.totalIssues)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
       });
+      s6.addTable(custTable, { x:0.5, y:4.15, w:12.3, colW:[7.3,2.5,2.5], fontSize:10.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
+      if(custOpps.length>10) s6.addText(`+ ${custOpps.length-10} more customer(s) — see the branch-level pages that follow.`, { x:0.5, y:4.15+10*0.3+0.15, w:12, h:0.3, fontSize:9.5, italic:true, color:SOFT });
     }
-    footer(s6, 'Opportunities & Threats');
+    footer(s6, 'Opportunities — Top Line');
 
-        } catch(e) { console.error('Opportunities & Threats slide failed', e); }
-// ---------- Branches Needing Attention (every flagged branch, network-wide) ----------
-    try {
-
-    const custOpps = computeCustomerOpportunities(approved);
-    const branchIssueRows = [];
-    custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchIssueRows.push({ customer:c.name, branch:b.branch, issues:b.issues.map(i=>i.text) }); }); });
-    const ATT_PER_PAGE = 8;
-    const attPages = [];
-    for(let i=0; i<branchIssueRows.length; i+=ATT_PER_PAGE) attPages.push(branchIssueRows.slice(i, i+ATT_PER_PAGE));
-    if(attPages.length===0) attPages.push([]);
-    attPages.forEach((page, pageIdx)=>{
-     try{
-      let s6b = pptx.addSlide();
-      s6b.addText(attPages.length>1 ? `Branches Needing Attention (${pageIdx+1}/${attPages.length})` : 'Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-      s6b.addText(`${branchIssueRows.length} branch(es) flagged network-wide — low/high stock, weak SOS or SUC, price compliance, cross-branch gaps.`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
-      if(page.length===0){
-        s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
-      } else {
-        const attHeader = ['Customer','Branch','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-        const attRows = [attHeader];
-        page.forEach((r,i)=>{
-          const fillC = i%2?'F6F2EF':'FFFFFF';
-          attRows.push([r.customer, r.branch, r.issues.map(t=>'• '+t).join('\n')].map(v=>({text:String(v), options:{fill:{color:fillC}, valign:'top'}})));
-        });
-        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.6,1.8,7.9], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, valign:'top' });
-      }
-      footer(s6b, 'Branches Needing Attention');
-     }catch(e){ console.error('Skipping Branches Needing Attention page', pageIdx, e); }
-    });
-
-        } catch(e) { console.error('Branches Needing Attention slide failed', e); }
+        } catch(e) { console.error('Opportunities Top Line slide failed', e); }
 // ---------- Pricing vs RSP ----------
     try {
 
@@ -3935,10 +3901,40 @@ async function exportPpt(){
     footer(s7, 'Priced Above RSP');
 
         } catch(e) { console.error('Pricing vs RSP slide failed', e); }
+// ---------- Branches Needing Attention (every flagged branch, the simpler per-branch view) ----------
+    try {
+
+    const branchIssueRows = [];
+    custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchIssueRows.push({ customer:c.name, branch:b.branch, issues:b.issues.map(i=>i.text) }); }); });
+    const ATT_PER_PAGE = 8;
+    const attPages = [];
+    for(let i=0; i<branchIssueRows.length; i+=ATT_PER_PAGE) attPages.push(branchIssueRows.slice(i, i+ATT_PER_PAGE));
+    if(attPages.length===0) attPages.push([]);
+    attPages.forEach((page, pageIdx)=>{
+     try{
+      let s6b = pptx.addSlide();
+      s6b.addText(attPages.length>1 ? `Branches Needing Attention (${pageIdx+1}/${attPages.length})` : 'Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+      s6b.addText(`${branchIssueRows.length} branch(es) flagged network-wide — each compared only against its own numbers.`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
+      if(page.length===0){
+        s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
+      } else {
+        const attHeader = ['Customer','Branch','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+        const attRows = [attHeader];
+        page.forEach((r,i)=>{
+          const fillC = i%2?'F6F2EF':'FFFFFF';
+          attRows.push([r.customer, r.branch, r.issues.map(t=>'• '+t).join('\n')].map(v=>({text:String(v), options:{fill:{color:fillC}, valign:'top'}})));
+        });
+        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.6,1.8,7.9], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, valign:'top' });
+      }
+      footer(s6b, 'Branches Needing Attention');
+     }catch(e){ console.error('Skipping Branches Needing Attention page', pageIdx, e); }
+    });
+
+        } catch(e) { console.error('Branches Needing Attention slide failed', e); }
 // ---------- Per-account insights & recommendations (top 8 by visit volume) ----------
     try {
 
-    function generateAccountInsights(c, opps){
+    function generateAccountInsights(c, custOpps){
       const out = [];
       if(c.avgSfr < 70) out.push(`Shelf utilization is low at ${fmt(c.avgSfr)}% — recommend a facing audit vs the planogram to close the gap.`);
       else if(c.avgSfr >= 90) out.push(`Shelf utilization is strong at ${fmt(c.avgSfr)}% — maintain the current replenishment cadence.`);
@@ -3949,15 +3945,17 @@ async function exportPpt(){
       if(c.oosSkuName!=='—' && c.oosCount>0) out.push(`${c.oosSkuName} went out of stock in ${c.oosCount} visit(s) — flag to supply chain for replenishment priority.`);
       if(c.priceOkPct < 80) out.push(`Price compliance is only ${fmt(c.priceOkPct)}% vs RSP — audit shelf tags and correct mismatches with store management.`);
       else out.push(`Price compliance is healthy at ${fmt(c.priceOkPct)}% vs RSP.`);
-      const branchKeys = c.branches.map(b=>c.name+' · '+b.branch);
-      const myOpp = opps.find(o=>branchKeys.includes(o.branch));
-      if(myOpp) out.push(`${myOpp.sku} underperforms here vs ${myOpp.benchmarkBranch} — potential to recover ~${fmt(myOpp.gap,1)} units/day with a distribution or facing fix.`);
+      const myCustOpp = custOpps.find(co=>co.name===c.name);
+      if(myCustOpp && myCustOpp.branches.length){
+        const topBranch = [...myCustOpp.branches].sort((a,b)=>b.issues.length-a.issues.length)[0];
+        if(topBranch && topBranch.issues[0]) out.push(`${topBranch.branch}: ${topBranch.issues[0].text}`);
+      }
       return out.slice(0,6);
     }
     const topAccountsForInsights = [...customers].sort((a,b)=>b.branchCount-a.branchCount).slice(0,25);
     topAccountsForInsights.forEach(c=>{
      try{
-      const insights = generateAccountInsights(c, opps);
+      const insights = generateAccountInsights(c, custOpps);
       let sa = pptx.addSlide();
       sa.addText(c.name, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
       sa.addText(`${c.branchCount} branch(es) · SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}% — Insights & Recommendations`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:12, color:SOFT });
@@ -4700,6 +4698,7 @@ function screenEditVisit(){
   const sosOverall = catTotal>0 ? (shahdFacingsSum/catTotal*100) : 0;
   const fillPct = spaceTotal>0 ? Math.min(300,(filledTotal/spaceTotal*100)) : 0;
   const exceeds = catTotal>0 && shahdFacingsSum>catTotal;
+  const exceedsSpace = spaceTotal>0 && filledTotal>spaceTotal;
   return `<div class="screen">
     <h1>Editing visit / تعديل الزيارة</h1>
     <p class="lede">${visit.accountName} · ${visit.branch} · ${visit.date} · submitted by ${visit.auditor}</p>
@@ -4715,7 +4714,9 @@ function screenEditVisit(){
         ${catTotal>0 ? statusChip(sosOverall>SOS_MONITOR_MAX?'off':'on', `SOS / حصة الرف: ${fmt(sosOverall)}%`) : statusChip('neutral','Enter category total to see SOS')}
         ${spaceTotal>0 ? statusChip(fillPct>SUC_MONITOR_MAX?'off':'on', `SUC / التعبئة: ${fmt(fillPct)}%`) : statusChip('neutral','Enter dedicated space total to see SUC')}
       </div>
-      ${exceeds ? `<p class="hint" style="color:var(--red);font-weight:700;margin:8px 0 0">⚠️ Total Shahd facings (${fmt(shahdFacingsSum)}) exceed total category facings (${fmt(catTotal)}) — recheck the count, or confirm "extra display" below if Shahd genuinely has space beyond the main category shelf.</p>
+      ${exceeds ? `<p class="hint" style="color:var(--red);font-weight:700;margin:8px 0 0">⚠️ Total Shahd facings (${fmt(shahdFacingsSum)}) exceed total category facings (${fmt(catTotal)}) — recheck the count, or confirm "extra display" below if Shahd genuinely has space beyond the main category shelf.</p>` : ''}
+      ${exceedsSpace ? `<p class="hint" style="color:var(--red);font-weight:700;margin:8px 0 0">⚠️ Actual space filled (${fmt(filledTotal)}) exceeds the dedicated Shahd space (${fmt(spaceTotal)}) — recheck the count, or confirm "extra display" below if Shahd genuinely has space beyond the main shelf.</p>` : ''}
+      ${(exceeds || exceedsSpace) ? `
       <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
         <input type="checkbox" ${d.extraDisplay?'checked':''} onchange="editDraftSetExtraDisplay(this.checked)"/>
         <span>We have extra display beyond the category shelf / لدينا عرض إضافي خارج رف الفئة</span>
@@ -4761,7 +4762,10 @@ function editLineHtml(it, idx){
 /* ---- Store Map (locations learned automatically from visit photo GPS) ---- */
 let storeMapInstance = null;
 function screenStoreMap(){
-  const total = State.accounts.length;
+  // ECOMM dark stores never get a visit photo, so they can never be "located" this way — counting
+  // them in the denominator just drags the coverage % down and makes the total confusing. Field
+  // accounts only.
+  const total = State.accounts.filter(a=>a.medium!=='ecomm').length;
   const located = Object.keys(State.locations).length;
   const pct = total ? (located/total*100) : 0;
   return `<div class="screen">
