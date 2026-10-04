@@ -3564,64 +3564,91 @@ const OPP_LOW_STOCK_DAYS = 3;
 const OPP_OVERSTOCK_DAYS = 21; // 3 weeks
 const OPP_LOW_SOS_PCT = 20;
 const OPP_LOW_SUC_PCT = 70;
-// Each issue carries plain structured fields (sku, velocity, stock, coverage, price, RSP, risk) rather
-// than a pre-written sentence, so it can be rendered as a scannable table — in the app and in the PPT
-// — instead of a wall of text. Risk is a simple 3-level triage: High = actual/imminent lost sales
-// (out of stock), Medium = ongoing performance drag (price, SOS, SUC), Low = tied-up cash, not urgent
-// (overstock).
-const OPP_RISK = { lowstock:'High', price:'Medium', sos:'Medium', sfr:'Medium', overstock:'Low' };
+// One row per SKU — stock and price are checked side by side on the SAME row (Stock Status/Stock Risk,
+// Price vs RSP/Price Risk), not split into separate rows by issue type. SOS/SUC are branch-wide (not
+// a single SKU), so they stay as a flag on the branch heading rather than a row of their own. Risk is
+// a simple label per check: stock risk is High when near/at a stockout, Low when overstocked; price
+// risk is Low whenever the shelf price doesn't match RSP, whichever direction.
 const OPP_RISK_RANK = { High:0, Medium:1, Low:2 };
 function computeCustomerOpportunities(approved){
   const customers = computeCustomerAnalysis(approved);
   return customers.map(c=>{
     const branches = c.branches.map(b=>{
-      const issues = [];
-      if(b.sos < OPP_LOW_SOS_PCT) issues.push({ type:'sos', risk:OPP_RISK.sos, sku:'—', category:'—', vel:null, stock:null, coverageDays:null, price:null, rsp:null, note:`SOS ${fmt(b.sos)}% (< ${OPP_LOW_SOS_PCT}%) — negotiate more facings` });
-      if(b.sfr < OPP_LOW_SUC_PCT) issues.push({ type:'sfr', risk:OPP_RISK.sfr, sku:'—', category:'—', vel:null, stock:null, coverageDays:null, price:null, rsp:null, note:`SUC ${fmt(b.sfr)}% (< ${OPP_LOW_SUC_PCT}%) — facing/replenishment gap` });
+      const sosLow = b.sos < OPP_LOW_SOS_PCT;
+      const sfrLow = b.sfr < OPP_LOW_SUC_PCT;
+      const skuRows = [];
       b.skuList.forEach(s=>{
+        let stockStatus = '', stockRisk = '';
+        if(s.stock===0){ stockStatus = 'Out of stock'; stockRisk = 'High'; }
+        else if(isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<OPP_LOW_STOCK_DAYS){ stockStatus = 'Low stock vs velocity'; stockRisk = 'High'; }
+        else if(isFinite(s.coverageDays) && s.coverageDays>OPP_OVERSTOCK_DAYS){ stockStatus = 'Overstocked vs velocity'; stockRisk = 'Low'; }
+        let priceVsRsp = '', priceRisk = '';
         if(s.priceStatus && s.priceStatus!=='neutral' && s.priceStatus!=='on'){
-          issues.push({ type:'price', risk:OPP_RISK.price, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:s.priceStatus==='watch'?'Above RSP':'Below RSP' });
+          priceVsRsp = s.priceStatus==='watch' ? 'Above RSP' : 'Below RSP';
+          priceRisk = 'Low';
         }
-        if(s.stock===0 || (isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<OPP_LOW_STOCK_DAYS)){
-          issues.push({ type:'lowstock', risk:OPP_RISK.lowstock, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:s.stock===0?'Out of stock':'Restock urgently' });
-        }
-        if(isFinite(s.coverageDays) && s.coverageDays>OPP_OVERSTOCK_DAYS){
-          issues.push({ type:'overstock', risk:OPP_RISK.overstock, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:'Pause next delivery / redistribute' });
-        }
+        if(!stockStatus && !priceVsRsp) return; // nothing wrong with this SKU — no row
+        const notes = [];
+        if(stockRisk==='High') notes.push('Restock urgently');
+        else if(stockStatus==='Overstocked vs velocity') notes.push('Consider pausing next delivery');
+        if(priceVsRsp) notes.push(`Check price — ${priceVsRsp.toLowerCase()}`);
+        skuRows.push({
+          sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp,
+          stockStatus, stockRisk, priceVsRsp, priceRisk, note: notes.join('. '),
+        });
       });
-      issues.sort((a,b2)=>OPP_RISK_RANK[a.risk]-OPP_RISK_RANK[b2.risk]); // High first — the rows needing action surface immediately
-      return { branch:b.branch, sfr:b.sfr, sos:b.sos, issues };
-    }).filter(b=>b.issues.length>0);
-    return { name:c.name, branches, totalIssues: branches.reduce((s,b)=>s+b.issues.length,0) };
+      skuRows.sort((a,b2)=>(OPP_RISK_RANK[a.stockRisk] ?? 3)-(OPP_RISK_RANK[b2.stockRisk] ?? 3)); // High stock risk first
+      return { branch:b.branch, sfr:b.sfr, sos:b.sos, sosLow, sfrLow, skuRows };
+    }).filter(b=>b.skuRows.length>0 || b.sosLow || b.sfrLow);
+    const totalIssues = branches.reduce((s,b)=>s+b.skuRows.length+(b.sosLow?1:0)+(b.sfrLow?1:0),0);
+    return { name:c.name, branches, totalIssues };
   }).filter(c=>c.branches.length>0).sort((a,b)=>b.totalIssues-a.totalIssues);
 }
 // Network-wide counts of each of the 5 checks — the "top line" view before drilling into branches.
 function summarizeOpportunities(custOpps){
   const counts = { lowstock:0, price:0, sos:0, sfr:0, overstock:0 };
   let branchCount = 0;
-  custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchCount++; b.issues.forEach(i=>{ if(counts[i.type]!=null) counts[i.type]++; }); }); });
+  custOpps.forEach(c=>{ c.branches.forEach(b=>{
+    branchCount++;
+    if(b.sosLow) counts.sos++;
+    if(b.sfrLow) counts.sfr++;
+    b.skuRows.forEach(r=>{
+      if(r.stockRisk==='High') counts.lowstock++;
+      else if(r.stockStatus==='Overstocked vs velocity') counts.overstock++;
+      if(r.priceVsRsp) counts.price++;
+    });
+  }); });
   return { counts, branchCount, totalIssues: custOpps.reduce((s,c)=>s+c.totalIssues,0) };
 }
-function riskChipKind(risk){ return risk==='High' ? 'off' : risk==='Medium' ? 'watch' : 'neutral'; }
-function opportunityRowsHtml(issues){
+function riskChipKind(risk){ return risk==='High' ? 'off' : risk==='Medium' ? 'watch' : risk==='Low' ? 'neutral' : 'neutral'; }
+function branchFlagLine(b){
+  const sos = `${b.sosLow?'⚠️ ':''}SOS ${fmt(b.sos)}%${b.sosLow?` — below ${OPP_LOW_SOS_PCT}%`:''}`;
+  const sfr = `${b.sfrLow?'⚠️ ':''}SUC ${fmt(b.sfr)}%${b.sfrLow?` — below ${OPP_LOW_SUC_PCT}%`:''}`;
+  return `<span style="${b.sosLow?'color:var(--red);font-weight:700':''}">${sos}</span> · <span style="${b.sfrLow?'color:var(--red);font-weight:700':''}">${sfr}</span>`;
+}
+function opportunitySkuTableHtml(skuRows){
+  if(skuRows.length===0) return '';
   return `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:6px"><table class="mini">
-    <tr><th>SKU</th><th>Vel/d</th><th>Stock</th><th>Coverage</th><th>Price</th><th>RSP</th><th>Risk</th><th>Note</th></tr>
-    ${issues.map(i=>`<tr>
-      <td>${i.sku}${i.category!=='—'?`<br><span class="hint">${i.category}</span>`:''}</td>
-      <td>${i.vel!=null?fmt(i.vel,1):'—'}</td>
-      <td>${i.stock!=null?fmt(i.stock):'—'}</td>
-      <td>${i.coverageDays!=null?(isFinite(i.coverageDays)?fmt(i.coverageDays,1)+'d':'∞'):'—'}</td>
-      <td>${i.price!=null?fmt(i.price):'—'}</td>
-      <td>${i.rsp!=null?fmt(i.rsp):'—'}</td>
-      <td>${statusChip(riskChipKind(i.risk), i.risk)}</td>
-      <td>${i.note}</td>
+    <tr><th>SKU</th><th>Vel/d</th><th>Stock</th><th>Coverage</th><th>Price</th><th>RSP</th><th>Stock Status</th><th>Stock Risk</th><th>Price vs RSP</th><th>Price Risk</th><th>Note</th></tr>
+    ${skuRows.map(r=>`<tr>
+      <td>${r.sku}<br><span class="hint">${r.category}</span></td>
+      <td>${r.vel!=null?fmt(r.vel,1):'—'}</td>
+      <td>${r.stock!=null?fmt(r.stock):'—'}</td>
+      <td>${r.coverageDays!=null?(isFinite(r.coverageDays)?fmt(r.coverageDays,1)+'d':'∞'):'—'}</td>
+      <td>${r.price!=null?fmt(r.price):'—'}</td>
+      <td>${r.rsp!=null?fmt(r.rsp):'—'}</td>
+      <td>${r.stockStatus||'—'}</td>
+      <td>${r.stockRisk?statusChip(riskChipKind(r.stockRisk), r.stockRisk):'—'}</td>
+      <td>${r.priceVsRsp||'—'}</td>
+      <td>${r.priceRisk?statusChip(riskChipKind(r.priceRisk), r.priceRisk):'—'}</td>
+      <td>${r.note||'—'}</td>
     </tr>`).join('')}
   </table></div>`;
 }
 function dashOpportunities(approved){
   const rows = computeCustomerOpportunities(approved);
   if(rows.length===0) return emptyState('💡','No clear opportunities yet','Needs more approved visits to compare across branches.');
-  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch, as a table — sorted by risk so High-risk rows surface first. Every check is the branch compared to its own numbers.</p>
+  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged SKUs by branch — one row per SKU, stock and price checked side by side. Every check is the branch compared to its own numbers.</p>
   ${rows.map(r=>{
     const open = State.expandedCategory === 'opp:'+r.name;
     return `<div class="card">
@@ -3631,8 +3658,8 @@ function dashOpportunities(approved){
       </div>
       ${open ? r.branches.map(b=>`
         <div class="branch-toggle" style="border-top:1px solid var(--line);cursor:default;display:block">
-          <div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch} <span class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%</span></div>
-          ${opportunityRowsHtml(b.issues)}
+          <div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch} <span class="hint">${branchFlagLine(b)}</span></div>
+          ${opportunitySkuTableHtml(b.skuRows)}
         </div>`).join('') : ''}
     </div>`;
   }).join('')}`;
@@ -3936,8 +3963,11 @@ async function exportPpt(){
     const PPT_BRANCHES_CAP = 40;
     const PPT_ROWS_PER_BRANCH = 12;
     const flatBranches = [];
-    custOpps.forEach(c=>{ c.branches.forEach(b=>{ flatBranches.push({ customer:c.name, branch:b.branch, sfr:b.sfr, sos:b.sos, issues:b.issues }); }); });
-    flatBranches.sort((a,b)=>b.issues.length-a.issues.length);
+    custOpps.forEach(c=>{ c.branches.forEach(b=>{
+      const count = b.skuRows.length + (b.sosLow?1:0) + (b.sfrLow?1:0);
+      flatBranches.push({ customer:c.name, branch:b.branch, sfr:b.sfr, sos:b.sos, sosLow:b.sosLow, sfrLow:b.sfrLow, skuRows:b.skuRows, count });
+    }); });
+    flatBranches.sort((a,b)=>b.count-a.count);
     const branchesForPpt = flatBranches.slice(0, PPT_BRANCHES_CAP);
 
     if(branchesForPpt.length===0){
@@ -3950,22 +3980,26 @@ async function exportPpt(){
        try{
         let s6b = pptx.addSlide();
         s6b.addText(`${bb.customer} — ${bb.branch}`, { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
-        s6b.addText(`SUC ${fmt(bb.sfr)}% · SOS ${fmt(bb.sos)}% · ${bb.issues.length} issue(s), highest risk first  ·  branch ${idx+1}/${branchesForPpt.length} (worst by issue count)`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:10.5, italic:true, color:SOFT });
-        const rowsForSlide = bb.issues.slice(0, PPT_ROWS_PER_BRANCH);
-        const attHeader = ['SKU','Vel/d','Stock','Coverage','Price','RSP','Risk','Note'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+        const flagBits = [];
+        if(bb.sosLow) flagBits.push(`⚠ SOS ${fmt(bb.sos)}% (below ${OPP_LOW_SOS_PCT}%)`);
+        if(bb.sfrLow) flagBits.push(`⚠ SUC ${fmt(bb.sfr)}% (below ${OPP_LOW_SUC_PCT}%)`);
+        s6b.addText(`SUC ${fmt(bb.sfr)}% · SOS ${fmt(bb.sos)}%${flagBits.length?'  ·  '+flagBits.join('  ·  '):''}  ·  branch ${idx+1}/${branchesForPpt.length} (worst by issue count)`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:10.5, italic:true, color:SOFT });
+        const rowsForSlide = bb.skuRows.slice(0, PPT_ROWS_PER_BRANCH);
+        const attHeader = ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk','Note'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
         const attRows = [attHeader];
-        rowsForSlide.forEach((i,ri)=>{
+        const riskColorOf = r => r==='High'?RED:(r==='Medium'?AMBER:(r==='Low'?GREEN:DARK));
+        rowsForSlide.forEach((r,ri)=>{
           const fillC = ri%2?'F6F2EF':'FFFFFF';
-          const riskColor = i.risk==='High'?RED:(i.risk==='Medium'?AMBER:GREEN);
           attRows.push([
-            i.sku, i.vel!=null?fmt(i.vel,1):'—', i.stock!=null?fmt(i.stock):'—',
-            i.coverageDays!=null?(isFinite(i.coverageDays)?fmt(i.coverageDays,1):'∞'):'—',
-            i.price!=null?fmt(i.price):'—', i.rsp!=null?fmt(i.rsp):'—', i.risk, i.note,
-          ].map((v,ci)=>({text:String(v), options:{fill:{color:fillC}, color: ci===6?riskColor:DARK, bold: ci===6}})));
+            r.sku, r.vel!=null?fmt(r.vel,1):'—', r.stock!=null?fmt(r.stock):'—',
+            r.coverageDays!=null?(isFinite(r.coverageDays)?fmt(r.coverageDays,1):'∞'):'—',
+            r.price!=null?fmt(r.price):'—', r.rsp!=null?fmt(r.rsp):'—',
+            r.stockStatus||'—', r.stockRisk||'—', r.priceVsRsp||'—', r.priceRisk||'—', r.note||'—',
+          ].map((v,ci)=>({text:String(v), options:{fill:{color:fillC}, color: ci===7?riskColorOf(r.stockRisk):(ci===9?riskColorOf(r.priceRisk):DARK), bold: ci===7||ci===9}})));
         });
-        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[3.0,1.1,1.1,1.3,1.1,1.1,1.1,2.6], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
-        if(bb.issues.length>PPT_ROWS_PER_BRANCH){
-          s6b.addText(`+ ${bb.issues.length-PPT_ROWS_PER_BRANCH} more issue(s) for this branch — see the live Opportunities tab for the full list.`, { x:0.5, y:1.35+(rowsForSlide.length+1)*0.3+0.1, w:12, h:0.3, fontSize:9, italic:true, color:SOFT });
+        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.2,0.8,0.8,1.0,0.8,0.8,1.4,1.0,1.3,1.0,1.2], fontSize:8.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
+        if(bb.skuRows.length>PPT_ROWS_PER_BRANCH){
+          s6b.addText(`+ ${bb.skuRows.length-PPT_ROWS_PER_BRANCH} more SKU(s) for this branch — see the live Opportunities tab for the full list.`, { x:0.5, y:1.35+(rowsForSlide.length+1)*0.3+0.1, w:12, h:0.3, fontSize:9, italic:true, color:SOFT });
         }
         footer(s6b, 'Branches Needing Attention');
        }catch(e){ console.error('Skipping branch attention slide', bb.branch, e); }
@@ -3995,9 +4029,11 @@ async function exportPpt(){
       else out.push(`Price compliance is healthy at ${fmt(c.priceOkPct)}% vs RSP.`);
       const myCustOpp = custOpps.find(co=>co.name===c.name);
       if(myCustOpp && myCustOpp.branches.length){
-        const topBranch = [...myCustOpp.branches].sort((a,b)=>b.issues.length-a.issues.length)[0];
-        const topIssue = topBranch && topBranch.issues[0]; // already sorted High risk first
-        if(topIssue) out.push(`${topBranch.branch} (${topIssue.risk} risk): ${topIssue.sku!=='—'?topIssue.sku+' — ':''}${topIssue.note}.`);
+        const topBranch = [...myCustOpp.branches].sort((a,b)=>(b.skuRows.length+(b.sosLow?1:0)+(b.sfrLow?1:0))-(a.skuRows.length+(a.sosLow?1:0)+(a.sfrLow?1:0)))[0];
+        const topSkuRow = topBranch && topBranch.skuRows[0]; // already sorted High stock risk first
+        if(topSkuRow) out.push(`${topBranch.branch} (${topSkuRow.stockRisk||topSkuRow.priceRisk} risk): ${topSkuRow.sku} — ${topSkuRow.note}.`);
+        else if(topBranch && topBranch.sosLow) out.push(`${topBranch.branch}: SOS ${fmt(topBranch.sos)}% — below ${OPP_LOW_SOS_PCT}%.`);
+        else if(topBranch && topBranch.sfrLow) out.push(`${topBranch.branch}: SUC ${fmt(topBranch.sfr)}% — below ${OPP_LOW_SUC_PCT}%.`);
       }
       return out.slice(0,6);
     }
