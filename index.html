@@ -2932,6 +2932,51 @@ function screenVisitCalendar(){
 }
 
 /* ---- Dashboard (Overview / Customers / Categories / Opportunities) ---- */
+function openPptExportMenu(){ State.pptExportMode = 'menu'; State.pptAccountSearch = ''; render(); }
+function closePptExportMenu(){ State.pptExportMode = null; render(); }
+function choosePptAccountMode(){ State.pptExportMode = 'account-pick'; render(); }
+function setPptAccountSearch(v){ State.pptAccountSearch = v; render(); }
+async function runPptAccountExport(name){
+  State.pptExportMode = null;
+  render();
+  showToast(`Building ${name} PowerPoint…`);
+  await exportPptAccount(name);
+}
+function pptExportMenuHtml(){
+  if(State.pptExportMode==='account-pick'){
+    const approvedForList = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
+    const names = [...new Set(computeCustomerAnalysis(approvedForList).map(c=>c.name))].sort((a,b)=>a.localeCompare(b));
+    const q = (State.pptAccountSearch||'').toLowerCase();
+    const filtered = q ? names.filter(n=>n.toLowerCase().includes(q)) : names;
+    return `<div class="card" style="border-color:var(--red)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h3 style="margin:0">Pick an account</h3>
+        <button class="btn btn-ghost btn-sm" onclick="closePptExportMenu()">✕</button>
+      </div>
+      <input type="text" placeholder="Search customer…" value="${State.pptAccountSearch||''}" oninput="setPptAccountSearch(this.value)" style="margin-bottom:8px"/>
+      <div style="max-height:260px;overflow-y:auto">
+        ${filtered.length===0 ? `<p class="hint">No matches.</p>` : filtered.map(n=>`
+          <div class="search-result" onclick="runPptAccountExport('${n.replace(/'/g,"\\'")}')"><div class="sr-main">${n}</div></div>
+        `).join('')}
+      </div>
+    </div>`;
+  }
+  return `<div class="card" style="border-color:var(--red)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">Export PPT — pick a format</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closePptExportMenu()">✕</button>
+    </div>
+    <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:8px;text-align:left" id="ppt-exec-btn" onclick="exportPptExecutive()">
+      Executive Summary <span class="hint" style="color:inherit;opacity:.85">— top-level KPIs only, ~6 slides, for leadership</span>
+    </button>
+    <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:8px;text-align:left" id="ppt-btn" onclick="exportPpt()">
+      Full Network Detail <span class="hint" style="color:inherit;opacity:.85">— every section, customer &amp; branch action plans</span>
+    </button>
+    <button class="btn btn-primary btn-sm" style="width:100%;text-align:left" onclick="choosePptAccountMode()">
+      Single Account <span class="hint" style="color:inherit;opacity:.85">— pick one customer, its full branch detail only</span>
+    </button>
+  </div>`;
+}
 function screenDashboard(){
   const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
   if(approved.length===0){
@@ -2943,10 +2988,11 @@ function screenDashboard(){
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
       <div><h1>Dashboard / لوحة التحكم</h1><p class="lede">Auto-rolled up from ${approved.length} approved visit${approved.length>1?'s':''}.</p></div>
       <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
-        <button class="btn-sm" style="background:var(--red);color:#fff;border:none;border-radius:9px;padding:8px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap" onclick="exportPpt()" id="ppt-btn">⬇ Export PPT</button>
+        <button class="btn-sm" style="background:var(--red);color:#fff;border:none;border-radius:9px;padding:8px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap" onclick="openPptExportMenu()" id="ppt-menu-btn">⬇ Export PPT</button>
         <button class="btn-sm" style="background:var(--green);color:#fff;border:none;border-radius:9px;padding:8px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap" onclick="exportExcel()" id="xlsx-btn">⬇ Export Excel</button>
       </div>
     </div>
+    ${State.pptExportMode ? pptExportMenuHtml() : ''}
     <div class="pillrow">
       <button class="${State.dashSub==='overview'?'active':''}" onclick="setDashSub('overview')">Overview / نظرة عامة</button>
       <button class="${State.dashSub==='customer'?'active':''}" onclick="setDashSub('customer')">Customers / العملاء</button>
@@ -3692,39 +3738,131 @@ async function loadPptxLib(){
   await loadScriptOnce('./vendor-pptxgen.js');
   if(!window.PptxGenJS) throw new Error('PowerPoint library failed to initialize — try reloading the page.');
 }
+// ============================= PPT EXPORT — shared setup, used by all three export modes =============================
+const PPT_RED = 'C0272D', PPT_DARK = '201B1A', PPT_SOFT = '6B615E', PPT_LINE = 'E9E1DD', PPT_GREEN='1E7145', PPT_AMBER='B8860B';
+const PPT_CHART_COLORS = ['C0272D','8E1116','B8860B','1E7145','6B615E','D9A5A8','4A7C63','E0C46C'];
+function pptFooter(slide, label){
+  slide.addText('Shelf Pulse — Cairo 3A (Shahd)  ·  Confidential', { x:0.5, y:7.15, w:8, h:0.3, fontSize:8, color:PPT_SOFT });
+  slide.addText(label||'', { x:10.5, y:7.15, w:2.3, h:0.3, fontSize:8, color:PPT_SOFT, align:'right' });
+}
+function newPptx(title){
+  const pptx = new window.PptxGenJS();
+  pptx.defineLayout({ name:'WIDE', width:13.33, height:7.5 });
+  pptx.layout = 'WIDE';
+  pptx.author = 'Shelf Pulse'; pptx.title = title || 'Trade Marketing Field Analysis';
+  return pptx;
+}
+// Everything every export mode needs computed once — approved-only, latest-visit-only for current
+// state (matches the Dashboard exactly), full-history only for genuine compliance metrics.
+function buildPptContext(){
+  const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
+  const aggs = approved.map(v=>visitAggregate(v));
+  const avg = f => aggs.length ? aggs.reduce((s,a)=>s+f(a),0)/aggs.length : 0;
+  const latestVisitsForPpt = findLatestVisitPerBranch(approved);
+  const latestAggsForPpt = latestVisitsForPpt.map(v=>visitAggregate(v));
+  const avgLatest = f => latestAggsForPpt.length ? latestAggsForPpt.reduce((s,a)=>s+f(a),0)/latestAggsForPpt.length : 0;
+  const stockSummaryForPpt = computeNetworkStockSummary(approved);
+  const customers = computeCustomerAnalysis(approved);
+  const { catRows, skuRows } = computeCategoryAnalysis(approved);
+  const custOpps = computeCustomerOpportunities(approved);
+  const oppSummary = summarizeOpportunities(custOpps);
+  const sortedCustomers = [...customers].sort((a,b)=>b.branchCount-a.branchCount);
+  return { approved, aggs, avg, avgLatest, stockSummaryForPpt, customers, catRows, skuRows, custOpps, oppSummary, sortedCustomers };
+}
+function pptActionPlanRisk(riskLabel){ return riskLabel==='High'?PPT_RED:(riskLabel==='Medium'?PPT_AMBER:PPT_GREEN); }
+function renderActionPlanAndPricing(slide, title, subtitle, bullets, pricingHeader, pricingRows, pricingColW){
+  slide.addText(title, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:PPT_DARK });
+  if(subtitle) slide.addText(subtitle, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10.5, italic:true, color:PPT_SOFT });
+  slide.addText('Action plan', { x:0.5, y:1.3, w:5.7, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
+  slide.addText(bullets.map(b=>({ text:b.text, options:{ bullet:{code:'2022'}, breakLine:true, color:pptActionPlanRisk(b.risk), bold:b.risk==='High' } })),
+    { x:0.5, y:1.7, w:5.7, h:4.9, fontSize:11.5, color:PPT_DARK, valign:'top' });
+  slide.addText('Priced above RSP', { x:6.5, y:1.3, w:6.3, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
+  if(pricingRows.length===0){
+    slide.addText('Nothing priced above RSP here.', { x:6.5, y:1.75, w:6.3, h:0.4, fontSize:11, italic:true, color:PPT_SOFT });
+  } else {
+    const table = [pricingHeader.map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}))];
+    pricingRows.forEach((row,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      table.push(row.map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+    });
+    slide.addTable(table, { x:6.5, y:1.75, w:6.3, fontSize:9.5, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.32, colW:pricingColW });
+  }
+}
+// One customer's overview slide (3-5 action plans + above-RSP pricing rolled up across its branches),
+// then up to branchCap of its most-severe flagged branches, same two elements each — pass
+// branchCap:Infinity for a single-account export where every branch should appear, uncapped.
+function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
+  const custBullets = [];
+  if(c.avgSfr < OPP_LOW_SUC_PCT) custBullets.push({risk:'Medium', text:`Improve shelf utilization — SUC at ${fmt(c.avgSfr)}%, below the ${OPP_LOW_SUC_PCT}% bar.`});
+  if(c.avgSos < OPP_LOW_SOS_PCT) custBullets.push({risk:'Medium', text:`Negotiate more facings — SOS at ${fmt(c.avgSos)}%, below ${OPP_LOW_SOS_PCT}% share.`});
+  if(c.priceOkPct < 80) custBullets.push({risk:'Medium', text:`Correct shelf pricing — only ${fmt(c.priceOkPct)}% of checks match RSP across this customer.`});
+  if(c.oosSkuName && c.oosSkuName!=='—' && c.oosCount>0) custBullets.push({risk:'High', text:`Prioritize replenishment for ${c.oosSkuName} — most frequently out of stock (${c.oosCount} visit(s)).`});
+  if(c.topSkuName && c.topSkuName!=='—') custBullets.push({risk:'Low', text:`Protect ${c.topSkuName}'s facing — the strongest seller at ${fmt(c.topSkuVel,1)} units/store/day.`});
+  if(custBullets.length===0) custBullets.push({risk:'Low', text:'No major issues flagged — maintain current execution standard.'});
+  custBullets.sort((a,b)=>(OPP_RISK_RANK[a.risk]??3)-(OPP_RISK_RANK[b.risk]??3));
+
+  const custAboveRspBySku = {};
+  if(custOpp) custOpp.branches.forEach(b=>{
+    b.skuRows.forEach(r=>{
+      if(r.priceVsRsp!=='Above RSP') return;
+      custAboveRspBySku[r.sku] = custAboveRspBySku[r.sku] || { sku:r.sku, category:r.category, rsp:r.rsp, branchCount:0, priceSum:0 };
+      custAboveRspBySku[r.sku].branchCount++;
+      custAboveRspBySku[r.sku].priceSum += r.price;
+    });
+  });
+  const custAboveRsp = Object.values(custAboveRspBySku).sort((a,b)=>b.branchCount-a.branchCount);
+
+  let s4c = pptx.addSlide();
+  renderActionPlanAndPricing(
+    s4c, c.name, `${c.branchCount} branch(es) · network rollup: SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}%`,
+    custBullets.slice(0,5),
+    ['SKU','Branches','Avg Price','RSP'],
+    custAboveRsp.slice(0,10).map(s=>[s.sku, String(s.branchCount), fmt(s.priceSum/s.branchCount), fmt(s.rsp)]),
+    [2.7,1.2,1.2,1.2],
+  );
+  pptFooter(s4c, c.name);
+
+  if(!custOpp) return;
+  const flaggedBranchOpps = custOpp.branches.filter(b=>b.skuRows.length>0 || b.sosLow || b.sfrLow);
+  const severity = b => b.skuRows.filter(r=>r.stockRisk==='High').length*100 + b.skuRows.length + (b.sosLow?1:0) + (b.sfrLow?1:0);
+  const branchesToShow = [...flaggedBranchOpps].sort((a,b)=>severity(b)-severity(a)).slice(0, branchCap);
+  if(flaggedBranchOpps.length > branchesToShow.length){
+    s4c.addText(`Showing the ${branchesToShow.length} most-severe branches of ${flaggedBranchOpps.length} flagged — full list in the app's Opportunities tab.`, { x:0.5, y:6.85, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
+  }
+  branchesToShow.forEach(b=>{
+   try{
+    const branchBullets = [];
+    if(b.sosLow) branchBullets.push({risk:'Medium', text:`Negotiate more facings — SOS at ${fmt(b.sos)}%, below ${OPP_LOW_SOS_PCT}%.`});
+    if(b.sfrLow) branchBullets.push({risk:'Medium', text:`Address shelf utilization — SUC at ${fmt(b.sfr)}%, below ${OPP_LOW_SUC_PCT}%.`});
+    b.skuRows.forEach(r=>{
+      if(r.stockRisk==='High') branchBullets.push({risk:'High', text:`${r.stockStatus} — ${r.sku}. ${r.note}.`});
+      else if(r.stockStatus==='Overstocked vs velocity') branchBullets.push({risk:'Low', text:`${r.sku} overstocked — ${isFinite(r.coverageDays)?fmt(r.coverageDays,1)+'d cover':'excess stock'}. Pause next delivery.`});
+      else if(r.priceVsRsp) branchBullets.push({risk:'Medium', text:`Correct ${r.sku} pricing — ${r.priceVsRsp.toLowerCase()} (${fmt(r.price)} vs RSP ${fmt(r.rsp)}).`});
+    });
+    branchBullets.sort((a,b2)=>(OPP_RISK_RANK[a.risk]??3)-(OPP_RISK_RANK[b2.risk]??3));
+    const branchAboveRsp = b.skuRows.filter(r=>r.priceVsRsp==='Above RSP');
+    let sbr = pptx.addSlide();
+    renderActionPlanAndPricing(
+      sbr, `${c.name} — ${b.branch}`, `SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%`,
+      branchBullets.slice(0,5),
+      ['SKU','Price','RSP'],
+      branchAboveRsp.slice(0,10).map(r=>[r.sku, fmt(r.price), fmt(r.rsp)]),
+      [3.3,1.5,1.5],
+    );
+    pptFooter(sbr, `${c.name} — ${b.branch}`);
+   }catch(e){ console.error('Skipping branch action-plan slide for', c.name, b && b.branch, e); }
+  });
+}
+
 async function exportPpt(){
   const btn = document.getElementById('ppt-btn');
   if(btn){ btn.textContent = 'Building…'; btn.disabled = true; }
   try{
     await loadPptxLib();
-    const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
-    const aggs = approved.map(v=>visitAggregate(v));
-    const avg = f => aggs.length ? aggs.reduce((s,a)=>s+f(a),0)/aggs.length : 0;
-    // SUC/SOS/OSA/Price-matching/stock-coverage must match the Dashboard tab exactly — both are
-    // "current state" figures built from each branch's LATEST visit only, never blended across every
-    // historical visit. This mirrors dashOverview()'s computation precisely; avg()/aggs above stay in
-    // use only for genuine full-history compliance metrics (visits verified %, data completeness),
-    // the same split the Dashboard itself makes.
-    const latestVisitsForPpt = findLatestVisitPerBranch(approved);
-    const latestAggsForPpt = latestVisitsForPpt.map(v=>visitAggregate(v));
-    const avgLatest = f => latestAggsForPpt.length ? latestAggsForPpt.reduce((s,a)=>s+f(a),0)/latestAggsForPpt.length : 0;
-    const stockSummaryForPpt = computeNetworkStockSummary(approved);
-    const customers = computeCustomerAnalysis(approved);
-    const { catRows, skuRows } = computeCategoryAnalysis(approved);
-    const custOpps = computeCustomerOpportunities(approved);
-    const oppSummary = summarizeOpportunities(custOpps);
-    const RED = 'C0272D', DARK = '201B1A', SOFT = '6B615E', LINE = 'E9E1DD', GREEN='1E7145', AMBER='B8860B';
-    const CHART_COLORS = ['C0272D','8E1116','B8860B','1E7145','6B615E','D9A5A8','4A7C63','E0C46C'];
-
-    const pptx = new window.PptxGenJS();
-    pptx.defineLayout({ name:'WIDE', width:13.33, height:7.5 });
-    pptx.layout = 'WIDE';
-    pptx.author = 'Shelf Pulse'; pptx.title = 'Trade Marketing Field Analysis';
-
-    function footer(slide, label){
-      slide.addText('Shelf Pulse — Cairo 3A (Shahd)  ·  Confidential', { x:0.5, y:7.15, w:8, h:0.3, fontSize:8, color:SOFT });
-      slide.addText(label||'', { x:10.5, y:7.15, w:2.3, h:0.3, fontSize:8, color:SOFT, align:'right' });
-    }
+    const { approved, aggs, avg, avgLatest, stockSummaryForPpt, customers, catRows, skuRows, custOpps, oppSummary, sortedCustomers } = buildPptContext();
+    const RED=PPT_RED, DARK=PPT_DARK, SOFT=PPT_SOFT, LINE=PPT_LINE, GREEN=PPT_GREEN, AMBER=PPT_AMBER, CHART_COLORS=PPT_CHART_COLORS;
+    const pptx = newPptx('Trade Marketing Field Analysis');
+    const footer = pptFooter;
 
     // ---------- Cover ----------
     try {
@@ -3871,7 +4009,6 @@ async function exportPpt(){
     try {
 
     const custHeader = ['Customer','Branches','SUC%','SOS%','Stock','Days Cover','Top Seller (vel/store/d)','Most OOS','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-    const sortedCustomers = [...customers].sort((a,b)=>b.branchCount-a.branchCount);
     const CUST_PER_PAGE = 18;
     const custPages = [];
     for(let i=0; i<sortedCustomers.length; i+=CUST_PER_PAGE) custPages.push(sortedCustomers.slice(i, i+CUST_PER_PAGE));
@@ -3897,38 +4034,32 @@ async function exportPpt(){
      }catch(e){ console.error('Skipping Customer Analysis page', pageIdx, e); }
     });
 
-    // Each customer with more than 2 branches then gets its own branch-level detail slide(s),
-    // paginated so a large chain doesn't overflow one table. SUC/SOS/OSA/Price OK% here are each
-    // branch's own latest visit, same as everywhere else in the app. A customer with only 1-2
-    // branches is skipped here — a dedicated slide adds little over what the overview table above
-    // already shows for it — which is also what keeps this deck in the 40-50 slide range rather than
-    // ballooning to one slide per customer regardless of size, as it would with dozens of customers
-    // that only have a branch or two each.
-    const BRANCHES_PER_SLIDE = 20;
-    const CUST_DETAIL_MIN_BRANCHES = 3;
-    const branchHeader = ['Branch','SUC%','SOS%','OSA%','Price OK%','Visits','Last Visit'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+    // Each customer with more than 2 branches gets ONE overview slide — 3-5 action plans plus an
+    // above-RSP-only pricing table, rolled up across all its branches — then one slide per branch
+    // that actually has something flagged, same two elements but scoped to that branch alone. A
+    // customer with only 1-2 branches is skipped here (see "Smaller Customers" below), and a branch
+    // with nothing flagged gets no slide at all — a clean branch has no action to give the sales
+    // team, so it doesn't earn a page. This is deliberately the opposite of a raw numbers table: the
+    // whole point is something a rep can act on at a glance.
+    // Giving every single flagged branch its own slide, for every customer with 3+ branches, would
+    // produce an enormous deck (hundreds of slides on a real network — most branches trip at least
+    // one of the five checks). To stay in the 40-50 slide range from the structure agreed on
+    // earlier while still giving each major customer real branch-level action detail: only customers
+    // with CUST_DETAIL_MIN_BRANCHES+ branches get their own slide(s) at all, and within those, only
+    // each customer's BRANCH_SLIDES_PER_CUSTOMER most-severe branches (by High-risk issue count, then
+    // total issues) get a dedicated slide — named explicitly on the customer's own slide, with a note
+    // on how many more exist. The full, unlimited, always-current branch list stays one tap away in
+    // the app's own Opportunities tab.
+    const CUST_DETAIL_MIN_BRANCHES = 10;
+    const BRANCH_SLIDES_PER_CUSTOMER = 4;
     const detailedCustomers = sortedCustomers.filter(c=>c.branchCount >= CUST_DETAIL_MIN_BRANCHES);
     const smallCustomers = sortedCustomers.filter(c=>c.branchCount < CUST_DETAIL_MIN_BRANCHES);
+
     detailedCustomers.forEach(c=>{
      try{
-      const sortedBranches = [...c.branches].sort((a,b)=>a.branch.localeCompare(b.branch));
-      const branchPages = [];
-      for(let i=0; i<sortedBranches.length; i+=BRANCHES_PER_SLIDE) branchPages.push(sortedBranches.slice(i, i+BRANCHES_PER_SLIDE));
-      branchPages.forEach((page, pageIdx)=>{
-       try{
-        let sc = pptx.addSlide();
-        sc.addText(branchPages.length>1 ? `${c.name} (${pageIdx+1}/${branchPages.length})` : c.name, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
-        sc.addText(`${c.branchCount} branch(es) · network rollup: SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}%`, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10.5, italic:true, color:SOFT });
-        const branchRows = [branchHeader];
-        page.forEach((b,i)=>{
-          const fillC = i%2?'F6F2EF':'FFFFFF';
-          branchRows.push([b.branch, fmt(b.sfr), fmt(b.sos), fmt(b.osaPct), fmt(b.priceOkPct), String(b.visits), b.lastVisitDate||'—'].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-        });
-        sc.addTable(branchRows, { x:0.5, y:1.3, w:12.3, fontSize:10, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.34 });
-        footer(sc, c.name);
-       }catch(e){ console.error('Skipping branch page for', c.name, pageIdx, e); }
-      });
-     }catch(e){ console.error('Skipping customer branch detail', c && c.name, e); }
+      const custOpp = custOpps.find(co=>co.name===c.name);
+      buildCustomerDetailSlides(pptx, c, custOpp, BRANCH_SLIDES_PER_CUSTOMER);
+     }catch(e){ console.error('Skipping customer action-plan detail', c && c.name, e); }
     });
     if(smallCustomers.length>0){
      try{
@@ -4015,6 +4146,206 @@ await pptx.writeFile({ fileName: `Shelf-Pulse-Analysis-${todayStr()}.pptx` });
     showToast(err.message || 'Could not build the PowerPoint.');
   } finally {
     if(btn){ btn.textContent = '⬇ Export PPT'; btn.disabled = false; }
+  }
+}
+
+/* Short deck for leadership — top-level network performance only, no customer/branch drill-down.
+   Reuses the exact same Cover/Executive Summary/KPI/Category Mix/SKU Performance/Best&Worst sections
+   as the full export, so the numbers always match; just stops before Customer Analysis. */
+async function exportPptExecutive(){
+  const btn = document.getElementById('ppt-exec-btn');
+  if(btn){ btn.textContent = 'Building…'; btn.disabled = true; }
+  try{
+    await loadPptxLib();
+    const { approved, aggs, avg, avgLatest, stockSummaryForPpt, customers, catRows, skuRows, oppSummary } = buildPptContext();
+    const RED=PPT_RED, DARK=PPT_DARK, SOFT=PPT_SOFT, LINE=PPT_LINE, GREEN=PPT_GREEN, AMBER=PPT_AMBER, CHART_COLORS=PPT_CHART_COLORS;
+    const pptx = newPptx('Trade Marketing — Executive Summary');
+    const footer = pptFooter;
+
+    // ---------- Cover ----------
+    try {
+
+    let s1 = pptx.addSlide();
+    s1.background = { color: RED };
+    s1.addText('Shelf Pulse', { x:0.7, y:2.5, w:11.9, h:1, fontSize:44, bold:true, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText('Trade Marketing & Market Development — Field Analysis', { x:0.7, y:3.4, w:11.9, h:0.6, fontSize:20, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText(`Generated ${new Date().toLocaleDateString()} · ${approved.length} approved visits · ${customers.length} customers · Cairo 3A (Shahd)`, { x:0.7, y:4.1, w:11.9, h:0.5, fontSize:13, color:'FBEAEA', fontFace:'Arial' });
+
+        } catch(e) { console.error('Cover slide failed', e); }
+// ---------- Executive Summary ----------
+    try {
+
+    // Wins/risks stay at network level — no customer named here on purpose, since the branch-level
+    // breakdown lives in the Customer Analysis section further on.
+    const sortedByScoreCust = [...customers].sort((a,b)=>b.avgSfr-a.avgSfr);
+    const bestCust = sortedByScoreCust[0], worstCust = sortedByScoreCust[sortedByScoreCust.length-1];
+    const worstPriceSku = [...skuRows].filter(r=>r.priceN>0).sort((a,b)=>a.priceOkPct-b.priceOkPct)[0];
+    let s2 = pptx.addSlide();
+    s2.addText('Executive Summary', { x:0.5, y:0.35, w:12, h:0.55, fontSize:28, bold:true, color:DARK });
+    s2.addText(`${new Date().toLocaleDateString('en-GB',{weekday:'long', year:'numeric', month:'long', day:'numeric'})}`, { x:0.5, y:0.9, w:12, h:0.35, fontSize:12, color:SOFT });
+    const headline = [
+      ['SUC', fmt(avgLatest(a=>a.avgSfr))+'%'], ['SOS', fmt(avgLatest(a=>a.avgSos))+'%'],
+      ['OSA', fmt(avgLatest(a=>a.osaPct))+'%'], ['Price OK', fmt(avgLatest(a=>a.priceOkPct))+'%'],
+    ];
+    headline.forEach((h,i)=>{
+      const x = 0.5 + i*3.1;
+      s2.addText(h[1], { x, y:1.5, w:2.9, h:0.7, fontSize:30, bold:true, color:RED, align:'center' });
+      s2.addText(h[0], { x, y:2.2, w:2.9, h:0.35, fontSize:11, color:SOFT, align:'center' });
+    });
+    s2.addShape('line', { x:0.5, y:2.75, w:12.3, h:0, line:{color:LINE, width:1} });
+    s2.addText('Key wins', { x:0.5, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:GREEN });
+    const wins = [];
+    if(bestCust) wins.push(`Best-performing branch network-wide reaches ${fmt(bestCust.avgSfr)}% SUC — see Customer Analysis for which one.`);
+    const bestSku = skuRows[0];
+    if(bestSku) wins.push(`${bestSku.name} is the network's top seller at ${fmt(bestSku.avgVelPerStore,1)} units/store/day.`);
+    if(avgLatest(a=>a.priceOkPct) >= 80) wins.push(`Price compliance is healthy across the network at ${fmt(avgLatest(a=>a.priceOkPct))}%.`);
+    if(wins.length<3) wins.push(`${approved.length} verified visits captured so far this cycle.`);
+    s2.addText(wins.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:0.5, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
+    s2.addText('Key risks', { x:6.9, y:3.0, w:5.9, h:0.4, fontSize:14, bold:true, color:RED });
+    const risks = [];
+    if(worstCust && worstCust.name!==bestCust?.name) risks.push(`Weakest branch network-wide sits at ${fmt(worstCust.avgSfr)}% SUC — see Customer Analysis for which one.`);
+    if(oppSummary.totalIssues>0) risks.push(`${oppSummary.totalIssues} issue(s) flagged across ${oppSummary.branchCount} branch(es) network-wide — see Customer Analysis for branch-level detail.`);
+    if(worstPriceSku) risks.push(`${worstPriceSku.name} has the weakest price compliance at ${fmt(worstPriceSku.priceOkPct)}%.`);
+    if(risks.length<3) risks.push(`Monitor OOS trends as visit volume grows.`);
+    s2.addText(risks.slice(0,3).map(w=>({text:w, options:{bullet:true, breakLine:true}})), { x:6.9, y:3.4, w:5.9, h:2.2, fontSize:11.5, color:DARK, valign:'top' });
+    footer(s2, 'Executive Summary');
+
+        } catch(e) { console.error('Executive Summary slide failed', e); }
+// ---------- KPI Overview: charts, not boxes ----------
+    try {
+
+    let s3 = pptx.addSlide();
+    s3.addText('KPI Overview', { x:0.5, y:0.35, w:12, h:0.55, fontSize:26, bold:true, color:DARK });
+    const priceOnCount = skuRows.reduce((s,r)=>s+r.priceOk,0);
+    const priceOffCount = skuRows.reduce((s,r)=>s+(r.priceN-r.priceOk),0);
+    try{
+      s3.addChart(pptx.ChartType.bar, [{
+        name:'Score', labels:['SUC','SOS','OSA','Price OK','Data Complete'],
+        values:[avgLatest(a=>a.avgSfr), avgLatest(a=>a.avgSos), avgLatest(a=>a.osaPct), avgLatest(a=>a.priceOkPct), avg(a=>a.visitDonePct)].map(v=>+v.toFixed(1)),
+      }], { x:0.5, y:1.05, w:6.6, h:3.3, barDir:'bar', chartColors:[RED], showValue:true, dataLabelColor:DARK, dataLabelFontSize:10, catAxisLabelFontSize:11, valAxisMaxVal:100, showLegend:false, title:'Network KPIs (%)', titleFontSize:12, titleColor:DARK });
+    }catch(e){ console.error('bar chart failed', e); }
+    try{
+      s3.addChart(pptx.ChartType.doughnut, [{
+        name:'Price status', labels:['Matching RSP','Not matching RSP'], values:[priceOnCount, Math.max(0,priceOffCount)],
+      }], { x:7.3, y:1.05, w:5.5, h:3.3, chartColors:[GREEN, RED], showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', title:'Price Compliance', titleFontSize:12, titleColor:DARK });
+    }catch(e){ console.error('doughnut chart failed', e); }
+    s3.addText([
+      {text:`Avg stock coverage: ${fmt(stockSummaryForPpt.avgCoverage,1)} days`, options:{bullet:true, breakLine:true}},
+      {text:`Visits verified with photo + GPS: ${fmt(aggs.length?aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100:0)}%`, options:{bullet:true, breakLine:true}},
+    ], { x:0.5, y:4.6, w:12.3, h:0.8, fontSize:11.5, color:SOFT });
+    footer(s3, 'KPI Overview');
+
+        } catch(e) { console.error('KPI Overview: charts, not boxes slide failed', e); }
+// ---------- Category Mix ----------
+    try {
+
+    let s3b = pptx.addSlide();
+    s3b.addText('Category Mix', { x:0.5, y:0.35, w:12, h:0.55, fontSize:26, bold:true, color:DARK });
+    try{
+      s3b.addChart(pptx.ChartType.pie, [{
+        name:'Network velocity share', labels: catRows.map(c=>c.category), values: catRows.map(c=>{
+          return skuRows.filter(r=>r.category===c.category).reduce((s,r)=>s+r.totalVelNetwork,0);
+        }).map(v=>+v.toFixed(1)),
+      }], { x:0.6, y:1.1, w:6.2, h:5.6, chartColors:CHART_COLORS, showLegend:true, legendPos:'b', showPercent:true, dataLabelColor:'FFFFFF', dataLabelFontSize:9, title:'Share of network units/day by category', titleFontSize:12, titleColor:DARK });
+    }catch(e){ console.error('pie chart failed', e); }
+    const catTable = [[{text:'Category',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SUC%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}},{text:'Avg SOS%',options:{bold:true,color:'FFFFFF',fill:{color:RED}}}]];
+    catRows.forEach((c,i)=>catTable.push([
+      {text:c.category, options:{fill:{color:i%2?'F6F2EF':'FFFFFF'}}},
+      {text:fmt(c.avgSfr), options:{fill:{color:i%2?'F6F2EF':'FFFFFF'}}},
+      {text:fmt(c.avgSos), options:{fill:{color:i%2?'F6F2EF':'FFFFFF'}}},
+    ]));
+    s3b.addTable(catTable, { x:7.1, y:1.1, w:5.7, fontSize:11, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.38 });
+    footer(s3b, 'Category Mix');
+
+        } catch(e) { console.error('Category Mix slide failed', e); }
+// ---------- Category / SKU performance ----------
+    try {
+
+    let s5 = pptx.addSlide();
+    s5.addText('SKU Performance', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+    try{
+      s5.addChart(pptx.ChartType.bar, [{
+        name:'Vel/store/d', labels: skuRows.slice(0,8).map(r=>r.name), values: skuRows.slice(0,8).map(r=>+r.avgVelPerStore.toFixed(1)),
+      }], { x:0.5, y:1.0, w:12.3, h:3.4, barDir:'bar', chartColors:[RED], showValue:true, dataLabelColor:DARK, dataLabelFontSize:10, catAxisLabelFontSize:10, showLegend:false, title:'Top 8 SKUs — avg units/store/day', titleFontSize:12, titleColor:DARK });
+    }catch(e){ console.error('sku bar chart failed', e); }
+    const skuHeader = ['SKU','Category','Vel/store/d','Network total/d','Coverage','Price OK%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+    const skuTable = [skuHeader];
+    skuRows.slice(0,8).forEach((r,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      skuTable.push([r.name, r.category, fmt(r.avgVelPerStore,1), fmt(r.totalVelNetwork,1), fmt(r.coveragePct)+'%', fmt(r.priceOkPct)].map(v=>({text:String(v), options:{fill:{color:fillC}}})));
+    });
+    s5.addTable(skuTable, { x:0.5, y:4.6, w:12.3, fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.32 });
+    footer(s5, 'SKU Performance');
+
+        } catch(e) { console.error('Category / SKU performance slide failed', e); }
+// ---------- Best & Worst Performers ----------
+    try {
+
+    let s5b = pptx.addSlide();
+    s5b.addText('Best & Worst Performers', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+    s5b.addText('Network-wide, across every approved visit', { x:0.5, y:0.85, w:12, h:0.3, fontSize:11, italic:true, color:SOFT });
+    const bestByStoreVel = [...skuRows].filter(r=>r.avgVelPerStore>0).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore)[0];
+    const bestByNetworkVel = [...skuRows].filter(r=>r.totalVelNetwork>0).sort((a,b)=>b.totalVelNetwork-a.totalVelNetwork)[0];
+    const carried = skuRows.filter(r=>r.n>0);
+    const bestCoverage = [...carried].sort((a,b)=>b.coveragePct-a.coveragePct)[0];
+    const worstCoverage = [...carried].sort((a,b)=>a.coveragePct-b.coveragePct)[0];
+    const statCard = (x, y, w, h, label, skuName, skuCategory, bigValue, bigColor) => {
+      try{ s5b.addShape('roundRect', { x, y, w, h, fill:{color:'FBF9F8'}, line:{color:LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
+      s5b.addText(label, { x:x+0.25, y:y+0.15, w:w-0.5, h:0.3, fontSize:11, bold:true, color:SOFT });
+      s5b.addText(bigValue, { x:x+0.25, y:y+0.45, w:w-0.5, h:0.7, fontSize:32, bold:true, color:bigColor });
+      s5b.addText(skuName||'—', { x:x+0.25, y:y+1.15, w:w-0.5, h:0.35, fontSize:13, bold:true, color:DARK });
+      s5b.addText(skuCategory||'', { x:x+0.25, y:y+1.48, w:w-0.5, h:0.3, fontSize:10, color:SOFT });
+    };
+    statCard(0.5, 1.3, 5.95, 2.0, 'BEST SELLER — PER STORE/DAY', bestByStoreVel?.name, bestByStoreVel?.category, bestByStoreVel?fmt(bestByStoreVel.avgVelPerStore,1)+' units/store/d':'—', GREEN);
+    statCard(6.75, 1.3, 5.95, 2.0, 'BEST SELLER — TOTAL NETWORK VOLUME', bestByNetworkVel?.name, bestByNetworkVel?.category, bestByNetworkVel?fmt(bestByNetworkVel.totalVelNetwork,0)+' units/day': '—', GREEN);
+    statCard(0.5, 3.55, 5.95, 2.0, 'BEST COVERAGE — MOST STORES CARRYING IT', bestCoverage?.name, bestCoverage?.category, bestCoverage?fmt(bestCoverage.coveragePct)+'%':'—', GREEN);
+    statCard(6.75, 3.55, 5.95, 2.0, 'LEAST COVERAGE — FEWEST STORES CARRYING IT', worstCoverage?.name, worstCoverage?.category, worstCoverage?fmt(worstCoverage.coveragePct)+'%':'—', RED);
+    footer(s5b, 'Best & Worst Performers');
+
+        } catch(e) { console.error('Best & Worst Performers slide failed', e); }
+
+    await pptx.writeFile({ fileName: `Shelf-Pulse-Executive-Summary-${todayStr()}.pptx` });
+    showToast('PowerPoint downloaded ✓');
+  } catch(err){
+    console.error(err);
+    showToast(err.message || 'Could not build the PowerPoint.');
+  } finally {
+    if(btn){ btn.textContent = 'Executive Summary'; btn.disabled = false; }
+  }
+}
+
+/* Focused single-account deck — just the one customer's overview (3-5 action plans + above-RSP
+   pricing rolled up across all its branches) followed by EVERY one of its branches (no severity cap,
+   unlike the full-network export — a one-customer deck is naturally bounded by that customer's own
+   branch count, so there's no need to trim it), each with its own action plan + pricing. Meant to be
+   handed straight to the sales person responsible for that one account. */
+async function exportPptAccount(customerName){
+  const btn = document.getElementById('ppt-account-btn');
+  if(btn){ btn.textContent = 'Building…'; btn.disabled = true; }
+  try{
+    await loadPptxLib();
+    const { approved, customers, custOpps } = buildPptContext();
+    const c = customers.find(x=>x.name===customerName);
+    if(!c){ showToast('No approved visit data for this customer yet'); return; }
+    const custOpp = custOpps.find(co=>co.name===customerName);
+    const RED=PPT_RED, DARK=PPT_DARK;
+    const pptx = newPptx(`${customerName} — Account Summary`);
+
+    let s1 = pptx.addSlide();
+    s1.background = { color: RED };
+    s1.addText(customerName, { x:0.7, y:2.6, w:11.9, h:1, fontSize:40, bold:true, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText('Account Summary — Shelf Pulse, Cairo 3A (Shahd)', { x:0.7, y:3.5, w:11.9, h:0.6, fontSize:18, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText(`Generated ${new Date().toLocaleDateString()} · ${c.branchCount} branch(es) · from approved visits only`, { x:0.7, y:4.15, w:11.9, h:0.5, fontSize:13, color:'FBEAEA', fontFace:'Arial' });
+
+    buildCustomerDetailSlides(pptx, c, custOpp, Infinity);
+
+    await pptx.writeFile({ fileName: `${customerName.replace(/[^\w\u0600-\u06FF]+/g,'-')}-Account-Summary-${todayStr()}.pptx` });
+    showToast('PowerPoint downloaded ✓');
+  } catch(err){
+    console.error(err);
+    showToast(err.message || 'Could not build the PowerPoint.');
+  } finally {
+    if(btn){ btn.textContent = '⬇ Download'; btn.disabled = false; }
   }
 }
 
@@ -4403,8 +4734,176 @@ function screenTeam(){
   </div>`;
 }
 
+/* ---- Monthly Scorecard — a specific month, drill down supervisor → merchandiser ----
+   Unlike the all-time Scorecard above (approved visits only, no particular period), this scopes to
+   one calendar month and uses EVERY visit submitted that month regardless of status — rejected and
+   pending visits are exactly what "data accuracy" needs to be measured against; filtering them out
+   would make every merchandiser look 100% accurate by definition. */
+function computeMonthlyScorecard(month){
+  const monthVisits = State.visits.filter(v => v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
+  const byMerch = {};
+  monthVisits.forEach(v=>{
+    byMerch[v.auditor] = byMerch[v.auditor] || { all:[], approved:[], rejected:[], pending:[] };
+    const g = byMerch[v.auditor];
+    g.all.push(v);
+    if(v.status==='approved') g.approved.push(v);
+    else if(v.status==='rejected') g.rejected.push(v);
+    else g.pending.push(v);
+  });
+  return Object.entries(byMerch).map(([merch, g])=>{
+    const target = targetForMerch(merch);
+    const totalVisits = g.all.length;
+    const reviewed = g.approved.length + g.rejected.length; // pending visits haven't been judged yet, so they're excluded from accuracy
+    const accuracyPct = reviewed>0 ? g.approved.length/reviewed*100 : null;
+    const completionVals = g.all.map(v=>visitAggregate(v).visitDonePct);
+    const dataCompletion = completionVals.length ? completionVals.reduce((s,x)=>s+x,0)/completionVals.length : 0;
+    return {
+      merch, sup: supervisorOfMerch(merch), target, totalVisits,
+      approvedCount: g.approved.length, rejectedCount: g.rejected.length, pendingCount: g.pending.length,
+      accuracyPct, dataCompletion,
+      visitAchievedPct: target>0 ? Math.min(150, totalVisits/target*100) : null,
+    };
+  }).sort((a,b)=>b.totalVisits-a.totalVisits);
+}
+function setScorecardView(v){ State.scorecardView = v; render(); }
+function setScorecardMonth(v){ State.scorecardMonth = v; render(); }
+function selectScorecardSupervisor(name){ State.scorecardSupervisor = name; State.scorecardMerch = null; render(); }
+function backToScorecardSupervisors(){ State.scorecardSupervisor = null; State.scorecardMerch = null; render(); }
+function selectScorecardMerch(name){ State.scorecardMerch = name; render(); }
+function backToScorecardTeam(){ State.scorecardMerch = null; render(); }
+function monthlyMerchCardHtml(r){
+  return `<div class="card" style="cursor:pointer" onclick="selectScorecardMerch('${r.merch.replace(/'/g,"\\'")}')">
+    <div class="visit-row" style="border:none;padding:0 0 8px">
+      <div class="visit-main">${r.merch}</div>
+      <div style="font-weight:800;color:${r.target?barColor(r.visitAchievedPct):'var(--ink-soft)'}">${r.totalVisits}${r.target?'/'+r.target:''}</div>
+    </div>
+    <div class="verify-row">
+      ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete / اكتمال')}
+      ${r.accuracyPct!=null ? statusChip(r.accuracyPct>=90?'on':r.accuracyPct>=70?'watch':'off', fmt(r.accuracyPct)+'% accurate / دقة') : statusChip('neutral','No reviewed visits yet')}
+    </div>
+  </div>`;
+}
+function screenMonthlyScorecard(){
+  const month = State.scorecardMonth || todayStr().slice(0,7);
+  const rows = computeMonthlyScorecard(month);
+  const monthLabel = new Date(month+'-01T00:00:00').toLocaleDateString('en-GB',{year:'numeric', month:'long'});
+
+  const monthPicker = `<input type="month" value="${month}" onchange="setScorecardMonth(this.value)" style="margin-bottom:12px"/>`;
+
+  // Supervisor role: no picker needed, they only ever see their own team.
+  if(State.role==='supervisor'){
+    const mySet = new Set(myMerchandisers());
+    const teamRows = rows.filter(r=>mySet.has(r.merch));
+    return screenMonthlyTeamView(month, monthLabel, monthPicker, State.name, teamRows, false);
+  }
+
+  if(State.scorecardMerch){
+    const r = rows.find(x=>x.merch===State.scorecardMerch);
+    return screenMonthlyMerchDetail(month, monthLabel, monthPicker, r, State.scorecardMerch);
+  }
+  if(State.scorecardSupervisor){
+    const teamRows = rows.filter(r=>r.sup===State.scorecardSupervisor);
+    return screenMonthlyTeamView(month, monthLabel, monthPicker, State.scorecardSupervisor, teamRows, true);
+  }
+  // Top level: pick a supervisor
+  const supNames = Object.values(SUPERVISOR_PASSWORDS);
+  return `<div class="screen">
+    <h1>Monthly Scorecard / بطاقة الأداء الشهرية</h1>
+    ${scorecardPillRow()}
+    <p class="lede">${monthLabel} — pick a supervisor to see their team, then a merchandiser for full detail.</p>
+    ${monthPicker}
+    ${supNames.map(sup=>{
+      const teamRows = rows.filter(r=>r.sup===sup);
+      const teamVisits = teamRows.reduce((s,r)=>s+r.totalVisits,0);
+      const teamTarget = teamRows.reduce((s,r)=>s+(r.target||0),0);
+      const reviewedAll = teamRows.reduce((s,r)=>s+r.approvedCount+r.rejectedCount,0);
+      const approvedAll = teamRows.reduce((s,r)=>s+r.approvedCount,0);
+      const teamAccuracy = reviewedAll>0 ? approvedAll/reviewedAll*100 : null;
+      return `<div class="card" style="cursor:pointer" onclick="selectScorecardSupervisor('${sup.replace(/'/g,"\\'")}')">
+        <div class="visit-row" style="border:none;padding:0 0 8px">
+          <div class="visit-main">${sup}</div>
+          <div style="font-weight:800;color:${teamTarget?barColor(Math.min(150,teamVisits/teamTarget*100)):'var(--ink-soft)'}">${teamVisits}${teamTarget?'/'+teamTarget:''}</div>
+        </div>
+        <div class="verify-row">
+          ${statusChip('neutral', `${teamRows.length} merchandiser${teamRows.length===1?'':'s'}`)}
+          ${teamAccuracy!=null ? statusChip(teamAccuracy>=90?'on':teamAccuracy>=70?'watch':'off', fmt(teamAccuracy)+'% accurate / دقة') : statusChip('neutral','No reviewed visits yet')}
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+function screenMonthlyTeamView(month, monthLabel, monthPicker, supName, teamRows, showBack){
+  const teamVisits = teamRows.reduce((s,r)=>s+r.totalVisits,0);
+  const teamTarget = teamRows.reduce((s,r)=>s+(r.target||0),0);
+  const reviewedAll = teamRows.reduce((s,r)=>s+r.approvedCount+r.rejectedCount,0);
+  const approvedAll = teamRows.reduce((s,r)=>s+r.approvedCount,0);
+  const teamAccuracy = reviewedAll>0 ? approvedAll/reviewedAll*100 : null;
+  const teamCompletion = teamRows.length ? teamRows.reduce((s,r)=>s+r.dataCompletion,0)/teamRows.length : 0;
+  return `<div class="screen">
+    ${showBack ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardSupervisors()">← Back to supervisors</button>` : ''}
+    <h1>${supName} — ${monthLabel}</h1>
+    ${scorecardPillRow()}
+    <p class="lede">Team summary, then tap a merchandiser for full detail.</p>
+    ${monthPicker}
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">Team summary</h3>
+      <div class="verify-row">
+        ${statusChip('neutral', `${teamVisits}${teamTarget?'/'+teamTarget:''} total visits`)}
+        ${statusChip(teamCompletion>=95?'on':'watch', fmt(teamCompletion)+'% data complete')}
+        ${teamAccuracy!=null ? statusChip(teamAccuracy>=90?'on':teamAccuracy>=70?'watch':'off', fmt(teamAccuracy)+'% accurate (approved vs rejected)') : statusChip('neutral','No reviewed visits yet')}
+      </div>
+    </div>
+    ${teamRows.length===0 ? emptyState('👥','No visits this month','') : teamRows.map(monthlyMerchCardHtml).join('')}
+  </div>`;
+}
+function screenMonthlyMerchDetail(month, monthLabel, monthPicker, r, merchName){
+  const showBackToTeam = State.role!=='supervisor';
+  if(!r){
+    return `<div class="screen">
+      ${showBackToTeam ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardTeam()">← Back</button>` : ''}
+      <h1>${merchName}</h1>
+      ${scorecardPillRow()}
+      ${emptyState('📭','No visits this month', monthLabel)}
+    </div>`;
+  }
+  return `<div class="screen">
+    ${showBackToTeam ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardTeam()">← Back to team</button>` : ''}
+    <h1>${r.merch} — ${monthLabel}</h1>
+    ${scorecardPillRow()}
+    ${r.sup ? `<p class="lede">Supervisor: ${r.sup}</p>` : ''}
+    ${monthPicker}
+    <div class="card">
+      <h3>Visits vs target</h3>
+      <div style="font-size:28px;font-weight:800;color:${r.target?barColor(r.visitAchievedPct):'var(--ink)'}">${r.totalVisits}${r.target?' / '+r.target:''}</div>
+      ${r.target ? `<div class="bar-track" style="margin-top:6px"><div class="bar-fill" style="width:${Math.min(100,r.visitAchievedPct)}%;background:${barColor(r.visitAchievedPct)}"></div></div>` : `<p class="hint">No target on file for this merchandiser.</p>`}
+    </div>
+    <div class="card">
+      <h3>Data completion</h3>
+      <div class="verify-row">${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% of required fields filled, avg across all visits this month')}</div>
+    </div>
+    <div class="card">
+      <h3>Data accuracy — approved vs rejected</h3>
+      <div class="verify-row">
+        ${statusChip('on', `${r.approvedCount} approved`)}
+        ${statusChip('off', `${r.rejectedCount} rejected`)}
+        ${statusChip('neutral', `${r.pendingCount} pending`)}
+      </div>
+      ${r.accuracyPct!=null
+        ? `<p class="hint" style="margin-top:8px">${fmt(r.accuracyPct)}% of reviewed visits were approved (pending visits aren't counted until reviewed).</p>`
+        : `<p class="hint" style="margin-top:8px">No visits reviewed yet this month.</p>`}
+    </div>
+  </div>`;
+}
+
 /* ---- Scorecard ---- */
+function scorecardPillRow(){
+  return `<div class="pillrow">
+    <button class="${State.scorecardView!=='monthly'?'active':''}" onclick="setScorecardView('alltime')">All-time / كل الوقت</button>
+    <button class="${State.scorecardView==='monthly'?'active':''}" onclick="setScorecardView('monthly')">Monthly / شهري</button>
+  </div>`;
+}
 function screenScorecard(){
+  if(State.scorecardView==='monthly') return screenMonthlyScorecard();
   const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
   const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
   const byMerch = {};
@@ -4424,9 +4923,10 @@ function screenScorecard(){
     const avgDuration = durations.length ? durations.reduce((s,m)=>s+m,0)/durations.length : null;
     return { merch, sup: supervisorOfMerch(merch), visits: visits.length, branchCount: branches.length, target, achieved, score: scoreFor(a), avgDuration, ...a };
   }).sort((a,b)=>b.score-a.score);
-  if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1><p class="lede">Weighted score by merchandiser.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
+  if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1>${scorecardPillRow()}<p class="lede">Weighted score by merchandiser.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
   return `<div class="screen">
     <h1>Scorecard / بطاقة الأداء</h1>
+    ${scorecardPillRow()}
     <p class="lede">Weighted score by merchandiser — SUC 25% · OSA 15% · Price 20% · SOS 15% · Visit compliance 15% · Data completion 10%.</p>
     ${rows.map((r,idx)=>`
       <div class="card">
@@ -5397,7 +5897,9 @@ Object.assign(window, {
   go, setNavContext, logout, selectLoginRole, backToLoginMenu, attemptMerchandiserLogin, attemptMerchEmpidLogin, cancelMerchLogin, attemptPasswordLogin, setLoginPassword,
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
-  submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportExcel, resetVisits,
+  submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
+  openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
+  setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
