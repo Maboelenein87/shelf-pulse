@@ -3564,18 +3564,32 @@ const OPP_LOW_STOCK_DAYS = 3;
 const OPP_OVERSTOCK_DAYS = 21; // 3 weeks
 const OPP_LOW_SOS_PCT = 20;
 const OPP_LOW_SUC_PCT = 70;
+// Each issue carries plain structured fields (sku, velocity, stock, coverage, price, RSP, risk) rather
+// than a pre-written sentence, so it can be rendered as a scannable table — in the app and in the PPT
+// — instead of a wall of text. Risk is a simple 3-level triage: High = actual/imminent lost sales
+// (out of stock), Medium = ongoing performance drag (price, SOS, SUC), Low = tied-up cash, not urgent
+// (overstock).
+const OPP_RISK = { lowstock:'High', price:'Medium', sos:'Medium', sfr:'Medium', overstock:'Low' };
+const OPP_RISK_RANK = { High:0, Medium:1, Low:2 };
 function computeCustomerOpportunities(approved){
   const customers = computeCustomerAnalysis(approved);
   return customers.map(c=>{
     const branches = c.branches.map(b=>{
       const issues = [];
-      if(b.sos < OPP_LOW_SOS_PCT) issues.push({type:'sos', text:`Low shelf share — only ${fmt(b.sos)}% SOS (below ${OPP_LOW_SOS_PCT}%). Worth negotiating more facings with the category buyer.`});
-      if(b.sfr < OPP_LOW_SUC_PCT) issues.push({type:'sfr', text:`Low shelf utilization — only ${fmt(b.sfr)}% SUC (below ${OPP_LOW_SUC_PCT}%). Facing or replenishment gap.`});
+      if(b.sos < OPP_LOW_SOS_PCT) issues.push({ type:'sos', risk:OPP_RISK.sos, sku:'—', category:'—', vel:null, stock:null, coverageDays:null, price:null, rsp:null, note:`SOS ${fmt(b.sos)}% (< ${OPP_LOW_SOS_PCT}%) — negotiate more facings` });
+      if(b.sfr < OPP_LOW_SUC_PCT) issues.push({ type:'sfr', risk:OPP_RISK.sfr, sku:'—', category:'—', vel:null, stock:null, coverageDays:null, price:null, rsp:null, note:`SUC ${fmt(b.sfr)}% (< ${OPP_LOW_SUC_PCT}%) — facing/replenishment gap` });
       b.skuList.forEach(s=>{
-        if(s.priceStatus && s.priceStatus!=='neutral' && s.priceStatus!=='on') issues.push({type:'price', text:`${s.name} priced at ${fmt(s.actualPrice)} EGP vs RSP ${fmt(s.rsp)} EGP — ${s.priceStatus==='watch'?'above':'below'} RSP.`});
-        if(s.stock===0 || (isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<OPP_LOW_STOCK_DAYS)) issues.push({type:'lowstock', text:`${s.name} is low vs this branch's own sales — ${s.stock===0?'out of stock':fmt(s.coverageDays,1)+' days of cover left'} (${fmt(s.stock)} units). Restock urgently.`});
-        if(isFinite(s.coverageDays) && s.coverageDays>OPP_OVERSTOCK_DAYS) issues.push({type:'overstock', text:`${s.name} looks overstocked vs this branch's own sales — ${fmt(s.coverageDays,1)} days of cover (${fmt(s.stock)} units). Consider pausing the next delivery or redistributing.`});
+        if(s.priceStatus && s.priceStatus!=='neutral' && s.priceStatus!=='on'){
+          issues.push({ type:'price', risk:OPP_RISK.price, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:s.priceStatus==='watch'?'Above RSP':'Below RSP' });
+        }
+        if(s.stock===0 || (isFinite(s.coverageDays) && s.coverageDays>0 && s.coverageDays<OPP_LOW_STOCK_DAYS)){
+          issues.push({ type:'lowstock', risk:OPP_RISK.lowstock, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:s.stock===0?'Out of stock':'Restock urgently' });
+        }
+        if(isFinite(s.coverageDays) && s.coverageDays>OPP_OVERSTOCK_DAYS){
+          issues.push({ type:'overstock', risk:OPP_RISK.overstock, sku:s.name, category:s.category, vel:s.avgVel, stock:s.stock, coverageDays:s.coverageDays, price:s.actualPrice, rsp:s.rsp, note:'Pause next delivery / redistribute' });
+        }
       });
+      issues.sort((a,b2)=>OPP_RISK_RANK[a.risk]-OPP_RISK_RANK[b2.risk]); // High first — the rows needing action surface immediately
       return { branch:b.branch, sfr:b.sfr, sos:b.sos, issues };
     }).filter(b=>b.issues.length>0);
     return { name:c.name, branches, totalIssues: branches.reduce((s,b)=>s+b.issues.length,0) };
@@ -3588,13 +3602,26 @@ function summarizeOpportunities(custOpps){
   custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchCount++; b.issues.forEach(i=>{ if(counts[i.type]!=null) counts[i.type]++; }); }); });
   return { counts, branchCount, totalIssues: custOpps.reduce((s,c)=>s+c.totalIssues,0) };
 }
-function issueIcon(type){
-  return {lowstock:'🔴', overstock:'🟡', sos:'🟠', sfr:'🟡', price:'🟠', data:'⚠️'}[type] || '•';
+function riskChipKind(risk){ return risk==='High' ? 'off' : risk==='Medium' ? 'watch' : 'neutral'; }
+function opportunityRowsHtml(issues){
+  return `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:6px"><table class="mini">
+    <tr><th>SKU</th><th>Vel/d</th><th>Stock</th><th>Coverage</th><th>Price</th><th>RSP</th><th>Risk</th><th>Note</th></tr>
+    ${issues.map(i=>`<tr>
+      <td>${i.sku}${i.category!=='—'?`<br><span class="hint">${i.category}</span>`:''}</td>
+      <td>${i.vel!=null?fmt(i.vel,1):'—'}</td>
+      <td>${i.stock!=null?fmt(i.stock):'—'}</td>
+      <td>${i.coverageDays!=null?(isFinite(i.coverageDays)?fmt(i.coverageDays,1)+'d':'∞'):'—'}</td>
+      <td>${i.price!=null?fmt(i.price):'—'}</td>
+      <td>${i.rsp!=null?fmt(i.rsp):'—'}</td>
+      <td>${statusChip(riskChipKind(i.risk), i.risk)}</td>
+      <td>${i.note}</td>
+    </tr>`).join('')}
+  </table></div>`;
 }
 function dashOpportunities(approved){
   const rows = computeCustomerOpportunities(approved);
   if(rows.length===0) return emptyState('💡','No clear opportunities yet','Needs more approved visits to compare across branches.');
-  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch — each one compared against its own numbers: low or high stock, price vs RSP, low SOS, low SUC.</p>
+  return `<p class="hint" style="margin-bottom:10px">Tap a customer to see flagged issues by branch, as a table — sorted by risk so High-risk rows surface first. Every check is the branch compared to its own numbers.</p>
   ${rows.map(r=>{
     const open = State.expandedCategory === 'opp:'+r.name;
     return `<div class="card">
@@ -3603,11 +3630,9 @@ function dashOpportunities(approved){
         <div style="font-size:16px">${open?'−':'+'}</div>
       </div>
       ${open ? r.branches.map(b=>`
-        <div class="branch-toggle" style="border-top:1px solid var(--line);cursor:default">
-          <div style="width:100%">
-            <div class="visit-sub" style="font-weight:700;color:var(--ink);margin-bottom:6px">${b.branch} <span class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%</span></div>
-            ${b.issues.map(i=>`<p style="font-size:12px;margin:4px 0">${issueIcon(i.type)} ${i.text}</p>`).join('')}
-          </div>
+        <div class="branch-toggle" style="border-top:1px solid var(--line);cursor:default;display:block">
+          <div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch} <span class="hint">SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%</span></div>
+          ${opportunityRowsHtml(b.issues)}
         </div>`).join('') : ''}
     </div>`;
   }).join('')}`;
@@ -3901,34 +3926,57 @@ async function exportPpt(){
     footer(s7, 'Priced Above RSP');
 
         } catch(e) { console.error('Pricing vs RSP slide failed', e); }
-// ---------- Branches Needing Attention (every flagged branch, the simpler per-branch view) ----------
+// ---------- Branches Needing Attention (every flagged branch, as a table — same columns as the app) ----------
     try {
 
-    const branchIssueRows = [];
-    custOpps.forEach(c=>{ c.branches.forEach(b=>{ branchIssueRows.push({ customer:c.name, branch:b.branch, issues:b.issues.map(i=>i.text) }); }); });
-    const ATT_PER_PAGE = 8;
-    const attPages = [];
-    for(let i=0; i<branchIssueRows.length; i+=ATT_PER_PAGE) attPages.push(branchIssueRows.slice(i, i+ATT_PER_PAGE));
-    if(attPages.length===0) attPages.push([]);
-    attPages.forEach((page, pageIdx)=>{
-     try{
+    // A real network can flag hundreds of branches with thousands of rows between them — more than
+    // any deck should try to paginate through. Capped to the worst branches by issue count, each
+    // shown as a proper table (highest-risk rows first, same columns the in-app Opportunities tab
+    // uses); the complete, unlimited, always-current list stays one tap away in the app itself.
+    const PPT_BRANCHES_CAP = 40;
+    const PPT_ROWS_PER_BRANCH = 12;
+    const flatBranches = [];
+    custOpps.forEach(c=>{ c.branches.forEach(b=>{ flatBranches.push({ customer:c.name, branch:b.branch, sfr:b.sfr, sos:b.sos, issues:b.issues }); }); });
+    flatBranches.sort((a,b)=>b.issues.length-a.issues.length);
+    const branchesForPpt = flatBranches.slice(0, PPT_BRANCHES_CAP);
+
+    if(branchesForPpt.length===0){
       let s6b = pptx.addSlide();
-      s6b.addText(attPages.length>1 ? `Branches Needing Attention (${pageIdx+1}/${attPages.length})` : 'Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
-      s6b.addText(`${branchIssueRows.length} branch(es) flagged network-wide — each compared only against its own numbers.`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:11, italic:true, color:SOFT });
-      if(page.length===0){
-        s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
-      } else {
-        const attHeader = ['Customer','Branch','Issues'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
-        const attRows = [attHeader];
-        page.forEach((r,i)=>{
-          const fillC = i%2?'F6F2EF':'FFFFFF';
-          attRows.push([r.customer, r.branch, r.issues.map(t=>'• '+t).join('\n')].map(v=>({text:String(v), options:{fill:{color:fillC}, valign:'top'}})));
-        });
-        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[2.6,1.8,7.9], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, valign:'top' });
-      }
+      s6b.addText('Branches Needing Attention', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:DARK });
+      s6b.addText('No branches currently flagged — everything is within normal ranges.', { x:0.5, y:1.5, w:12, h:0.5, fontSize:13, color:SOFT });
       footer(s6b, 'Branches Needing Attention');
-     }catch(e){ console.error('Skipping Branches Needing Attention page', pageIdx, e); }
-    });
+    } else {
+      branchesForPpt.forEach((bb, idx) => {
+       try{
+        let s6b = pptx.addSlide();
+        s6b.addText(`${bb.customer} — ${bb.branch}`, { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
+        s6b.addText(`SUC ${fmt(bb.sfr)}% · SOS ${fmt(bb.sos)}% · ${bb.issues.length} issue(s), highest risk first  ·  branch ${idx+1}/${branchesForPpt.length} (worst by issue count)`, { x:0.5, y:0.85, w:12, h:0.35, fontSize:10.5, italic:true, color:SOFT });
+        const rowsForSlide = bb.issues.slice(0, PPT_ROWS_PER_BRANCH);
+        const attHeader = ['SKU','Vel/d','Stock','Coverage','Price','RSP','Risk','Note'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:RED}}}));
+        const attRows = [attHeader];
+        rowsForSlide.forEach((i,ri)=>{
+          const fillC = ri%2?'F6F2EF':'FFFFFF';
+          const riskColor = i.risk==='High'?RED:(i.risk==='Medium'?AMBER:GREEN);
+          attRows.push([
+            i.sku, i.vel!=null?fmt(i.vel,1):'—', i.stock!=null?fmt(i.stock):'—',
+            i.coverageDays!=null?(isFinite(i.coverageDays)?fmt(i.coverageDays,1):'∞'):'—',
+            i.price!=null?fmt(i.price):'—', i.rsp!=null?fmt(i.rsp):'—', i.risk, i.note,
+          ].map((v,ci)=>({text:String(v), options:{fill:{color:fillC}, color: ci===6?riskColor:DARK, bold: ci===6}})));
+        });
+        s6b.addTable(attRows, { x:0.5, y:1.35, w:12.3, colW:[3.0,1.1,1.1,1.3,1.1,1.1,1.1,2.6], fontSize:9.5, border:{color:LINE, pt:0.5}, autoPage:false, rowH:0.3 });
+        if(bb.issues.length>PPT_ROWS_PER_BRANCH){
+          s6b.addText(`+ ${bb.issues.length-PPT_ROWS_PER_BRANCH} more issue(s) for this branch — see the live Opportunities tab for the full list.`, { x:0.5, y:1.35+(rowsForSlide.length+1)*0.3+0.1, w:12, h:0.3, fontSize:9, italic:true, color:SOFT });
+        }
+        footer(s6b, 'Branches Needing Attention');
+       }catch(e){ console.error('Skipping branch attention slide', bb.branch, e); }
+      });
+      if(flatBranches.length>PPT_BRANCHES_CAP){
+        let s6c = pptx.addSlide();
+        s6c.addText('Branches Needing Attention — more branches', { x:0.5, y:0.35, w:12, h:0.5, fontSize:22, bold:true, color:DARK });
+        s6c.addText(`${flatBranches.length-PPT_BRANCHES_CAP} more flagged branch(es) beyond the top ${PPT_BRANCHES_CAP} shown here — see the live Opportunities tab in the app for the complete, always-current list.`, { x:0.5, y:1.3, w:12, h:1, fontSize:13, color:SOFT });
+        footer(s6c, 'Branches Needing Attention');
+      }
+    }
 
         } catch(e) { console.error('Branches Needing Attention slide failed', e); }
 // ---------- Per-account insights & recommendations (top 8 by visit volume) ----------
@@ -3948,7 +3996,8 @@ async function exportPpt(){
       const myCustOpp = custOpps.find(co=>co.name===c.name);
       if(myCustOpp && myCustOpp.branches.length){
         const topBranch = [...myCustOpp.branches].sort((a,b)=>b.issues.length-a.issues.length)[0];
-        if(topBranch && topBranch.issues[0]) out.push(`${topBranch.branch}: ${topBranch.issues[0].text}`);
+        const topIssue = topBranch && topBranch.issues[0]; // already sorted High risk first
+        if(topIssue) out.push(`${topBranch.branch} (${topIssue.risk} risk): ${topIssue.sku!=='—'?topIssue.sku+' — ':''}${topIssue.note}.`);
       }
       return out.slice(0,6);
     }
