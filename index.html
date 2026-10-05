@@ -3397,9 +3397,16 @@ function screenAccounts(){
         ${open ? c.branches.map(b=>{
           const bKey = 'abr:'+c.name+'|'+b.branch;
           const bOpen = State.expandedBranch === bKey;
-          const acct = State.accounts.find(a=>a.name===c.name && a.branch===b.branch);
-          const lastVisit = State.visits.filter(v=>v.accountName===c.name && v.branch===b.branch && v.status!=='rejected')
-            .sort((x,y)=>(y.submittedAt||0)-(x.submittedAt||0))[0];
+          // Looked up by the branch's own account ids — NOT by name text. c.name here is the canonical
+          // customer name ("سعودي") while accounts and visits store the raw ERP spelling ("سعودى"), and a
+          // route cycle upload deliberately rewrites account text to the file's spelling, so comparing
+          // name strings made merch/supervisor, last-visit duration and the monthly target chip all
+          // silently come up empty for any customer whose raw name isn't already its canonical form.
+          const branchAccts = State.accounts.filter(a=>(b.accountIds||[]).includes(a.id));
+          const acct = branchAccts.find(a=>a.merch) || branchAccts[0]
+            || State.accounts.find(a=>canonicalCustomerName(a.name)===c.name && a.branch===b.branch);
+          const branchVisitsAll = State.visits.filter(v=>(b.accountIds||[]).includes(v.accountId) && v.status!=='rejected');
+          const lastVisit = [...branchVisitsAll].sort((x,y)=>(y.submittedAt||0)-(x.submittedAt||0))[0];
           const durMins = lastVisit ? visitDurationMinutes(lastVisit) : null;
           const totalVel = b.skuList.reduce((s,sk)=>s+sk.avgVel,0);
           // Absolute facing counts from the latest visit — catFacings is one visit-level total copied
@@ -3412,7 +3419,7 @@ function screenAccounts(){
           // column — only counted for a target once that column has actually been uploaded for this
           // account; accounts never touched by a route cycle upload show no target chip at all.
           const monthPrefix = todayStr().slice(0,7);
-          const visitsThisMonth = State.visits.filter(v=>v.accountName===c.name && v.branch===b.branch && v.status!=='rejected' && (v.date||'').startsWith(monthPrefix)).length;
+          const visitsThisMonth = branchVisitsAll.filter(v=>(v.date||'').startsWith(monthPrefix)).length;
           return `<div class="branch-toggle" style="cursor:pointer" onclick="toggleBranchRow('${bKey.replace(/'/g,"\\'")}')">
             <div><div class="visit-sub" style="font-weight:700;color:var(--ink)">${b.branch}</div>
               <div class="hint">Last visited: ${b.lastVisitDate||'—'}${daysAgoLabel(b.lastVisitDate)}${durMins!==null?' · ⏱ '+fmtDuration(durMins):''}</div>
@@ -4410,33 +4417,31 @@ const ROUTE_CYCLE_COLUMNS = {
   channel: 'Channel', region: 'Region name', merchCode: 'Merchandiser code', merchName: 'Merchandiser Arabic name',
   supCode: 'Supervisor code', supName: 'Supervisor Arabic name', active: 'Merchandizer active', totalVisits: 'Total Visits',
 };
+function routeCycleSheetUsable(ws){
+  const rows = window.XLSX.utils.sheet_to_json(ws, { defval:'' });
+  if(rows.length===0) return null;
+  if(!(ROUTE_CYCLE_COLUMNS.name in rows[0]) || !(ROUTE_CYCLE_COLUMNS.merchCode in rows[0])) return null;
+  return rows;
+}
 async function handleRouteCycleFile(inputEl){
   const file = inputEl.files[0]; if(!file) return;
   try{
     await loadXlsxLib();
     const buf = await file.arrayBuffer();
     const wb = window.XLSX.read(buf, { type:'array' });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = window.XLSX.utils.sheet_to_json(ws, { defval:'' });
-    if(rows.length===0){ showToast('No rows found in that file'); return; }
-    if(!(ROUTE_CYCLE_COLUMNS.name in rows[0]) || !(ROUTE_CYCLE_COLUMNS.merchCode in rows[0])){
-      showToast("That file doesn't look like a route cycle export — expected columns like \"Customer Name\" and \"Merchandiser code\" weren't found.");
+    // A route plan workbook often holds one sheet per month ("Data September", "Data October") — the
+    // importer used to read only the FIRST sheet without saying so, so uploading an October plan that
+    // happened to have September in front of it quietly imported September's assignments instead.
+    // Every sheet is now listed, and the last usable one (the most recent month, by convention) is
+    // preselected; the preview names the sheet it's about to apply so it's never a guess.
+    const usable = wb.SheetNames.filter(n => routeCycleSheetUsable(wb.Sheets[n]));
+    if(usable.length===0){
+      showToast("That file doesn't look like a route cycle export — expected columns like \"Customer Name\" and \"Merchandiser code\" weren't found on any sheet.");
       return;
     }
-    State.routeCycleRows = rows;
-    const merchCodes = new Set(rows.map(r=>String(r[ROUTE_CYCLE_COLUMNS.merchCode]||'').trim()).filter(Boolean));
-    let newAccounts = 0, updatedAccounts = 0;
-    rows.forEach(row => {
-      const name = String(row[ROUTE_CYCLE_COLUMNS.name]||'').trim();
-      const branch = String(row[ROUTE_CYCLE_COLUMNS.branch]||'').trim();
-      if(!name || !branch) return;
-      const custId = row[ROUTE_CYCLE_COLUMNS.custId] != null ? String(row[ROUTE_CYCLE_COLUMNS.custId]).trim() : '';
-      const matched = (custId && State.accounts.find(a => a.customerId && a.customerId===custId))
-        || State.accounts.find(a => a.name.trim().toLowerCase()===name.toLowerCase() && a.branch.trim().toLowerCase()===branch.toLowerCase());
-      if(matched) updatedAccounts++; else newAccounts++;
-    });
-    State.routeCyclePreview = { rowCount: rows.length, merchCount: merchCodes.size, newAccounts, updatedAccounts };
-    render();
+    State.routeCycleWb = wb;
+    State.routeCycleSheets = usable;
+    loadRouteCycleSheet(usable[usable.length-1]);
   }catch(e){
     console.error(e);
     showToast("Could not read that file — make sure it's a valid .xlsx export.");
@@ -4444,10 +4449,38 @@ async function handleRouteCycleFile(inputEl){
     inputEl.value = '';
   }
 }
-function cancelRouteCycleUpload(){ State.routeCycleRows = null; State.routeCyclePreview = null; render(); }
+function loadRouteCycleSheet(sheetName){
+  const wb = State.routeCycleWb; if(!wb) return;
+  const rows = routeCycleSheetUsable(wb.Sheets[sheetName]);
+  if(!rows){ showToast('That sheet has no usable route cycle rows'); return; }
+  State.routeCycleRows = rows;
+  State.routeCycleSheet = sheetName;
+  const merchCodes = new Set(rows.map(r=>String(r[ROUTE_CYCLE_COLUMNS.merchCode]||'').trim()).filter(Boolean));
+  let newAccounts = 0, updatedAccounts = 0, merchChanges = 0;
+  const matchedIds = new Set();
+  rows.forEach(row => {
+    const name = String(row[ROUTE_CYCLE_COLUMNS.name]||'').trim();
+    const branch = String(row[ROUTE_CYCLE_COLUMNS.branch]||'').trim();
+    if(!name || !branch) return;
+    const custId = row[ROUTE_CYCLE_COLUMNS.custId] != null ? String(row[ROUTE_CYCLE_COLUMNS.custId]).trim() : '';
+    const matched = (custId && State.accounts.find(a => a.customerId && a.customerId===custId))
+      || State.accounts.find(a => a.name.trim().toLowerCase()===name.toLowerCase() && a.branch.trim().toLowerCase()===branch.toLowerCase());
+    if(matched){
+      updatedAccounts++;
+      matchedIds.add(matched.id);
+      const newMerch = String(row[ROUTE_CYCLE_COLUMNS.merchName]||'').trim();
+      if(newMerch && (matched.merch||'').trim()!==newMerch) merchChanges++;
+    } else newAccounts++;
+  });
+  const notInFile = State.accounts.filter(a=>a.medium!=='ecomm' && !matchedIds.has(a.id)).length;
+  State.routeCyclePreview = { rowCount: rows.length, merchCount: merchCodes.size, newAccounts, updatedAccounts, merchChanges, notInFile, sheetName };
+  render();
+}
+function selectRouteCycleSheet(name){ loadRouteCycleSheet(name); }
+function cancelRouteCycleUpload(){ State.routeCycleRows = null; State.routeCyclePreview = null; State.routeCycleWb = null; State.routeCycleSheets = null; State.routeCycleSheet = null; render(); }
 async function applyRouteCycleUpload(){
   if(!State.routeCycleRows) return;
-  if(!confirm(`Apply ${State.routeCycleRows.length} rows? This updates the account list and merchandiser directory — existing data for matched accounts will be overwritten with values from the file.`)) return;
+  if(!confirm(`Apply ${State.routeCycleRows.length} rows from sheet "${State.routeCycleSheet||''}"? This updates the account list and merchandiser directory — existing data for matched accounts will be overwritten with values from the file.`)) return;
   try{
     const directoryUpdates = {};
     State.routeCycleRows.forEach(row => {
@@ -4496,7 +4529,7 @@ async function applyRouteCycleUpload(){
     await refSet('merchDirectory', State.merchDirectory, ACCOUNTS_DATA_VERSION);
     const preview = State.routeCyclePreview;
     showToast(`Applied ✓ — ${preview.newAccounts} new account${preview.newAccounts===1?'':'s'}, ${preview.updatedAccounts} updated, ${Object.keys(directoryUpdates).length} merchandiser/supervisor codes recorded.`);
-    State.routeCycleRows = null; State.routeCyclePreview = null;
+    State.routeCycleRows = null; State.routeCyclePreview = null; State.routeCycleWb = null; State.routeCycleSheets = null; State.routeCycleSheet = null;
     render();
   }catch(e){
     console.error(e);
@@ -5493,11 +5526,20 @@ function manageBackendUploadsHtml(){
       <p class="hint" style="margin-bottom:10px">Upload the route cycle export (.xlsx) to update the account list — customer, branch, channel, region, and which merchandiser/supervisor covers each — and to record each merchandiser's own code, so logins get checked against the right person instead of any code from a shared list. Matches existing accounts by name + branch; anything not matched becomes a new account.</p>
       <input type="file" accept=".xlsx,.xls" onchange="handleRouteCycleFile(this)"/>
       ${State.routeCyclePreview ? `
+      ${(State.routeCycleSheets||[]).length>1 ? `
+      <div style="margin-top:10px"><label>Sheet to import</label>
+        <select onchange="selectRouteCycleSheet(this.value)">
+          ${State.routeCycleSheets.map(n=>`<option value="${n.replace(/"/g,'&quot;')}" ${n===State.routeCycleSheet?'selected':''}>${n}</option>`).join('')}
+        </select>
+      </div>` : ''}
+      <p class="hint" style="margin-top:8px">Reading sheet: <strong>${State.routeCyclePreview.sheetName}</strong></p>
       <div class="verify-row" style="margin-top:10px">
         ${statusChip('neutral', `${State.routeCyclePreview.rowCount} rows`)}
         ${statusChip('neutral', `${State.routeCyclePreview.merchCount} merchandiser codes`)}
         ${statusChip('on', `${State.routeCyclePreview.newAccounts} new accounts`)}
         ${statusChip('watch', `${State.routeCyclePreview.updatedAccounts} updated`)}
+        ${statusChip(State.routeCyclePreview.merchChanges>0?'watch':'neutral', `${State.routeCyclePreview.merchChanges} change merchandiser`)}
+        ${statusChip('neutral', `${State.routeCyclePreview.notInFile} existing branches not in this sheet (left unchanged)`)}
       </div>
       <div style="display:flex;gap:8px;margin-top:10px">
         <button class="btn btn-primary btn-sm" onclick="applyRouteCycleUpload()">Apply</button>
@@ -5899,7 +5941,7 @@ Object.assign(window, {
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
-  setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
+  selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
