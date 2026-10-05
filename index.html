@@ -1636,6 +1636,12 @@ function visitAggregate(visit){
   const shahdCounted = items.filter(it=>!it.calc.excludedFromSucSos);
   const totalShahdFacings = shahdCounted.reduce((s,it)=>s+(parseFloat(it.shahdFacings)||0),0);
   items.forEach(it => { it.calc.sosVsShahd = it.calc.excludedFromSucSos ? null : (totalShahdFacings>0 ? Math.min(100, (parseFloat(it.shahdFacings)||0)/totalShahdFacings*100) : 0); });
+  // Everything below that is a per-SKU rate (availability, price match, completeness, velocity,
+  // coverage) counts ONLY the SKUs that are actually sold at this visit's customer. SUC/SOS above were
+  // already summed from the whole visit, which is correct: a SKU that isn't on the shelf adds nothing.
+  const custNameForScope = canonicalCustomerName(visit.accountName);
+  const allItems = items;
+  items = allItems.filter(it => skuAppliesToCustomer(SKU_MAP[it.skuId], custNameForScope));
   const n = items.length || 1;
   const avg = f => items.reduce((s,it)=>s+f(it.calc),0) / n;
   const finiteCoverage = items.map(it=>it.calc.stockCoverage).filter(x=>isFinite(x));
@@ -1646,7 +1652,7 @@ function visitAggregate(visit){
     // A SUM, same reasoning as avgSfr above — sos per item is this SKU's share of total category
     // facings, so summing gives the true overall SOS instead of dividing it by however many SKUs exist.
     // Marinated Fresh's sos:null coerces to 0 and doesn't affect this sum — excluded, as intended.
-    avgSos: items.reduce((s,it)=>s+(it.calc.sos||0),0),
+    avgSos: allItems.reduce((s,it)=>s+(it.calc.sos||0),0), // whole visit, not just relevant SKUs — see note above
     osaPct: items.filter(it=>it.calc.osa==='Y').length / n * 100,
     priceOkPct: items.filter(it=>it.calc.priceStatus==='on').length / n * 100,
     visitDonePct: items.filter(it=>it.calc.visitDone).length / n * 100,
@@ -1932,6 +1938,33 @@ async function setVisitStatus(id, status, note){
   await visitUpdate(id, patch);
 }
 
+/* ============================= SKU SCOPE — which customers a SKU is actually sold at =============================
+   Not every SKU belongs at every customer (e.g. Chicken meal isn't a Seoudi item; Marinated Fresh isn't
+   carried there). A SKU's scope is either: all customers; ONLY a chosen list; or everyone EXCEPT a chosen
+   list. A SKU that isn't relevant to a customer is dropped from that customer's visit checklist AND from
+   every per-SKU number built from its visits — availability, price match, stock, velocity, opportunities,
+   the dashboard and the PPT — so it can't raise a false "out of stock" flag. SUC/SOS are untouched: they
+   are shelf-share sums, and a SKU that isn't there simply contributes zero to them.
+   An empty list is treated as "all customers" on purpose, so ticking "only selected" before picking
+   anyone can never make a SKU vanish everywhere. The old single-customer `exclusiveTo` is read as
+   "only that customer" so SKUs already configured that way keep working. */
+function skuScopeRaw(s){
+  if(s && s.scope && (s.scope.mode==='only' || s.scope.mode==='except')) return { mode:s.scope.mode, customers:Array.isArray(s.scope.customers)?s.scope.customers:[] };
+  if(s && s.exclusiveTo) return { mode:'only', customers:[s.exclusiveTo] };
+  return { mode:'all', customers:[] };
+}
+function skuScope(s){
+  const raw = skuScopeRaw(s);
+  return raw.customers.length===0 ? { mode:'all', customers:[] } : raw;
+}
+function skuAppliesToCustomer(s, customerName){
+  if(!s) return true; // unknown/orphaned SKU — never hide data we can't classify
+  const sc = skuScope(s);
+  if(sc.mode==='all') return true;
+  const listed = sc.customers.includes(canonicalCustomerName(customerName));
+  return sc.mode==='only' ? listed : !listed;
+}
+
 /* ============================= ECOMM VISIT (availability + price only, no photo/arrival ritual) =============================
    Deliberately not the field draft shape — dark stores have no shelf to photograph or arrive at, and
    the only two things that matter are: is it in stock, and is the price right. Auto-approved on
@@ -1940,7 +1973,7 @@ async function setVisitStatus(id, status, note){
 function ecommSkuItemsFor(account){
   const custName = canonicalCustomerName(account.name);
   return State.skus
-    .filter(s => !s.exclusiveTo || s.exclusiveTo === custName) // nationwide, or exclusive to this exact customer
+    .filter(s => skuAppliesToCustomer(s, custName))
     .map(s => ({ skuId: s.id, available: true, actualPrice: '' }));
 }
 function latestEcommVisitFor(accountId){
@@ -2562,7 +2595,7 @@ function visitRowHtml(v){
     <div class="visit-row" style="border:none;padding:0;">
       <div>
         <div class="visit-main">${v.accountName} · ${v.branch} ${verified?'📍':''}</div>
-        <div class="visit-sub">${v.date} · ${v.auditor} · ${(v.items||[]).length} SKUs · ${fmt(agg.visitDonePct)}% complete</div>
+        <div class="visit-sub">${v.date} · ${v.auditor} · ${agg.items.length} SKUs · ${fmt(agg.visitDonePct)}% complete</div>
       </div>
       <span class="status-badge status-${v.status}">${v.status}</span>
     </div>
@@ -3252,6 +3285,7 @@ function computeEcommAnalysis(){
     store.lastVisitDate = v.date;
     (v.items||[]).forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
+      if(!skuAppliesToCustomer(sku, v.accountName)) return; // not sold on this platform
       store.skuStats[sku.id] = store.skuStats[sku.id] || { name:sku.name, category:sku.category, rsp:sku.rsp||0 };
       const s = store.skuStats[sku.id];
       s.available = !!it.available; // overwritten each pass — latest reading only
@@ -3466,6 +3500,7 @@ function computeNetworkStockSummary(approved){
     const acct = accountsById[v.accountId];
     const branchKey = (acct && acct.customerId) ? acct.customerId : (v.branch||'').trim().toLowerCase();
     (v.items||[]).forEach(it=>{
+      if(!skuAppliesToCustomer(SKU_MAP[it.skuId], custName)) return; // not sold at this customer — its 0 stock isn't a gap
       const c = computeItem(it);
       // Same code-based branch identity as everywhere else — otherwise a duplicate account for the
       // same physical store double-counts its stock into the network total instead of just showing
@@ -3782,7 +3817,10 @@ function pptCoverageLabel(d){ return d==null ? '—' : (isFinite(d) ? fmt(d,1)+'
 /* ---- Account slides: the same one-row-per-SKU opportunity table as the app's Opportunities tab,
    with the 3 most important actions written underneath. A rep reads the table, then the three
    things to go and do. ---- */
-function renderOppTableAndActions(slide, title, subtitle, header, rows, colW, riskCols, actions, moreNote){
+/* Draws one slide of an opportunity table. `actions` is only passed for the first slide of a table —
+   they sit just under wherever the table ends, so a branch with two flagged SKUs doesn't leave a hole
+   in the middle of the slide, capped so a full table never pushes them into the footer. */
+function drawOppTable(slide, title, subtitle, header, rows, colW, riskCols, rowH, actions, moreNote){
   slide.addText(title, { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:22, bold:true, color:PPT_DARK });
   if(subtitle) slide.addText(subtitle, { x:0.5, y:0.8, w:12.3, h:0.3, fontSize:10.5, italic:true, color:PPT_SOFT });
   if(rows.length===0){
@@ -3797,17 +3835,37 @@ function renderOppTableAndActions(slide, title, subtitle, header, rows, colW, ri
         return { text:String(v), options:{ fill:{color:fillC}, color:col, bold:isRisk && v!=='—' } };
       }));
     });
-    slide.addTable(table, { x:0.5, y:1.2, w:12.3, colW, fontSize:9, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.36 });
+    slide.addTable(table, { x:0.5, y:1.2, w:12.3, colW, fontSize:9, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH });
   }
-  // Actions sit just under wherever the table actually ends (header + one row each), so a branch with
-  // two flagged SKUs doesn't leave a hole in the middle of the slide; capped so a full 8-row table
-  // never pushes them into the footer.
-  const tableEnd = rows.length===0 ? 1.8 : 1.2 + 0.36*(rows.length+1);
-  if(moreNote) slide.addText(moreNote, { x:0.5, y:tableEnd+0.1, w:12.3, h:0.28, fontSize:9, italic:true, color:PPT_SOFT });
-  const actionsY = Math.min(5.3, tableEnd + (moreNote ? 0.5 : 0.35));
+  const tableEnd = rows.length===0 ? 1.8 : 1.2 + rowH*(rows.length+1);
+  if(moreNote) slide.addText(moreNote, { x:0.5, y:tableEnd+0.05, w:12.3, h:0.28, fontSize:9, italic:true, color:PPT_SOFT });
+  if(!actions) return;
+  const actionsY = Math.min(5.45, tableEnd + (moreNote ? 0.45 : 0.35));
   slide.addText('Top 3 actions', { x:0.5, y:actionsY, w:12.3, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
   slide.addText(actions.map(a=>({ text:a.text, options:{ bullet:{code:'2022'}, breakLine:true, color:pptActionPlanRisk(a.risk), bold:a.risk==='High' } })),
     { x:0.5, y:actionsY+0.35, w:12.3, h:1.4, fontSize:11.5, color:PPT_DARK, valign:'top' });
+}
+const PPT_ROWS_FIRST = 12; // first slide shares the page with the 3 actions
+const PPT_ROWS_CONT = 17;  // continuation slides are table only
+/* Splits a table over as many slides as it needs. In `full` mode every row is shown (actions stay on
+   the first slide, under the highest-risk rows); otherwise the table stops at PPT_ACCOUNT_MAX_ROWS with
+   a pointer to the app — used by the all-customers deck, where showing every SKU of every branch would
+   run to hundreds of slides. */
+function addOppTableSlides(pptx, o){
+  const full = !!o.full;
+  const rowH = full ? 0.3 : 0.36;
+  const firstN = full ? PPT_ROWS_FIRST : PPT_ACCOUNT_MAX_ROWS;
+  const chunks = [o.rows.slice(0, firstN)];
+  if(full) for(let i=firstN; i<o.rows.length; i+=PPT_ROWS_CONT) chunks.push(o.rows.slice(i, i+PPT_ROWS_CONT));
+  chunks.forEach((chunk, idx)=>{
+    const s = pptx.addSlide();
+    const title = chunks.length>1 ? `${o.title} (${idx+1}/${chunks.length})` : o.title;
+    let more = '';
+    if(idx===0 && full && chunks.length>1) more = `Table continues on the next slide — ${o.rows.length-firstN} more SKU(s).`;
+    else if(idx===0 && !full && o.rows.length>firstN) more = `+ ${o.rows.length-firstN} more SKU(s) flagged — full list in the app's Opportunities tab.`;
+    drawOppTable(s, title, o.subtitle, o.header, chunk, o.colW, o.riskCols, rowH, idx===0 ? o.actions : null, more);
+    pptFooter(s, o.label);
+  });
 }
 const PPT_ACCOUNT_MAX_ROWS = 8;
 function pptNames(list, n){ return list.slice(0,n).join(', ') + (list.length>n ? ` +${list.length-n} more` : ''); }
@@ -3817,7 +3875,7 @@ function pptPickTop3(cands){
 }
 // One customer's rolled-up slide, then up to branchCap of its most-severe flagged branches, each its
 // own slide — pass branchCap:Infinity for a single-account export where every branch should appear.
-function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
+function buildCustomerDetailSlides(pptx, c, custOpp, branchCap, full){
   const branchesList = custOpp ? custOpp.branches : [];
 
   // ---- customer slide: one row per SKU, rolled up across every flagged branch ----
@@ -3840,7 +3898,7 @@ function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
     if(hasHigh) branchesHigh++;
   });
   const aggList = Object.values(agg).sort((a,b)=>(b.hi-a.hi) || (b.branches.size-a.branches.size));
-  const custRows = aggList.slice(0, PPT_ACCOUNT_MAX_ROWS).map(a=>{
+  const custRows = aggList.map(a=>{
     const stockParts = [];
     if(a.out) stockParts.push(`Out of stock ×${a.out}`);
     if(a.low) stockParts.push(`Low ×${a.low}`);
@@ -3870,14 +3928,13 @@ function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
   const branchesToShow = [...flaggedBranchOpps].sort((a,b)=>severity(b)-severity(a)).slice(0, branchCap);
   const branchNote = flaggedBranchOpps.length > branchesToShow.length ? `  ·  the ${branchesToShow.length} most-severe of ${flaggedBranchOpps.length} flagged branches follow` : '';
 
-  let s4c = pptx.addSlide();
-  renderOppTableAndActions(
-    s4c, c.name, `${c.branchCount} branch(es)  ·  SUC ${fmt(c.avgSfr)}%  ·  SOS ${fmt(c.avgSos)}%  ·  Price OK ${fmt(c.priceOkPct)}%  ·  all flagged branches rolled up per SKU (× = number of branches)${branchNote}`,
-    ['SKU','Branches','Stock status (branches)','Stock Risk','Avg Price','RSP','Price vs RSP (branches)','Price Risk'],
-    custRows, [3.4,0.9,2.8,1.0,1.0,0.8,1.5,0.9], [3,7], pptPickTop3(custCands),
-    aggList.length>PPT_ACCOUNT_MAX_ROWS ? `+ ${aggList.length-PPT_ACCOUNT_MAX_ROWS} more SKUs flagged — full list in the app's Opportunities tab.` : '',
-  );
-  pptFooter(s4c, c.name);
+  addOppTableSlides(pptx, {
+    title: c.name,
+    subtitle: `${c.branchCount} branch(es)  ·  SUC ${fmt(c.avgSfr)}%  ·  SOS ${fmt(c.avgSos)}%  ·  Price OK ${fmt(c.priceOkPct)}%  ·  all flagged branches rolled up per SKU (× = number of branches)${branchNote}`,
+    header: ['SKU','Branches','Stock status (branches)','Stock Risk','Avg Price','RSP','Price vs RSP (branches)','Price Risk'],
+    rows: custRows, colW: [3.4,0.9,2.8,1.0,1.0,0.8,1.5,0.9], riskCols: [3,7], actions: pptPickTop3(custCands),
+    label: c.name, full,
+  });
 
   // ---- branch slides: the dashboard's opportunity table, then that branch's top 3 actions ----
   branchesToShow.forEach(b=>{
@@ -3899,20 +3956,18 @@ function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
     const below = b.skuRows.filter(r=>r.priceVsRsp==='Below RSP');
     if(below.length) cands.push({ priority:5, risk:'Low', text:`Check shelf tags — below RSP: ${pptNames(below.map(r=>`${r.sku} (${fmt(r.price)} vs ${fmt(r.rsp)})`), 3)}.` });
 
-    const rows = b.skuRows.slice(0, PPT_ACCOUNT_MAX_ROWS).map(r=>[
+    const rows = b.skuRows.map(r=>[
       r.sku, r.vel!=null?fmt(r.vel,1):'—', r.stock!=null?fmt(r.stock):'—', pptCoverageLabel(r.coverageDays),
       r.price>0?fmt(r.price):'—', r.rsp?fmt(r.rsp):'—', r.stockStatus||'—', r.stockRisk||'—', r.priceVsRsp||'—', r.priceRisk||'—',
     ]);
     const sosTxt = `SOS ${fmt(b.sos)}%${b.sosLow?` ⚠ below ${OPP_LOW_SOS_PCT}%`:''}`;
     const sucTxt = `SUC ${fmt(b.sfr)}%${b.sfrLow?` ⚠ below ${OPP_LOW_SUC_PCT}%`:''}`;
-    let sbr = pptx.addSlide();
-    renderOppTableAndActions(
-      sbr, `${c.name} — ${b.branch}`, `${sosTxt}  ·  ${sucTxt}`,
-      ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk'],
-      rows, [3.4,0.7,0.7,0.85,0.75,0.7,2.1,0.95,1.2,0.95], [7,9], pptPickTop3(cands),
-      b.skuRows.length>PPT_ACCOUNT_MAX_ROWS ? `+ ${b.skuRows.length-PPT_ACCOUNT_MAX_ROWS} more SKUs flagged at this branch — full list in the app's Opportunities tab.` : '',
-    );
-    pptFooter(sbr, `${c.name} — ${b.branch}`);
+    addOppTableSlides(pptx, {
+      title: `${c.name} — ${b.branch}`, subtitle: `${sosTxt}  ·  ${sucTxt}`,
+      header: ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk'],
+      rows, colW: [3.4,0.7,0.7,0.85,0.75,0.7,2.1,0.95,1.2,0.95], riskCols: [7,9], actions: pptPickTop3(cands),
+      label: `${c.name} — ${b.branch}`, full,
+    });
    }catch(e){ console.error('Skipping branch slide for', c.name, b && b.branch, e); }
   });
 }
@@ -4221,7 +4276,7 @@ async function exportPpt(){
     detailedCustomers.forEach(c=>{
      try{
       const custOpp = custOpps.find(co=>co.name===c.name);
-      buildCustomerDetailSlides(pptx, c, custOpp, BRANCH_SLIDES_PER_CUSTOMER);
+      buildCustomerDetailSlides(pptx, c, custOpp, BRANCH_SLIDES_PER_CUSTOMER, false); // all-customers deck: capped, see addOppTableSlides
      }catch(e){ console.error('Skipping customer action-plan detail', c && c.name, e); }
     });
     if(smallCustomers.length>0){
@@ -4501,7 +4556,7 @@ async function exportPptAccount(customerName){
     s1.addText('Account Summary — Shelf Pulse, Cairo 3A (Shahd)', { x:0.7, y:3.5, w:11.9, h:0.6, fontSize:18, color:'FFFFFF', fontFace:'Arial' });
     s1.addText(`Generated ${new Date().toLocaleDateString()} · ${c.branchCount} branch(es) · from approved visits only`, { x:0.7, y:4.15, w:11.9, h:0.5, fontSize:13, color:'FBEAEA', fontFace:'Arial' });
 
-    buildCustomerDetailSlides(pptx, c, custOpp, Infinity);
+    buildCustomerDetailSlides(pptx, c, custOpp, Infinity, true); // single account: show every SKU, no cap
 
     await pptx.writeFile({ fileName: `${customerName.replace(/[^\w\u0600-\u06FF]+/g,'-')}-Account-Summary-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
@@ -5149,7 +5204,7 @@ function visitListResultsHtml(){
         <div class="visit-row" style="border:none;padding:0">
           <div>
             <div class="visit-main">${v.accountName} · ${v.branch}</div>
-            <div class="visit-sub">${v.date} · ${v.auditor} · ${(v.items||[]).length} SKUs · ${fmt(agg.visitDonePct)}% complete · ⏱ ${fmtDuration(visitDurationMinutes(v))}${v.editedBy?' · edited by '+v.editedBy:''}</div>
+            <div class="visit-sub">${v.date} · ${v.auditor} · ${agg.items.length} SKUs · ${fmt(agg.visitDonePct)}% complete · ⏱ ${fmtDuration(visitDurationMinutes(v))}${v.editedBy?' · edited by '+v.editedBy:''}</div>
           </div>
           <span class="status-badge status-${v.status}">${v.status}</span>
         </div>
@@ -5557,8 +5612,109 @@ async function restoreOrphanedSku(id){
   showToast('SKU restored — historical data reconnected ✓');
   render();
 }
+/* ---- SKU scope controls (Manage Backend → SKUs) ---- */
+function skuScopeCustomerNames(){ return [...new Set(State.accounts.map(a=>canonicalCustomerName(a.name)))].sort((a,b)=>a.localeCompare(b)); }
+let __skuSaveTimer = null;
+// Ticking a dozen customers shouldn't be a dozen database writes — the screen updates instantly and the
+// save follows once you pause.
+function saveSkusSoon(){ clearTimeout(__skuSaveTimer); __skuSaveTimer = setTimeout(()=>{ saveSkus().catch(e=>console.error('SKU scope save failed', e)); }, 600); }
+function skuScopeGuard(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return false; } return true; }
+function skuScopeSummary(s){
+  const sc = skuScopeRaw(s);
+  if(sc.mode==='all') return 'Sold at every customer.';
+  if(sc.customers.length===0) return 'Pick at least one customer — until then this SKU is shown everywhere.';
+  const shown = sc.customers.slice(0,4).join(', ') + (sc.customers.length>4 ? ` +${sc.customers.length-4} more` : '');
+  return sc.mode==='only' ? `Only sold at: ${shown}.` : `Sold everywhere except: ${shown}.`;
+}
+function skuScopeListHtml(idx){
+  const raw = skuScopeRaw(State.skus[idx]);
+  const q = (State.skuScopeSearch||'').toLowerCase();
+  const rows = skuScopeCustomerNames().map((n,i)=>({n,i})).filter(x=>!q || x.n.toLowerCase().includes(q));
+  if(rows.length===0) return '<p class="hint">No matches.</p>';
+  return rows.map(x=>`<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--line)"><input type="checkbox" ${raw.customers.includes(x.n)?'checked':''} onchange="toggleSkuScopeCustomer(${idx},${x.i})"/><span>${x.n}</span></label>`).join('');
+}
+// Updates the pieces of a SKU card in place (no full re-render, so a long list keeps its scroll position
+// and the search box keeps focus).
+function refreshSkuScopeUi(idx){
+  const s = State.skus[idx]; if(!s) return;
+  const raw = skuScopeRaw(s);
+  const el = id => document.getElementById(id+s.id);
+  if(el('sku-scope-mode-')) el('sku-scope-mode-').value = raw.mode;
+  if(el('sku-scope-sum-')) el('sku-scope-sum-').textContent = skuScopeSummary(s);
+  if(el('sku-scope-btn-')){ el('sku-scope-btn-').style.display = raw.mode==='all' ? 'none' : ''; el('sku-scope-btn-').textContent = `Choose customers (${raw.customers.length})`; }
+  if(el('sku-scope-list-')) el('sku-scope-list-').innerHTML = skuScopeListHtml(idx);
+}
+function setSkuScopeMode(idx, mode){
+  if(!skuScopeGuard()) return;
+  const s = State.skus[idx]; if(!s) return;
+  const cur = skuScopeRaw(s);
+  // Switching between "only" and "except" would silently flip what the same list means, so it starts fresh.
+  s.scope = { mode, customers: (mode!=='all' && mode===cur.mode) ? cur.customers : [] };
+  s.exclusiveTo = ''; // retire the old single-customer field once this SKU is edited here
+  State.skuScopeOpen = mode==='all' ? null : s.id;
+  State.skuScopeSearch = '';
+  saveSkusSoon(); render();
+}
+function toggleSkuScopePanel(id){ State.skuScopeOpen = (State.skuScopeOpen===id) ? null : id; State.skuScopeSearch = ''; render(); }
+function setSkuScopeSearch(idx, v){ State.skuScopeSearch = v; const s = State.skus[idx]; const el = s && document.getElementById('sku-scope-list-'+s.id); if(el) el.innerHTML = skuScopeListHtml(idx); }
+function toggleSkuScopeCustomer(idx, nameIdx){
+  if(!skuScopeGuard()) return;
+  const s = State.skus[idx]; const name = skuScopeCustomerNames()[nameIdx]; if(!s || !name) return;
+  const raw = skuScopeRaw(s); if(raw.mode==='all') return;
+  const list = raw.customers.includes(name) ? raw.customers.filter(n=>n!==name) : [...raw.customers, name];
+  s.scope = { mode: raw.mode, customers: list }; s.exclusiveTo = '';
+  saveSkusSoon(); refreshSkuScopeUi(idx);
+}
+// One place that knows how to mark a SKU sold / not sold at one customer, whatever mode it is in.
+function setSkuSoldAt(idx, custName, sold){
+  const s = State.skus[idx]; if(!s) return true;
+  const raw = skuScopeRaw(s);
+  let mode = raw.mode, list = [...raw.customers];
+  if(list.length===0) mode = 'all';
+  if(mode==='all'){
+    if(sold) return true;
+    mode = 'except'; list = [custName];
+  } else if(mode==='except'){
+    list = sold ? list.filter(n=>n!==custName) : (list.includes(custName) ? list : [...list, custName]);
+    if(list.length===0) mode = 'all';
+  } else {
+    if(sold) list = list.includes(custName) ? list : [...list, custName];
+    else {
+      list = list.filter(n=>n!==custName);
+      if(list.length===0){ showToast(`${s.name} is set to "only" ${custName} — unticking it would leave the SKU sold nowhere. Change its setting on the SKU card instead.`); return false; }
+    }
+  }
+  s.scope = { mode, customers: mode==='all' ? [] : list };
+  s.exclusiveTo = '';
+  return true;
+}
+function setScopeByCustomer(nameIdx){ State.skuScopeByCust = nameIdx==='' ? '' : (skuScopeCustomerNames()[Number(nameIdx)] || ''); render(); }
+function toggleSkuSoldAtSelected(idx, el){
+  if(!skuScopeGuard()){ el.checked = !el.checked; return; }
+  const cust = State.skuScopeByCust; if(!cust) return;
+  if(!setSkuSoldAt(idx, cust, el.checked)){ el.checked = !el.checked; return; }
+  saveSkusSoon(); refreshSkuScopeUi(idx);
+}
+function skuScopeByCustomerHtml(){
+  const names = skuScopeCustomerNames();
+  const sel = State.skuScopeByCust || '';
+  const selIdx = sel ? names.indexOf(sel) : -1;
+  return `<div class="card">
+    <h3>Set up by customer / حسب العميل</h3>
+    <p class="hint" style="margin-bottom:8px">Pick a customer, then untick the SKUs that aren't sold there. They drop out of that customer's visit checklists, flags, dashboard numbers and PPT — past visits included.</p>
+    <select onchange="setScopeByCustomer(this.value)">
+      <option value="">Choose a customer…</option>
+      ${names.map((n,i)=>`<option value="${i}" ${i===selIdx?'selected':''}>${n}</option>`).join('')}
+    </select>
+    ${selIdx>=0 ? `<div style="max-height:340px;overflow-y:auto;margin-top:8px">${State.skus.map((s,idx)=>`
+      <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)">
+        <input type="checkbox" ${skuAppliesToCustomer(s, sel)?'checked':''} onchange="toggleSkuSoldAtSelected(${idx}, this)"/>
+        <span>${s.name} <span class="hint">· ${s.category||''}</span></span>
+      </label>`).join('')}</div>` : ''}
+  </div>`;
+}
+
 function manageBackendSkusHtml(){
-  const customerNames = [...new Set(State.accounts.map(a=>canonicalCustomerName(a.name)))].sort((a,b)=>a.localeCompare(b));
   const orphans = findOrphanedSkuIds();
   return `
     ${orphans.length ? `
@@ -5582,6 +5738,7 @@ function manageBackendSkusHtml(){
       }).join('')}
     </div>
     ` : ''}
+    ${skuScopeByCustomerHtml()}
     <p class="lede">Edit the reference list merchandisers audit against. (${State.accounts.length} accounts loaded from route plan — ask me to add more.)</p>
     ${State.skus.map((s,idx)=>`
       <div class="card">
@@ -5593,14 +5750,22 @@ function manageBackendSkusHtml(){
           <div><label>Category / الفئة</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
           <div><label>RSP (EGP) / السعر الموصى به</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/></div>
         </div>
+        ${(() => { const raw = skuScopeRaw(s); return `
         <div style="margin-top:8px">
-          <label>Availability / التوفر</label>
-          <select onchange="skuField(${idx},'exclusiveTo',this.value)">
-            <option value="" ${!s.exclusiveTo?'selected':''}>Nationwide — every account / في كل الحسابات</option>
-            ${customerNames.map(name=>`<option value="${name}" ${s.exclusiveTo===name?'selected':''}>Exclusive to ${name}</option>`).join('')}
+          <label>Sold at / يُباع في</label>
+          <select id="sku-scope-mode-${s.id}" onchange="setSkuScopeMode(${idx}, this.value)">
+            <option value="all" ${raw.mode==='all'?'selected':''}>All customers</option>
+            <option value="only" ${raw.mode==='only'?'selected':''}>Only selected customers</option>
+            <option value="except" ${raw.mode==='except'?'selected':''}>All customers except selected</option>
           </select>
-          <p class="hint" style="margin-top:4px">${s.exclusiveTo ? `Only shows up in the checklist for ${s.exclusiveTo} — skipped everywhere else.` : `Shows up in every account's checklist, field and ECOMM.`}</p>
-        </div>
+          <p class="hint" id="sku-scope-sum-${s.id}" style="margin:4px 0 6px">${skuScopeSummary(s)}</p>
+          <button class="btn btn-ghost btn-sm" id="sku-scope-btn-${s.id}" style="${raw.mode==='all'?'display:none':''}" onclick="toggleSkuScopePanel('${s.id}')">Choose customers (${raw.customers.length})</button>
+          ${State.skuScopeOpen===s.id && raw.mode!=='all' ? `
+          <div style="margin-top:8px">
+            <input type="text" placeholder="Search customers…" value="${State.skuScopeSearch||''}" oninput="setSkuScopeSearch(${idx}, this.value)"/>
+            <div style="max-height:220px;overflow-y:auto;margin-top:6px"><div id="sku-scope-list-${s.id}">${skuScopeListHtml(idx)}</div></div>
+          </div>` : ''}
+        </div>`; })()}
         <button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="removeSku(${idx})">Remove SKU</button>
       </div>`).join('')}
     <button class="btn btn-line" onclick="addSku()">＋ Add SKU</button>
@@ -5943,7 +6108,7 @@ function syncDraftItemsWithSkus(){
   const d = State.draft;
   if(!d || !d.accountId || !d.items || d.items.length===0) return false;
   const custName = canonicalCustomerName(d.accountName);
-  const wanted = State.skus.filter(s => !s.exclusiveTo || s.exclusiveTo === custName);
+  const wanted = State.skus.filter(s => skuAppliesToCustomer(s, custName));
   const same = wanted.length===d.items.length && wanted.every((s,i)=>d.items[i].skuId===s.id);
   if(same) return false;
   const byId = {}; d.items.forEach(it=>{ byId[it.skuId] = it; });
@@ -5959,7 +6124,7 @@ function pickAccount(id){
     const daysSince = daysSinceLastVisitFor(a.id);
     const custName = canonicalCustomerName(a.name);
     dft.items = State.skus
-      .filter(s => !s.exclusiveTo || s.exclusiveTo === custName) // nationwide, or exclusive to this exact customer
+      .filter(s => skuAppliesToCustomer(s, custName))
       .map(s => {
         return {skuId:s.id, opening:'', closing:'', deliveries:'', actualCapacity:'', catFacings:'', shahdFacings:'', actualPrice:'', days:String(daysSince), _open:false};
       });
@@ -6098,6 +6263,7 @@ Object.assign(window, {
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
+  setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
   selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
