@@ -1516,6 +1516,20 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    capture availability (OOS) and price — no facings, stock, or photos — since there's no physical
    shelf to audit. They're deliberately excluded from Store Map: that map is built from visit-photo
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
+// Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
+// glance, not a guess. Change it whenever index.html changes.
+const APP_BUILD = '2026-10-05 · SKU sold-at';
+// Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
+// this never touches, so it's safe to tap mid-shift.
+async function forceAppUpdate(){
+  showToast('Updating…');
+  try{ if('serviceWorker' in navigator){ const regs = await navigator.serviceWorker.getRegistrations(); await Promise.all(regs.map(r=>r.unregister())); } }catch(e){ console.warn(e); }
+  try{ if(window.caches){ const keys = await caches.keys(); await Promise.all(keys.map(k=>caches.delete(k))); } }catch(e){ console.warn(e); }
+  location.reload();
+}
+function appBuildLineHtml(align){
+  return `<p class="hint" style="text-align:${align||'center'};margin:${align==='left'?'0 0 10px':'14px 0 4px'}">Build ${APP_BUILD} · <a href="#" style="color:var(--red);font-weight:700" onclick="forceAppUpdate();return false;">Update app</a></p>`;
+}
 const ECOMM_MERCH_CODE = '7073'; // Fayrouz Mahmoud Azmy Khalaf Mehran — the sole ECOMM data-entry merchandiser
 const ECOMM_MERCH_NAME = 'Fayrouz Mahmoud Azmy Khalaf Mehran';
 function isEcommMerch(){ return State.role==='merchandiser' && State.merchCode===ECOMM_MERCH_CODE; }
@@ -2544,6 +2558,7 @@ function screenLogin(){
       <div class="visit-row" style="border:none;padding:0"><div class="visit-main">Commercial Dashboard</div><div>🔒</div></div>
       <p class="hint">View-only analytics — no editing</p>
     </div>
+    ${appBuildLineHtml()}
   </div>`;
 }
 function setLoginPassword(v){ State.loginPassword = v; }
@@ -5569,6 +5584,7 @@ function screenManageBackend(){
   };
   return `<div class="screen">
     <h1>Manage Backend / إدارة النظام</h1>
+    ${appBuildLineHtml('left')}
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
       ${subs.map(s=>`<button class="btn ${sub===s.id?'btn-primary':'btn-ghost'} btn-sm" onclick="setManageBackendSub('${s.id}')">${s.label}</button>`).join('')}
     </div>
@@ -6263,7 +6279,7 @@ Object.assign(window, {
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
-  setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
+  forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
   selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
