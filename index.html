@@ -3777,88 +3777,243 @@ function buildPptContext(){
   return { approved, aggs, avg, avgLatest, stockSummaryForPpt, customers, catRows, skuRows, custOpps, oppSummary, sortedCustomers };
 }
 function pptActionPlanRisk(riskLabel){ return riskLabel==='High'?PPT_RED:(riskLabel==='Medium'?PPT_AMBER:PPT_GREEN); }
-function renderActionPlanAndPricing(slide, title, subtitle, bullets, pricingHeader, pricingRows, pricingColW){
-  slide.addText(title, { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:PPT_DARK });
-  if(subtitle) slide.addText(subtitle, { x:0.5, y:0.85, w:12, h:0.3, fontSize:10.5, italic:true, color:PPT_SOFT });
-  slide.addText('Action plan', { x:0.5, y:1.3, w:5.7, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
-  slide.addText(bullets.map(b=>({ text:b.text, options:{ bullet:{code:'2022'}, breakLine:true, color:pptActionPlanRisk(b.risk), bold:b.risk==='High' } })),
-    { x:0.5, y:1.7, w:5.7, h:4.9, fontSize:11.5, color:PPT_DARK, valign:'top' });
-  slide.addText('Priced above RSP', { x:6.5, y:1.3, w:6.3, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
-  if(pricingRows.length===0){
-    slide.addText('Nothing priced above RSP here.', { x:6.5, y:1.75, w:6.3, h:0.4, fontSize:11, italic:true, color:PPT_SOFT });
-  } else {
-    const table = [pricingHeader.map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}))];
-    pricingRows.forEach((row,i)=>{
-      const fillC = i%2?'F6F2EF':'FFFFFF';
-      table.push(row.map(v=>({text:String(v), options:{fill:{color:fillC}}})));
-    });
-    slide.addTable(table, { x:6.5, y:1.75, w:6.3, fontSize:9.5, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.32, colW:pricingColW });
-  }
-}
-// One customer's overview slide (3-5 action plans + above-RSP pricing rolled up across its branches),
-// then up to branchCap of its most-severe flagged branches, same two elements each — pass
-// branchCap:Infinity for a single-account export where every branch should appear, uncapped.
-function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
-  const custBullets = [];
-  if(c.avgSfr < OPP_LOW_SUC_PCT) custBullets.push({risk:'Medium', text:`Improve shelf utilization — SUC at ${fmt(c.avgSfr)}%, below the ${OPP_LOW_SUC_PCT}% bar.`});
-  if(c.avgSos < OPP_LOW_SOS_PCT) custBullets.push({risk:'Medium', text:`Negotiate more facings — SOS at ${fmt(c.avgSos)}%, below ${OPP_LOW_SOS_PCT}% share.`});
-  if(c.priceOkPct < 80) custBullets.push({risk:'Medium', text:`Correct shelf pricing — only ${fmt(c.priceOkPct)}% of checks match RSP across this customer.`});
-  if(c.oosSkuName && c.oosSkuName!=='—' && c.oosCount>0) custBullets.push({risk:'High', text:`Prioritize replenishment for ${c.oosSkuName} — most frequently out of stock (${c.oosCount} visit(s)).`});
-  if(c.topSkuName && c.topSkuName!=='—') custBullets.push({risk:'Low', text:`Protect ${c.topSkuName}'s facing — the strongest seller at ${fmt(c.topSkuVel,1)} units/store/day.`});
-  if(custBullets.length===0) custBullets.push({risk:'Low', text:'No major issues flagged — maintain current execution standard.'});
-  custBullets.sort((a,b)=>(OPP_RISK_RANK[a.risk]??3)-(OPP_RISK_RANK[b.risk]??3));
+function pptCoverageLabel(d){ return d==null ? '—' : (isFinite(d) ? fmt(d,1)+'d' : '∞'); }
 
-  const custAboveRspBySku = {};
-  if(custOpp) custOpp.branches.forEach(b=>{
-    b.skuRows.forEach(r=>{
-      if(r.priceVsRsp!=='Above RSP') return;
-      custAboveRspBySku[r.sku] = custAboveRspBySku[r.sku] || { sku:r.sku, category:r.category, rsp:r.rsp, branchCount:0, priceSum:0 };
-      custAboveRspBySku[r.sku].branchCount++;
-      custAboveRspBySku[r.sku].priceSum += r.price;
+/* ---- Account slides: the same one-row-per-SKU opportunity table as the app's Opportunities tab,
+   with the 3 most important actions written underneath. A rep reads the table, then the three
+   things to go and do. ---- */
+function renderOppTableAndActions(slide, title, subtitle, header, rows, colW, riskCols, actions, moreNote){
+  slide.addText(title, { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:22, bold:true, color:PPT_DARK });
+  if(subtitle) slide.addText(subtitle, { x:0.5, y:0.8, w:12.3, h:0.3, fontSize:10.5, italic:true, color:PPT_SOFT });
+  if(rows.length===0){
+    slide.addText('No SKU-level issues flagged here.', { x:0.5, y:1.3, w:12.3, h:0.4, fontSize:12, italic:true, color:PPT_SOFT });
+  } else {
+    const table = [header.map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}))];
+    rows.forEach((row,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      table.push(row.map((v,ci)=>{
+        const isRisk = riskCols.includes(ci);
+        const col = isRisk ? (v==='High'?PPT_RED:v==='Medium'?PPT_AMBER:v==='Low'?PPT_GREEN:PPT_DARK) : PPT_DARK;
+        return { text:String(v), options:{ fill:{color:fillC}, color:col, bold:isRisk && v!=='—' } };
+      }));
     });
+    slide.addTable(table, { x:0.5, y:1.2, w:12.3, colW, fontSize:9, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.36 });
+  }
+  // Actions sit just under wherever the table actually ends (header + one row each), so a branch with
+  // two flagged SKUs doesn't leave a hole in the middle of the slide; capped so a full 8-row table
+  // never pushes them into the footer.
+  const tableEnd = rows.length===0 ? 1.8 : 1.2 + 0.36*(rows.length+1);
+  if(moreNote) slide.addText(moreNote, { x:0.5, y:tableEnd+0.1, w:12.3, h:0.28, fontSize:9, italic:true, color:PPT_SOFT });
+  const actionsY = Math.min(5.3, tableEnd + (moreNote ? 0.5 : 0.35));
+  slide.addText('Top 3 actions', { x:0.5, y:actionsY, w:12.3, h:0.35, fontSize:14, bold:true, color:PPT_DARK });
+  slide.addText(actions.map(a=>({ text:a.text, options:{ bullet:{code:'2022'}, breakLine:true, color:pptActionPlanRisk(a.risk), bold:a.risk==='High' } })),
+    { x:0.5, y:actionsY+0.35, w:12.3, h:1.4, fontSize:11.5, color:PPT_DARK, valign:'top' });
+}
+const PPT_ACCOUNT_MAX_ROWS = 8;
+function pptNames(list, n){ return list.slice(0,n).join(', ') + (list.length>n ? ` +${list.length-n} more` : ''); }
+function pptPickTop3(cands){
+  const top = cands.sort((a,b)=>a.priority-b.priority).slice(0,3);
+  return top.length ? top : [{risk:'Low', text:'No major issues flagged — maintain current execution standard.'}];
+}
+// One customer's rolled-up slide, then up to branchCap of its most-severe flagged branches, each its
+// own slide — pass branchCap:Infinity for a single-account export where every branch should appear.
+function buildCustomerDetailSlides(pptx, c, custOpp, branchCap){
+  const branchesList = custOpp ? custOpp.branches : [];
+
+  // ---- customer slide: one row per SKU, rolled up across every flagged branch ----
+  const agg = {};
+  let branchesHigh = 0, nSosLow = 0, nSfrLow = 0;
+  branchesList.forEach(b=>{
+    if(b.sosLow) nSosLow++;
+    if(b.sfrLow) nSfrLow++;
+    let hasHigh = false;
+    b.skuRows.forEach(r=>{
+      const a = agg[r.sku] = agg[r.sku] || { sku:r.sku, branches:new Set(), out:0, low:0, over:0, above:0, below:0, hi:0, priceSum:0, priceN:0, rsp:r.rsp };
+      a.branches.add(b.branch);
+      if(r.stockStatus==='Out of stock') a.out++;
+      else if(r.stockRisk==='High') a.low++;
+      else if(r.stockStatus==='Overstocked vs velocity') a.over++;
+      if(r.stockRisk==='High'){ a.hi++; hasHigh = true; }
+      if(r.priceVsRsp==='Above RSP') a.above++; else if(r.priceVsRsp==='Below RSP') a.below++;
+      if(r.price>0){ a.priceSum += r.price; a.priceN++; }
+    });
+    if(hasHigh) branchesHigh++;
   });
-  const custAboveRsp = Object.values(custAboveRspBySku).sort((a,b)=>b.branchCount-a.branchCount);
+  const aggList = Object.values(agg).sort((a,b)=>(b.hi-a.hi) || (b.branches.size-a.branches.size));
+  const custRows = aggList.slice(0, PPT_ACCOUNT_MAX_ROWS).map(a=>{
+    const stockParts = [];
+    if(a.out) stockParts.push(`Out of stock ×${a.out}`);
+    if(a.low) stockParts.push(`Low ×${a.low}`);
+    if(a.over) stockParts.push(`Overstock ×${a.over}`);
+    const priceParts = [];
+    if(a.above) priceParts.push(`Above ×${a.above}`);
+    if(a.below) priceParts.push(`Below ×${a.below}`);
+    return [
+      a.sku, String(a.branches.size), stockParts.join(', ') || '—', (a.out||a.low) ? 'High' : (a.over ? 'Low' : '—'),
+      a.priceN ? fmt(a.priceSum/a.priceN) : '—', a.rsp ? fmt(a.rsp) : '—', priceParts.join(', ') || '—', priceParts.length ? 'Low' : '—',
+    ];
+  });
+
+  const custCands = [];
+  const hiSkus = aggList.filter(a=>a.hi>0).sort((a,b)=>b.hi-a.hi);
+  if(hiSkus.length) custCands.push({ priority:1, risk:'High', text:`Restock first — ${branchesHigh} of ${c.branchCount} branches have a SKU out of stock or about to be. Most widespread: ${pptNames(hiSkus.map(a=>`${a.sku} (${a.hi})`), 3)}.` });
+  if(nSosLow || nSfrLow || c.avgSos<OPP_LOW_SOS_PCT || c.avgSfr<OPP_LOW_SUC_PCT) custCands.push({ priority:2, risk:'Medium', text:`Win shelf space — average SOS ${fmt(c.avgSos)}% / SUC ${fmt(c.avgSfr)}%; ${nSosLow} branch(es) below the ${OPP_LOW_SOS_PCT}% SOS bar, ${nSfrLow} below ${OPP_LOW_SUC_PCT}% SUC. Negotiate facings and fix replenishment.` });
+  const aboveSkus = aggList.filter(a=>a.above>0).sort((a,b)=>b.above-a.above);
+  if(aboveSkus.length) custCands.push({ priority:3, risk:'Medium', text:`Correct pricing — above RSP in the most branches: ${pptNames(aboveSkus.map(a=>`${a.sku} (${a.above})`), 3)}.` });
+  const overSkus = aggList.filter(a=>a.over>0).sort((a,b)=>b.over-a.over);
+  if(overSkus.length) custCands.push({ priority:4, risk:'Low', text:`Rebalance overstock — ${pptNames(overSkus.map(a=>`${a.sku} (${a.over})`), 3)}; pause the next delivery.` });
+  const belowSkus = aggList.filter(a=>a.below>0).sort((a,b)=>b.below-a.below);
+  if(belowSkus.length) custCands.push({ priority:5, risk:'Low', text:`Check shelf tags — below RSP: ${pptNames(belowSkus.map(a=>`${a.sku} (${a.below})`), 3)}.` });
+
+  const flaggedBranchOpps = branchesList.filter(b=>b.skuRows.length>0 || b.sosLow || b.sfrLow);
+  const severity = b => b.skuRows.filter(r=>r.stockRisk==='High').length*100 + b.skuRows.length + (b.sosLow?1:0) + (b.sfrLow?1:0);
+  const branchesToShow = [...flaggedBranchOpps].sort((a,b)=>severity(b)-severity(a)).slice(0, branchCap);
+  const branchNote = flaggedBranchOpps.length > branchesToShow.length ? `  ·  the ${branchesToShow.length} most-severe of ${flaggedBranchOpps.length} flagged branches follow` : '';
 
   let s4c = pptx.addSlide();
-  renderActionPlanAndPricing(
-    s4c, c.name, `${c.branchCount} branch(es) · network rollup: SUC ${fmt(c.avgSfr)}% · SOS ${fmt(c.avgSos)}% · Price OK ${fmt(c.priceOkPct)}%`,
-    custBullets.slice(0,5),
-    ['SKU','Branches','Avg Price','RSP'],
-    custAboveRsp.slice(0,10).map(s=>[s.sku, String(s.branchCount), fmt(s.priceSum/s.branchCount), fmt(s.rsp)]),
-    [2.7,1.2,1.2,1.2],
+  renderOppTableAndActions(
+    s4c, c.name, `${c.branchCount} branch(es)  ·  SUC ${fmt(c.avgSfr)}%  ·  SOS ${fmt(c.avgSos)}%  ·  Price OK ${fmt(c.priceOkPct)}%  ·  all flagged branches rolled up per SKU (× = number of branches)${branchNote}`,
+    ['SKU','Branches','Stock status (branches)','Stock Risk','Avg Price','RSP','Price vs RSP (branches)','Price Risk'],
+    custRows, [3.4,0.9,2.8,1.0,1.0,0.8,1.5,0.9], [3,7], pptPickTop3(custCands),
+    aggList.length>PPT_ACCOUNT_MAX_ROWS ? `+ ${aggList.length-PPT_ACCOUNT_MAX_ROWS} more SKUs flagged — full list in the app's Opportunities tab.` : '',
   );
   pptFooter(s4c, c.name);
 
-  if(!custOpp) return;
-  const flaggedBranchOpps = custOpp.branches.filter(b=>b.skuRows.length>0 || b.sosLow || b.sfrLow);
-  const severity = b => b.skuRows.filter(r=>r.stockRisk==='High').length*100 + b.skuRows.length + (b.sosLow?1:0) + (b.sfrLow?1:0);
-  const branchesToShow = [...flaggedBranchOpps].sort((a,b)=>severity(b)-severity(a)).slice(0, branchCap);
-  if(flaggedBranchOpps.length > branchesToShow.length){
-    s4c.addText(`Showing the ${branchesToShow.length} most-severe branches of ${flaggedBranchOpps.length} flagged — full list in the app's Opportunities tab.`, { x:0.5, y:6.85, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
-  }
+  // ---- branch slides: the dashboard's opportunity table, then that branch's top 3 actions ----
   branchesToShow.forEach(b=>{
    try{
-    const branchBullets = [];
-    if(b.sosLow) branchBullets.push({risk:'Medium', text:`Negotiate more facings — SOS at ${fmt(b.sos)}%, below ${OPP_LOW_SOS_PCT}%.`});
-    if(b.sfrLow) branchBullets.push({risk:'Medium', text:`Address shelf utilization — SUC at ${fmt(b.sfr)}%, below ${OPP_LOW_SUC_PCT}%.`});
-    b.skuRows.forEach(r=>{
-      if(r.stockRisk==='High') branchBullets.push({risk:'High', text:`${r.stockStatus} — ${r.sku}. ${r.note}.`});
-      else if(r.stockStatus==='Overstocked vs velocity') branchBullets.push({risk:'Low', text:`${r.sku} overstocked — ${isFinite(r.coverageDays)?fmt(r.coverageDays,1)+'d cover':'excess stock'}. Pause next delivery.`});
-      else if(r.priceVsRsp) branchBullets.push({risk:'Medium', text:`Correct ${r.sku} pricing — ${r.priceVsRsp.toLowerCase()} (${fmt(r.price)} vs RSP ${fmt(r.rsp)}).`});
-    });
-    branchBullets.sort((a,b2)=>(OPP_RISK_RANK[a.risk]??3)-(OPP_RISK_RANK[b2.risk]??3));
-    const branchAboveRsp = b.skuRows.filter(r=>r.priceVsRsp==='Above RSP');
+    const cands = [];
+    const high = b.skuRows.filter(r=>r.stockRisk==='High').sort((x,y)=>(y.vel||0)-(x.vel||0)); // fastest sellers first — most to lose
+    if(high.length){
+      const outN = high.filter(r=>r.stockStatus==='Out of stock').length, lowN = high.length - outN;
+      const parts = []; if(outN) parts.push(`${outN} out of stock`); if(lowN) parts.push(`${lowN} running low`);
+      cands.push({ priority:1, risk:'High', text:`Restock now — ${parts.join(', ')}. Fastest sellers first: ${pptNames(high.map(r=>r.sku), 3)}.` });
+    }
+    if(b.sosLow && b.sfrLow) cands.push({ priority:2, risk:'Medium', text:`Win shelf space — SOS ${fmt(b.sos)}% (below ${OPP_LOW_SOS_PCT}%) and SUC ${fmt(b.sfr)}% (below ${OPP_LOW_SUC_PCT}%): negotiate facings and fix replenishment.` });
+    else if(b.sosLow) cands.push({ priority:2, risk:'Medium', text:`Negotiate more facings — SOS ${fmt(b.sos)}%, below the ${OPP_LOW_SOS_PCT}% bar.` });
+    else if(b.sfrLow) cands.push({ priority:2, risk:'Medium', text:`Lift shelf utilization — SUC ${fmt(b.sfr)}%, below ${OPP_LOW_SUC_PCT}%: check replenishment and facing fill.` });
+    const above = b.skuRows.filter(r=>r.priceVsRsp==='Above RSP');
+    if(above.length) cands.push({ priority:3, risk:'Medium', text:`Correct pricing — above RSP: ${pptNames(above.map(r=>`${r.sku} (${fmt(r.price)} vs ${fmt(r.rsp)})`), 3)}.` });
+    const over = b.skuRows.filter(r=>r.stockStatus==='Overstocked vs velocity');
+    if(over.length) cands.push({ priority:4, risk:'Low', text:`Pause the next delivery on overstocked: ${pptNames(over.map(r=>`${r.sku} (${pptCoverageLabel(r.coverageDays)} cover)`), 3)}.` });
+    const below = b.skuRows.filter(r=>r.priceVsRsp==='Below RSP');
+    if(below.length) cands.push({ priority:5, risk:'Low', text:`Check shelf tags — below RSP: ${pptNames(below.map(r=>`${r.sku} (${fmt(r.price)} vs ${fmt(r.rsp)})`), 3)}.` });
+
+    const rows = b.skuRows.slice(0, PPT_ACCOUNT_MAX_ROWS).map(r=>[
+      r.sku, r.vel!=null?fmt(r.vel,1):'—', r.stock!=null?fmt(r.stock):'—', pptCoverageLabel(r.coverageDays),
+      r.price>0?fmt(r.price):'—', r.rsp?fmt(r.rsp):'—', r.stockStatus||'—', r.stockRisk||'—', r.priceVsRsp||'—', r.priceRisk||'—',
+    ]);
+    const sosTxt = `SOS ${fmt(b.sos)}%${b.sosLow?` ⚠ below ${OPP_LOW_SOS_PCT}%`:''}`;
+    const sucTxt = `SUC ${fmt(b.sfr)}%${b.sfrLow?` ⚠ below ${OPP_LOW_SUC_PCT}%`:''}`;
     let sbr = pptx.addSlide();
-    renderActionPlanAndPricing(
-      sbr, `${c.name} — ${b.branch}`, `SUC ${fmt(b.sfr)}% · SOS ${fmt(b.sos)}%`,
-      branchBullets.slice(0,5),
-      ['SKU','Price','RSP'],
-      branchAboveRsp.slice(0,10).map(r=>[r.sku, fmt(r.price), fmt(r.rsp)]),
-      [3.3,1.5,1.5],
+    renderOppTableAndActions(
+      sbr, `${c.name} — ${b.branch}`, `${sosTxt}  ·  ${sucTxt}`,
+      ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk'],
+      rows, [3.4,0.7,0.7,0.85,0.75,0.7,2.1,0.95,1.2,0.95], [7,9], pptPickTop3(cands),
+      b.skuRows.length>PPT_ACCOUNT_MAX_ROWS ? `+ ${b.skuRows.length-PPT_ACCOUNT_MAX_ROWS} more SKUs flagged at this branch — full list in the app's Opportunities tab.` : '',
     );
     pptFooter(sbr, `${c.name} — ${b.branch}`);
-   }catch(e){ console.error('Skipping branch action-plan slide for', c.name, b && b.branch, e); }
+   }catch(e){ console.error('Skipping branch slide for', c.name, b && b.branch, e); }
   });
+}
+
+/* ---- Executive additions: accounts ranked by velocity and by performance, best/worst category & SKU ---- */
+// Account performance score = the Scorecard's own weights, shelf metrics only (SUC 25 · OSA 15 ·
+// Price 20 · SOS 15), rescaled to 100 — so an account is judged the same way a merchandiser is.
+function pptAccountStats(customers){
+  const clamp = x => Math.max(0, Math.min(100, x||0));
+  const rows = customers.map(c=>{
+    const totalVel = c.branches.reduce((s,b)=>s+b.skuList.reduce((x,sk)=>x+(sk.avgVel||0),0),0);
+    const osa = c.branches.length ? c.branches.reduce((s,b)=>s+(b.osaPct||0),0)/c.branches.length : 0;
+    const score = (clamp(c.avgSfr)*25 + clamp(osa)*15 + clamp(c.priceOkPct)*20 + clamp(c.avgSos)*15) / 75;
+    return { name:c.name, branchCount:c.branchCount, totalVel, avgSfr:c.avgSfr, avgSos:c.avgSos, osaPct:osa, priceOkPct:c.priceOkPct, score };
+  });
+  const networkVel = rows.reduce((s,r)=>s+r.totalVel,0);
+  rows.forEach(r=>{ r.velShare = networkVel>0 ? r.totalVel/networkVel*100 : 0; });
+  return { rows, networkVel };
+}
+function addTopAccountsSlide(pptx, customers){
+  const { rows, networkVel } = pptAccountStats(customers);
+  const top = rows.filter(r=>r.totalVel>0).sort((a,b)=>b.totalVel-a.totalVel).slice(0,10);
+  const s = pptx.addSlide();
+  s.addText('Top Selling Accounts', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+  s.addText(`Ranked by total units/day across all of an account's branches — with each account's average SOS and SUC. Network total: ${fmt(networkVel)} units/day.`, { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:11, italic:true, color:PPT_SOFT });
+  const header = ['#','Account','Branches','Units/day','% of network','Avg SOS%','Avg SUC%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}));
+  const table = [header];
+  top.forEach((r,i)=>{
+    const fillC = i%2?'F6F2EF':'FFFFFF';
+    const cells = [String(i+1), r.name, String(r.branchCount), fmt(r.totalVel), fmt(r.velShare,1)+'%', fmt(r.avgSos), fmt(r.avgSfr)];
+    table.push(cells.map((v,ci)=>({ text:v, options:{ fill:{color:fillC},
+      color: (ci===5 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===6 && r.avgSfr<OPP_LOW_SUC_PCT) ? PPT_RED : PPT_DARK,
+      bold: (ci===5 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===6 && r.avgSfr<OPP_LOW_SUC_PCT) } })));
+  });
+  s.addTable(table, { x:0.5, y:1.4, w:12.3, colW:[0.5,4.6,1.2,1.4,1.6,1.5,1.5], fontSize:11, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.4 });
+  s.addText(`Red = below the bar (SOS under ${OPP_LOW_SOS_PCT}%, SUC under ${OPP_LOW_SUC_PCT}%). SOS and SUC are each branch's latest visit, averaged across the account.`, { x:0.5, y:6.55, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
+  pptFooter(s, 'Top Selling Accounts');
+}
+function addBestWorstAccountsSlide(pptx, customers){
+  const { rows } = pptAccountStats(customers);
+  const ranked = [...rows].sort((a,b)=>b.score-a.score);
+  const best = ranked.slice(0,5);
+  const worst = ranked.slice(5).slice(-5).reverse(); // no account can appear in both lists when there are fewer than 10
+  const s = pptx.addSlide();
+  s.addText('Best & Worst Accounts', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+  s.addText('Performance score = SUC 25% · OSA 15% · Price compliance 20% · SOS 15% (the Scorecard weights, shelf metrics only), latest visit per branch.', { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:10.5, italic:true, color:PPT_SOFT });
+  const mk = (list, color, x, label) => {
+    s.addText(label, { x, y:1.4, w:6.0, h:0.35, fontSize:14, bold:true, color });
+    const header = ['Account','Br.','Score','SUC%','SOS%','OSA%','Price%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color}}}));
+    const table = [header];
+    list.forEach((r,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      table.push([r.name, String(r.branchCount), fmt(r.score), fmt(r.avgSfr), fmt(r.avgSos), fmt(r.osaPct), fmt(r.priceOkPct)].map((v,ci)=>({ text:v, options:{ fill:{color:fillC}, bold:ci===2 } })));
+    });
+    if(list.length===0) s.addText('Not enough accounts to rank.', { x, y:1.85, w:6.0, h:0.4, fontSize:11, italic:true, color:PPT_SOFT });
+    else s.addTable(table, { x, y:1.85, w:6.0, colW:[2.1,0.5,0.7,0.65,0.65,0.7,0.7], fontSize:10, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.42 });
+  };
+  mk(best, PPT_GREEN, 0.5, 'Best 5');
+  mk(worst, PPT_RED, 6.8, 'Worst 5');
+  s.addText('Br. = number of branches in the account — small accounts can swing widely on one or two branches.', { x:0.5, y:5.2, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
+  pptFooter(s, 'Best & Worst Accounts');
+}
+function addBestWorstCategorySkuSlide(pptx, catRows, skuRows){
+  const catVel = catRows.map(cr=>({
+    category:cr.category, avgSfr:cr.avgSfr, avgSos:cr.avgSos,
+    vel: skuRows.filter(r=>r.category===cr.category).reduce((s,r)=>s+r.totalVelNetwork,0),
+  })).filter(x=>x.vel>0).sort((a,b)=>b.vel-a.vel);
+  const carried = skuRows.filter(r=>r.n>0).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
+  const best5 = carried.slice(0,5);
+  const worst5 = carried.slice(5).slice(-5).reverse();
+  const s = pptx.addSlide();
+  s.addText('Best & Worst — Category & SKU', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+  s.addText('Ranked by sales velocity (units/day). SKUs: units per store per day, across the stores carrying them.', { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:10.5, italic:true, color:PPT_SOFT });
+  const card = (x, label, cat, color) => {
+    try{ s.addShape('roundRect', { x, y:1.35, w:6.0, h:1.15, fill:{color:'FBF9F8'}, line:{color:PPT_LINE, width:0.75}, rectRadius:0.06 }); }catch(e){}
+    s.addText(label, { x:x+0.2, y:1.4, w:5.6, h:0.28, fontSize:10, bold:true, color:PPT_SOFT });
+    s.addText(cat ? cat.category : '—', { x:x+0.2, y:1.68, w:5.6, h:0.42, fontSize:18, bold:true, color });
+    s.addText(cat ? `${fmt(cat.vel)} units/day  ·  avg SUC ${fmt(cat.avgSfr)}%  ·  avg SOS ${fmt(cat.avgSos)}%` : '', { x:x+0.2, y:2.12, w:5.6, h:0.3, fontSize:10.5, color:PPT_DARK });
+  };
+  card(0.5, 'BEST CATEGORY', catVel[0], PPT_GREEN);
+  card(6.8, 'WORST CATEGORY', catVel.length>1 ? catVel[catVel.length-1] : null, PPT_RED);
+  const mk = (list, color, x, label) => {
+    s.addText(label, { x, y:2.75, w:6.0, h:0.35, fontSize:14, bold:true, color });
+    const header = ['SKU','Category','Vel/store/d','Network/d'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color}}}));
+    const table = [header];
+    list.forEach((r,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      table.push([r.name, r.category, fmt(r.avgVelPerStore,1), fmt(r.totalVelNetwork,1)].map(v=>({ text:v, options:{ fill:{color:fillC} } })));
+    });
+    if(list.length===0) s.addText('Not enough SKUs to rank.', { x, y:3.15, w:6.0, h:0.4, fontSize:11, italic:true, color:PPT_SOFT });
+    else s.addTable(table, { x, y:3.15, w:6.0, colW:[2.6,1.4,1.0,1.0], fontSize:10, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.42 });
+  };
+  mk(best5, PPT_GREEN, 0.5, 'Best 5 SKUs');
+  mk(worst5, PPT_RED, 6.8, 'Worst 5 SKUs');
+  pptFooter(s, 'Best & Worst — Category & SKU');
+}
+// Adds the three slides, each guarded so one failure can't take the rest of the deck down.
+function addExecutiveRankingSlides(pptx, customers, catRows, skuRows){
+  try{ addBestWorstCategorySkuSlide(pptx, catRows, skuRows); }catch(e){ console.error('Best & Worst Category & SKU slide failed', e); }
+  try{ addTopAccountsSlide(pptx, customers); }catch(e){ console.error('Top Selling Accounts slide failed', e); }
+  try{ addBestWorstAccountsSlide(pptx, customers); }catch(e){ console.error('Best & Worst Accounts slide failed', e); }
 }
 
 async function exportPpt(){
@@ -4012,6 +4167,7 @@ async function exportPpt(){
     footer(s5b, 'Best & Worst Performers');
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
+    addExecutiveRankingSlides(pptx, customers, catRows, skuRows);
 // ---------- Customer Analysis ----------
     try {
 
@@ -4310,6 +4466,7 @@ async function exportPptExecutive(){
     footer(s5b, 'Best & Worst Performers');
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
+    addExecutiveRankingSlides(pptx, customers, catRows, skuRows);
 
     await pptx.writeFile({ fileName: `Shelf-Pulse-Executive-Summary-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
