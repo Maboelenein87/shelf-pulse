@@ -1550,7 +1550,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-08 · photo checks';
+const APP_BUILD = '2026-10-08 · scorecard drill-down';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -5318,6 +5318,113 @@ function screenTeam(){
    one calendar month and uses EVERY visit submitted that month regardless of status — rejected and
    pending visits are exactly what "data accuracy" needs to be measured against; filtering them out
    would make every merchandiser look 100% accurate by definition. */
+/* ---- Scorecard drill-down helpers (shared by All-time and Monthly) ----
+   SOS / SUC / OSA / Data completion are taken from each store's LAST visit in the pool (not an average
+   across every visit), then averaged across the stores of the supervisor / merchandiser. Pool = approved
+   field visits (all-time) or approved field visits of the chosen month (monthly). */
+function lastVisitScores(visits){
+  const latest = findLatestVisitPerBranch(visits);
+  const stores = latest.map(v=>({ v, a: visitAggregate(v) }));
+  const avg = f => stores.length ? stores.reduce((s,x)=>s+f(x.a),0)/stores.length : null;
+  return { stores, n: stores.length, sos: avg(a=>a.avgSos), suc: avg(a=>a.avgSfr), osa: avg(a=>a.osaPct), done: avg(a=>a.visitDonePct) };
+}
+function scoreChipsHtml(sc){
+  if(!sc.n) return statusChip('neutral','No approved visits');
+  return statusChip('neutral','SOS / حصة الرف '+fmt(sc.sos)+'%')
+    + statusChip('neutral','SUC / تعبئة '+fmt(sc.suc)+'%')
+    + statusChip(sc.osa>=90?'on':sc.osa>=75?'watch':'off','OSA / توافر '+fmt(sc.osa)+'%')
+    + statusChip(sc.done>=95?'on':'watch','Data / اكتمال '+fmt(sc.done)+'%');
+}
+function visitsOfSupervisor(pool, sup){
+  const memo = {};
+  return pool.filter(v=>{
+    const k = nameKey(cleanName(v.auditor));
+    if(!(k in memo)) memo[k] = isSameSupervisor(supervisorOfMerch(cleanName(v.auditor)), sup);
+    return memo[k];
+  });
+}
+function visitsOfMerch(pool, merch){
+  return pool.filter(v=>sameName(cleanName(v.auditor), merch));
+}
+function jsq(x){ return String(x).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+function scorecardSupCardHtml(sup, pool, month){
+  const sc = lastVisitScores(visitsOfSupervisor(pool, sup));
+  let extra = '';
+  if(month){
+    const rows = computeMonthlyScorecard(month).filter(r=>isSameSupervisor(r.sup, sup));
+    const tv = rows.reduce((s,r)=>s+r.totalVisits,0), tt = rows.reduce((s,r)=>s+(r.target||0),0);
+    const rev = rows.reduce((s,r)=>s+r.approvedCount+r.rejectedCount,0), app = rows.reduce((s,r)=>s+r.approvedCount,0);
+    const acc = rev>0 ? app/rev*100 : null;
+    extra = `<div class="verify-row" style="margin-top:6px">
+      ${statusChip('neutral', `${tv}${tt?'/'+tt:''} visits · ${rows.length} merch`)}
+      ${acc!=null ? statusChip(acc>=90?'on':acc>=70?'watch':'off', fmt(acc)+'% accurate / دقة') : statusChip('neutral','No reviewed visits yet')}
+    </div>`;
+  }
+  return `<div class="card" style="cursor:pointer" onclick="selectScorecardSupervisor('${jsq(sup)}')">
+    <div class="visit-row" style="border:none;padding:0 0 8px">
+      <div><div class="visit-main">${sup}</div><div class="hint">${sc.n} store${sc.n===1?'':'s'} · last visit</div></div>
+      <div style="font-size:18px;color:var(--ink-soft)">›</div>
+    </div>
+    <div class="verify-row">${scoreChipsHtml(sc)}</div>${extra}
+  </div>`;
+}
+function scorecardTeamView(pool, supName, allTimeRows, month, showBack, label){
+  const supVisits = visitsOfSupervisor(pool, supName);
+  const sc = lastVisitScores(supVisits);
+  // merchandisers: everyone with visits in the pool, plus (monthly) anyone with visits of any status
+  let merchNames = [...new Set(supVisits.map(v=>cleanName(v.auditor)).map(k=>k))];
+  const uniq = []; merchNames.forEach(n=>{ if(!uniq.some(x=>sameName(x,n))) uniq.push(n); });
+  const mrows = uniq.map(m=>{
+    const msc = lastVisitScores(visitsOfMerch(pool, m));
+    const ar = allTimeRows ? allTimeRows.find(x=>sameName(x.merch,m)) : null;
+    const mr = month ? computeMonthlyScorecard(month).find(x=>sameName(x.merch,m)) : null;
+    return { m, msc, ar, mr };
+  }).sort((a,b)=>(b.msc.n)-(a.msc.n));
+  return `<div class="screen">
+    ${showBack ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardSupervisors()">← Back to supervisors</button>` : ''}
+    <h1>${supName}</h1>
+    ${scorecardPillRow()}
+    <p class="lede">${label} · last-visit scores per merchandiser. Tap one to see every store they covered.</p>
+    ${month ? `<input type="month" value="${month}" onchange="setScorecardMonth(this.value)" style="margin-bottom:12px"/>` : ''}
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">Team (${sc.n} stores)</h3>
+      <div class="verify-row">${scoreChipsHtml(sc)}</div>
+    </div>
+    ${mrows.length===0 ? emptyState('👥','No approved visits','') : mrows.map(x=>`
+      <div class="card" style="cursor:pointer" onclick="selectScorecardMerch('${jsq(x.m)}')">
+        <div class="visit-row" style="border:none;padding:0 0 8px">
+          <div><div class="visit-main">${x.m}</div><div class="hint">${x.msc.n} store${x.msc.n===1?'':'s'}${x.ar?` · ${x.ar.achieved}${x.ar.target?'/'+x.ar.target:''} visits · weighted score ${fmt(x.ar.score)}%`:''}${x.mr?` · ${x.mr.totalVisits}${x.mr.target?'/'+x.mr.target:''} visits${x.mr.accuracyPct!=null?' · '+fmt(x.mr.accuracyPct)+'% accurate':''}`:''}</div></div>
+          <div style="font-size:18px;color:var(--ink-soft)">›</div>
+        </div>
+        <div class="verify-row">${scoreChipsHtml(x.msc)}</div>
+      </div>`).join('')}
+  </div>`;
+}
+function scorecardMerchStoresView(pool, merch, label, allTimeRow, monthCtx){
+  const sc = lastVisitScores(visitsOfMerch(pool, merch));
+  const stores = sc.stores.slice().sort((a,b)=>(a.v.accountName+a.v.branch).localeCompare(b.v.accountName+b.v.branch));
+  const sup = supervisorOfMerch(merch);
+  const showBack = State.role!=='supervisor' || !!State.scorecardMerch;
+  return `<div class="screen">
+    <button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardTeam()">← Back to team</button>
+    <h1>${merch}</h1>
+    ${scorecardPillRow()}
+    <p class="lede">${label}${sup?' · Supervisor: '+sup:''} · ${sc.n} store${sc.n===1?'':'s'}, scores from the last approved visit of each.</p>
+    ${monthCtx ? monthCtx.picker : ''}
+    <div class="card" style="border-color:var(--red)">
+      <h3 style="color:var(--red)">Merchandiser average</h3>
+      <div class="verify-row">${scoreChipsHtml(sc)}</div>
+    </div>
+    ${monthCtx && monthCtx.detailHtml ? monthCtx.detailHtml : ''}
+    ${stores.length===0 ? emptyState('🏪','No approved visits','') : stores.map(({v,a})=>`
+      <div class="card" style="padding:12px 14px">
+        <div class="visit-row" style="border:none;padding:0 0 8px">
+          <div><div class="visit-main">${v.accountName} · ${v.branch}</div><div class="hint">Last visit ${v.date}</div></div>
+        </div>
+        <div class="verify-row">${scoreChipsHtml({n:1,sos:a.avgSos,suc:a.avgSfr,osa:a.osaPct,done:a.visitDonePct})}</div>
+      </div>`).join('')}
+  </div>`;
+}
 function computeMonthlyScorecard(month){
   const monthVisits = State.visits.filter(v => v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
   const byMerch = {};
@@ -5351,115 +5458,13 @@ function selectScorecardSupervisor(name){ State.scorecardSupervisor = name; Stat
 function backToScorecardSupervisors(){ State.scorecardSupervisor = null; State.scorecardMerch = null; render(); }
 function selectScorecardMerch(name){ State.scorecardMerch = name; render(); }
 function backToScorecardTeam(){ State.scorecardMerch = null; render(); }
-function monthlyMerchCardHtml(r){
-  return `<div class="card" style="cursor:pointer" onclick="selectScorecardMerch('${r.merch.replace(/'/g,"\\'")}')">
-    <div class="visit-row" style="border:none;padding:0 0 8px">
-      <div class="visit-main">${r.merch}</div>
-      <div style="font-weight:800;color:${r.target?barColor(r.visitAchievedPct):'var(--ink-soft)'}">${r.totalVisits}${r.target?'/'+r.target:''}</div>
-    </div>
-    <div class="verify-row">
-      ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete / اكتمال')}
-      ${r.accuracyPct!=null ? statusChip(r.accuracyPct>=90?'on':r.accuracyPct>=70?'watch':'off', fmt(r.accuracyPct)+'% accurate / دقة') : statusChip('neutral','No reviewed visits yet')}
-    </div>
-  </div>`;
-}
-function screenMonthlyScorecard(){
-  const month = State.scorecardMonth || todayStr().slice(0,7);
-  const rows = computeMonthlyScorecard(month);
-  const monthLabel = new Date(month+'-01T00:00:00').toLocaleDateString('en-GB',{year:'numeric', month:'long'});
 
-  const monthPicker = `<input type="month" value="${month}" onchange="setScorecardMonth(this.value)" style="margin-bottom:12px"/>`;
-
-  // Supervisor role: no picker needed, they only ever see their own team.
-  if(State.role==='supervisor'){
-    const mySet = makeTeamSet(myMerchandisers());
-    const teamRows = rows.filter(r=>mySet.has(r.merch));
-    return screenMonthlyTeamView(month, monthLabel, monthPicker, State.name, teamRows, false);
-  }
-
-  if(State.scorecardMerch){
-    const r = rows.find(x=>x.merch===State.scorecardMerch);
-    return screenMonthlyMerchDetail(month, monthLabel, monthPicker, r, State.scorecardMerch);
-  }
-  if(State.scorecardSupervisor){
-    const teamRows = rows.filter(r=>r.sup===State.scorecardSupervisor);
-    return screenMonthlyTeamView(month, monthLabel, monthPicker, State.scorecardSupervisor, teamRows, true);
-  }
-  // Top level: pick a supervisor
-  const supNames = Object.values(SUPERVISOR_PASSWORDS);
-  return `<div class="screen">
-    <h1>Monthly Scorecard / بطاقة الأداء الشهرية</h1>
-    ${scorecardPillRow()}
-    <p class="lede">${monthLabel} — pick a supervisor to see their team, then a merchandiser for full detail.</p>
-    ${monthPicker}
-    ${supNames.map(sup=>{
-      const teamRows = rows.filter(r=>r.sup===sup);
-      const teamVisits = teamRows.reduce((s,r)=>s+r.totalVisits,0);
-      const teamTarget = teamRows.reduce((s,r)=>s+(r.target||0),0);
-      const reviewedAll = teamRows.reduce((s,r)=>s+r.approvedCount+r.rejectedCount,0);
-      const approvedAll = teamRows.reduce((s,r)=>s+r.approvedCount,0);
-      const teamAccuracy = reviewedAll>0 ? approvedAll/reviewedAll*100 : null;
-      return `<div class="card" style="cursor:pointer" onclick="selectScorecardSupervisor('${sup.replace(/'/g,"\\'")}')">
-        <div class="visit-row" style="border:none;padding:0 0 8px">
-          <div class="visit-main">${sup}</div>
-          <div style="font-weight:800;color:${teamTarget?barColor(Math.min(150,teamVisits/teamTarget*100)):'var(--ink-soft)'}">${teamVisits}${teamTarget?'/'+teamTarget:''}</div>
-        </div>
-        <div class="verify-row">
-          ${statusChip('neutral', `${teamRows.length} merchandiser${teamRows.length===1?'':'s'}`)}
-          ${teamAccuracy!=null ? statusChip(teamAccuracy>=90?'on':teamAccuracy>=70?'watch':'off', fmt(teamAccuracy)+'% accurate / دقة') : statusChip('neutral','No reviewed visits yet')}
-        </div>
-      </div>`;
-    }).join('')}
-  </div>`;
-}
-function screenMonthlyTeamView(month, monthLabel, monthPicker, supName, teamRows, showBack){
-  const teamVisits = teamRows.reduce((s,r)=>s+r.totalVisits,0);
-  const teamTarget = teamRows.reduce((s,r)=>s+(r.target||0),0);
-  const reviewedAll = teamRows.reduce((s,r)=>s+r.approvedCount+r.rejectedCount,0);
-  const approvedAll = teamRows.reduce((s,r)=>s+r.approvedCount,0);
-  const teamAccuracy = reviewedAll>0 ? approvedAll/reviewedAll*100 : null;
-  const teamCompletion = teamRows.length ? teamRows.reduce((s,r)=>s+r.dataCompletion,0)/teamRows.length : 0;
-  return `<div class="screen">
-    ${showBack ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardSupervisors()">← Back to supervisors</button>` : ''}
-    <h1>${supName} — ${monthLabel}</h1>
-    ${scorecardPillRow()}
-    <p class="lede">Team summary, then tap a merchandiser for full detail.</p>
-    ${monthPicker}
-    <div class="card" style="border-color:var(--red)">
-      <h3 style="color:var(--red)">Team summary</h3>
-      <div class="verify-row">
-        ${statusChip('neutral', `${teamVisits}${teamTarget?'/'+teamTarget:''} total visits`)}
-        ${statusChip(teamCompletion>=95?'on':'watch', fmt(teamCompletion)+'% data complete')}
-        ${teamAccuracy!=null ? statusChip(teamAccuracy>=90?'on':teamAccuracy>=70?'watch':'off', fmt(teamAccuracy)+'% accurate (approved vs rejected)') : statusChip('neutral','No reviewed visits yet')}
-      </div>
-    </div>
-    ${teamRows.length===0 ? emptyState('👥','No visits this month','') : teamRows.map(monthlyMerchCardHtml).join('')}
-  </div>`;
-}
-function screenMonthlyMerchDetail(month, monthLabel, monthPicker, r, merchName){
-  const showBackToTeam = State.role!=='supervisor';
-  if(!r){
-    return `<div class="screen">
-      ${showBackToTeam ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardTeam()">← Back</button>` : ''}
-      <h1>${merchName}</h1>
-      ${scorecardPillRow()}
-      ${emptyState('📭','No visits this month', monthLabel)}
-    </div>`;
-  }
-  return `<div class="screen">
-    ${showBackToTeam ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardTeam()">← Back to team</button>` : ''}
-    <h1>${r.merch} — ${monthLabel}</h1>
-    ${scorecardPillRow()}
-    ${r.sup ? `<p class="lede">Supervisor: ${r.sup}</p>` : ''}
-    ${monthPicker}
-    <div class="card">
+function monthlyMerchCardsHtml(r){
+  if(!r) return '';
+  return `<div class="card">
       <h3>Visits vs target</h3>
       <div style="font-size:28px;font-weight:800;color:${r.target?barColor(r.visitAchievedPct):'var(--ink)'}">${r.totalVisits}${r.target?' / '+r.target:''}</div>
       ${r.target ? `<div class="bar-track" style="margin-top:6px"><div class="bar-fill" style="width:${Math.min(100,r.visitAchievedPct)}%;background:${barColor(r.visitAchievedPct)}"></div></div>` : `<p class="hint">No target on file for this merchandiser.</p>`}
-    </div>
-    <div class="card">
-      <h3>Data completion</h3>
-      <div class="verify-row">${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% of required fields filled, avg across all visits this month')}</div>
     </div>
     <div class="card">
       <h3>Data accuracy — approved vs rejected</h3>
@@ -5471,9 +5476,31 @@ function screenMonthlyMerchDetail(month, monthLabel, monthPicker, r, merchName){
       ${r.accuracyPct!=null
         ? `<p class="hint" style="margin-top:8px">${fmt(r.accuracyPct)}% of reviewed visits were approved (pending visits aren't counted until reviewed).</p>`
         : `<p class="hint" style="margin-top:8px">No visits reviewed yet this month.</p>`}
-    </div>
+    </div>`;
+}
+function screenMonthlyScorecard(){
+  const month = State.scorecardMonth || todayStr().slice(0,7);
+  const monthLabel = new Date(month+'-01T00:00:00').toLocaleDateString('en-GB',{year:'numeric', month:'long'});
+  const monthPicker = `<input type="month" value="${month}" onchange="setScorecardMonth(this.value)" style="margin-bottom:12px"/>`;
+  const pool = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
+  const isSup = State.role==='supervisor';
+  if(State.scorecardMerch){
+    const r = computeMonthlyScorecard(month).find(x=>sameName(x.merch, State.scorecardMerch));
+    return scorecardMerchStoresView(pool, State.scorecardMerch, monthLabel, null, { picker: monthPicker, detailHtml: monthlyMerchCardsHtml(r) });
+  }
+  const supSel = isSup ? State.name : State.scorecardSupervisor;
+  if(supSel) return scorecardTeamView(pool, supSel, null, month, !isSup, monthLabel);
+  const supNames = Object.values(SUPERVISOR_PASSWORDS);
+  return `<div class="screen">
+    <h1>Monthly Scorecard / بطاقة الأداء الشهرية</h1>
+    ${scorecardPillRow()}
+    <p class="lede">${monthLabel} · SOS, SUC, OSA and data completion from each store's last approved visit that month. Tap a supervisor for the team.</p>
+    ${monthPicker}
+    ${supNames.map(sup=>scorecardSupCardHtml(sup, pool, month)).join('')}
   </div>`;
 }
+
+
 
 /* ---- Scorecard ---- */
 function scorecardPillRow(){
@@ -5482,49 +5509,42 @@ function scorecardPillRow(){
     <button class="${State.scorecardView==='monthly'?'active':''}" onclick="setScorecardView('monthly')">Monthly / شهري</button>
   </div>`;
 }
-function screenScorecard(){
-  if(State.scorecardView==='monthly') return screenMonthlyScorecard();
-  const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
-  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
+function allTimeScoreRows(pool, mySet){
   const byMerch = {};
-  approved.forEach(v=>{
+  pool.forEach(v=>{
     if(mySet && !mySet.hasVisit(v)) return;
     const k = cleanName(v.auditor); const key = Object.keys(byMerch).find(x=>sameName(x, k)) || k;
     byMerch[key] = byMerch[key] || [];
     byMerch[key].push(v);
   });
-  const rows = Object.entries(byMerch).map(([merch, visits])=>{
+  return Object.entries(byMerch).map(([merch, visits])=>{
     const aggs = visits.map(visitAggregate);
     const avg = f => aggs.reduce((s,a)=>s+f(a),0)/aggs.length;
     const target = targetForMerch(merch);
     const achieved = achievedForMerch(merch);
-    const branches = [...new Set(visits.map(v=>v.branch))];
     const a = { avgSfr: avg(x=>x.avgSfr), avgSos: avg(x=>x.avgSos), osaPct: avg(x=>x.osaPct), priceOkPct: avg(x=>x.priceOkPct), visitDonePct: avg(x=>x.visitDonePct), visitAchievedPct: target ? Math.min(100, achieved/target*100) : 100 };
-    const durations = visits.map(visitDurationMinutes).filter(m=>m!==null);
-    const avgDuration = durations.length ? durations.reduce((s,m)=>s+m,0)/durations.length : null;
-    return { merch, sup: supervisorOfMerch(merch), visits: visits.length, branchCount: branches.length, target, achieved, score: scoreFor(a), avgDuration, ...a };
+    return { merch, sup: supervisorOfMerch(merch), visits: visits.length, target, achieved, score: scoreFor(a), ...a };
   }).sort((a,b)=>b.score-a.score);
-  if(rows.length===0) return `<div class="screen"><h1>Scorecard / بطاقة الأداء</h1>${scorecardPillRow()}<p class="lede">Weighted score by merchandiser.</p>${emptyState('🏆','No approved visits yet','')}</div>`;
+}
+function screenScorecard(){
+  if(State.scorecardView==='monthly') return screenMonthlyScorecard();
+  const pool = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
+  const rows = allTimeScoreRows(pool, null);
+  const title = 'Scorecard / بطاقة الأداء';
+  const isSup = State.role==='supervisor';
+  if(State.scorecardMerch && (!isSup || true)){
+    const m = State.scorecardMerch;
+    const r = rows.find(x=>sameName(x.merch, m));
+    return scorecardMerchStoresView(pool, m, 'All-time', r, null);
+  }
+  const supNames = isSup ? [State.name] : Object.values(SUPERVISOR_PASSWORDS);
+  const supSel = isSup ? State.name : State.scorecardSupervisor;
+  if(supSel) return scorecardTeamView(pool, supSel, rows, null, !isSup, 'All-time');
   return `<div class="screen">
-    <h1>Scorecard / بطاقة الأداء</h1>
+    <h1>${title}</h1>
     ${scorecardPillRow()}
-    <p class="lede">Weighted score by merchandiser — SUC 25% · OSA 15% · Price 20% · SOS 15% · Visit compliance 15% · Data completion 10%.</p>
-    ${rows.map((r,idx)=>`
-      <div class="card">
-        <div class="visit-row" style="border:none;padding:0 0 8px">
-          <div><div class="visit-main">#${idx+1} ${r.merch}</div><div class="hint">${r.sup?'Supervisor: '+r.sup+' · ':''}${r.branchCount} branch${r.branchCount>1?'es':''} · ${r.achieved}${r.target?'/'+r.target:''} visits</div></div>
-          <div style="font-size:20px;font-weight:800;color:${barColor(r.score)}">${fmt(r.score)}%</div>
-        </div>
-        <div class="bar-track" style="margin-bottom:8px"><div class="bar-fill" style="width:${Math.min(100,r.score)}%;background:${barColor(r.score)}"></div></div>
-        <div class="verify-row">
-          ${statusChip('neutral','SUC '+fmt(r.avgSfr)+'%')}
-          ${statusChip('neutral','SOS '+fmt(r.avgSos)+'%')}
-          ${statusChip('neutral','OSA '+fmt(r.osaPct)+'%')}
-          ${statusChip(r.priceOkPct>=80?'on':'watch','Price '+fmt(r.priceOkPct)+'%')}
-          ${statusChip(r.visitDonePct>=95?'on':'watch','Data '+fmt(r.visitDonePct)+'%')}
-          ${statusChip('neutral','⏱ '+fmtDuration(r.avgDuration))}
-        </div>
-      </div>`).join('')}
+    <p class="lede">All-time · SOS, SUC, OSA and data completion from each store's LAST approved visit. Tap a supervisor for the team.</p>
+    ${supNames.map(sup=>scorecardSupCardHtml(sup, pool, null)).join('')}
   </div>`;
 }
 
