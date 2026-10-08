@@ -990,8 +990,9 @@ async function markGalleryTarget(accountId, accountName, branch){
   inp.onchange = async () => {
     const file = inp.files[0]; if(!file) return;
     showToast('Processing photo…');
-    const dataUrl = await compressImage(file, 800, 0.7);
-    finishGalleryPhoto(dataUrl);
+    const r = await preparePhotoFile(await compressImage(file, 800, 0.7), file, 'STORE');
+    if(!acceptPhotoIssue(r.issue, false)) return;
+    finishGalleryPhoto(r.dataUrl);
   };
   inp.click();
 }
@@ -1092,7 +1093,7 @@ function watchVisits(){
   // needs a composite Firestore index; sorting the small resulting set client-side avoids that.)
   const isMerchandiserOnly = State.role === 'merchandiser';
   const q = isMerchandiserOnly
-    ? query(collection(db, 'visits'), where('auditor', '==', identityLabel()))
+    ? query(collection(db, 'visits'), where('auditor', 'in', [...new Set([identityLabel(), identityLabel()+' ', State.name||''].filter(Boolean))])) // old visits were stamped with the untrimmed name
     : query(collection(db, 'visits'), orderBy('submittedAt', 'desc'));
   let firstSnapshot = true;
   onSnapshot(q, snap => {
@@ -1102,7 +1103,7 @@ function watchVisits(){
       snap.docChanges().forEach(ch => {
         if(ch.type === 'added'){
           const v = { id: ch.doc.id, ...ch.doc.data() };
-          if(v.auditor === identityLabel()) return; // no need to flag someone's own visit to themselves
+          if(sameName(v.auditor, identityLabel())) return; // no need to flag someone's own visit to themselves
           const mins = visitDurationMinutes(v);
           if(v.arrivedAt && mins !== null && mins < SHORT_COMPLETION_MINUTES) notifyFastCompletion(v, mins);
         }
@@ -1502,8 +1503,39 @@ const ROLES = {
   commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','ecomm','accounts','scorecard','allvisits','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
+/* ============================= NAME IDENTITY =============================
+   People are matched by a NORMALIZED name key, never by raw string. Names reach the app from several
+   places (the route cycle file, an old baked-in list, a dropdown, a saved phone session) and don't agree
+   letter for letter: a trailing space, "رأفت" vs "رافت", "فاطمة" vs "فاطمه". A single exact-match
+   comparison silently dropped anyone whose spelling differed from the one a supervisor's team list was
+   built from — their visits then showed only to Merch Head and Trade Marketing, who have no filter. */
+function cleanName(s){
+  return (s||'').replace(/[\u200B-\u200F\u202A-\u202E\uFEFF]/g,'').replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
+}
+function nameKey(s){
+  return cleanName(s)
+    .replace(/[\u064B-\u0652\u0640]/g,'')            // diacritics and tatweel
+    .replace(/[أإآ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه');
+}
+function sameName(a,b){ const ka = nameKey(a); return ka!=='' && ka===nameKey(b); }
+// A team as a set that compares by nameKey, and also recognises a visit by the merchandiser's CODE when
+// the visit carries one (new visits do) — codes never vary in spelling.
+function makeTeamSet(names){
+  const keys = new Set(names.map(nameKey));
+  const codes = new Set();
+  State.accounts.forEach(a=>{ if(a.merchCode && keys.has(nameKey(a.merch))) codes.add(String(a.merchCode)); });
+  return {
+    keys, codes, size: keys.size,
+    has: n => keys.has(nameKey(n)),
+    hasVisit: v => keys.has(nameKey(v.auditor)) || (!!v.auditorCode && codes.has(String(v.auditorCode))),
+  };
+}
+function merchCodeForName(name){
+  const hit = Object.entries(State.merchDirectory||{}).find(([,info])=>sameName(info.name, name));
+  return hit ? hit[0] : null;
+}
 function identityLabel(){
-  if(State.role==='merchandiser' || State.role==='supervisor') return State.name || 'Unnamed';
+  if(State.role==='merchandiser' || State.role==='supervisor') return cleanName(State.name) || 'Unnamed';
   return roleConf().label;
 }
 function bi(en, ar){ return `${en} <span dir="rtl" lang="ar" style="opacity:.68">/ ${ar}</span>`; }
@@ -1518,7 +1550,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-05 · SKU sold-at';
+const APP_BUILD = '2026-10-08 · photo checks';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -1548,7 +1580,7 @@ const State = {
   cameraOpen: false, cameraStream: null, cameraPreview: null, cameraMode: 'visit',
   galleries: {}, galleryTarget: null,
   merchDirectory: {}, routeCycleRows: null, routeCyclePreview: null, newMerchName: '', newMerchCode: '',
-  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null },
+  draft: { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], photoFlags: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null },
   arrivals: [], arrivalPending: false,
   toast: null,
   accountSearch: '',
@@ -1696,7 +1728,7 @@ async function loadAll(){
   if(!isConfigured){ State.loaded = true; return; }
   const me = localStorage.getItem('shelfpulse_me');
   let hasSavedSession = false;
-  if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = p.name || ''; State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
+  if(me){ try{ const p = JSON.parse(me); if(ROLES[p.role]){ State.role = p.role; State.name = cleanName(p.name); State.merchCode = p.merchCode || null; State.navContext = roleConf().contexts[0]; hasSavedSession = true; } }catch(e){} }
 
   // SKUs and accounts are managed live, so the baked-in defaults are only a first-time seed — an
   // existing list is never replaced because of a version number.
@@ -1772,13 +1804,13 @@ function attemptMerchEmpidLogin(){
   // not yet in the directory (not uploaded/added yet) fall back to the old behavior so nobody already
   // using the app gets locked out mid-transition.
   const dir = State.merchDirectory || {};
-  const bound = Object.entries(dir).find(([,info])=>info.name===State.pendingMerchName);
+  const bound = Object.entries(dir).find(([,info])=>sameName(info.name, State.pendingMerchName));
   if(bound){
     if(bound[0] !== id){ State.loginError='EMPID does not match the code on file for this name — check with your supervisor.'; render(); return; }
   } else if(!VALID_EMPIDS.has(id)){
     State.loginError='EMPID not recognized — check with your supervisor.'; render(); return;
   }
-  State.role='merchandiser'; State.name=State.pendingMerchName; State.merchCode=id; State.tab='home'; State.navContext='field';
+  State.role='merchandiser'; State.name=cleanName(State.pendingMerchName); State.merchCode=id; State.tab='home'; State.navContext='field';
   State.pendingMerchName=null; State.loginPassword='';
   saveMe(); restoreDraftIfAny(); consumeDeepLinkIfEcommMerch(); render();
 }
@@ -1862,16 +1894,7 @@ async function submitVisit(){
     // window since the arrival/first-photo attempt, so GPS has a real shot at a fix now that didn't
     // exist a few minutes ago. Bounded so it can't turn into another hang.
     showToast('Checking location…');
-    try{
-      d.geo = await withTimeout(new Promise(resolve => {
-        if(!navigator.geolocation){ resolve(null); return; }
-        navigator.geolocation.getCurrentPosition(
-          pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
-          () => resolve(null),
-          { enableHighAccuracy:true, timeout:8000 }
-        );
-      }), 10000);
-    }catch(e){ d.geo = null; }
+    try{ const r = await withTimeout(acquireLocation({ maxWaitMs:12000 }), 15000); d.geo = r.geo || null; }catch(e){ d.geo = null; }
     if(d.geo) saveDraftLocal();
   }
   if(!d.geo){
@@ -1903,7 +1926,7 @@ async function submitVisit(){
     return;
   }
   // Duplicate-visit guard: same account, same auditor, submitted very recently
-  const dupe = State.visits.find(v => v.accountId===d.accountId && v.auditor===identityLabel() && v.date===todayStr() && v.status!=='rejected' && (Date.now()-(v.submittedAt||0)) < 12*3600*1000);
+  const dupe = State.visits.find(v => v.accountId===d.accountId && sameName(v.auditor, identityLabel()) && v.date===todayStr() && v.status!=='rejected' && (Date.now()-(v.submittedAt||0)) < 12*3600*1000);
   if(dupe){
     const proceed = confirm('You already submitted a visit for this account today. Submit another anyway?');
     if(!proceed) return;
@@ -1925,16 +1948,16 @@ async function submitVisit(){
       id: visitId,
       accountId: d.accountId, accountName: d.accountName, branch: d.branch,
       channel: d.channel || '', region: d.region || '',
-      date: todayStr(), auditor: identityLabel(),
+      date: todayStr(), auditor: identityLabel(), auditorCode: State.merchCode || null,
       status: 'pending', items: finalItems,
-      photos: uploadedPhotos, geo: d.geo || null, capturedAt: d.capturedAt || null,
+      photos: uploadedPhotos, photoFlags: d.photoFlags || [], geo: d.geo || null, capturedAt: d.capturedAt || null,
       arrivalId: d.arrivalId || null, arrivedAt: d.arrivedAt || null, extraDisplay: !!d.extraDisplay,
       submittedAt: Date.now(),
     };
     await visitCreate(visit);
     recordLocationLearning(visit); // fire-and-forget — don't block the submit confirmation on this
     if(d.arrivalId){ arrivalUpdate(d.arrivalId, {status:'completed', visitId}).catch(()=>{}); } // fire-and-forget, same reasoning
-    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null };
+    State.draft = { accountId:'', accountName:'', branch:'', channel:'', region:'', date: todayStr(), items: [], photos: [], photoFlags: [], geo:null, capturedAt:null, catFacingsTotal:'', shahdSpaceTotal:'', extraDisplay:false, arrivalId:null, arrivedAt:null };
     clearDraftLocal();
     State.accountSearch = '';
     showToast(navigator.onLine ? 'Visit submitted for approval ✓' : "Saved on this device ✓ — will upload automatically once you're back online. You can move to the next visit now.");
@@ -2103,7 +2126,7 @@ async function submitEcommVisit(){
     const visit = {
       id: uid(),
       accountId: d.accountId, accountName: d.accountName, branch: d.branch,
-      medium: 'ecomm', date: todayStr(), auditor: identityLabel(),
+      medium: 'ecomm', date: todayStr(), auditor: identityLabel(), auditorCode: State.merchCode || null,
       status: 'approved', // auto-approved — see note above the ECOMM section for why
       items: d.items.map(it=>({ skuId: it.skuId, available: it.available, actualPrice: it.available ? it.actualPrice : '' })),
       submittedAt: Date.now(),
@@ -2147,6 +2170,7 @@ async function openCamera(){
 async function capturePhoto(){
   if((State.draft.photos||[]).length >= MAX_PHOTOS){ showToast(`Max ${MAX_PHOTOS} photos per visit`); return; }
   State.cameraMode = 'visit';
+  checkGeoPermission(); if(!State.draft.geo) warmLocation();
   if(await openCamera()) return;
   capturePhotoFallback();
 }
@@ -2154,6 +2178,7 @@ async function markArrival(){
   if(!State.draft.accountId){ showToast('Select an account first'); return; }
   if(State.draft.arrivalId || State.arrivalPending) return;
   State.cameraMode = 'arrival';
+  checkGeoPermission(); warmLocation();
   if(await openCamera()) return;
   arrivalPhotoFallback();
 }
@@ -2163,8 +2188,9 @@ function capturePhotoFallback(){
   inp.onchange = async () => {
     const file = inp.files[0]; if(!file) return;
     showToast('Processing photo…');
-    const dataUrl = await compressImage(file, 640, 0.55);
-    addCapturedPhoto(dataUrl);
+    const r = await preparePhotoFile(await compressImage(file, 640, 0.55), file, 'SHELF');
+    if(!acceptPhotoIssue(r.issue, true)) return;
+    addCapturedPhoto(r.dataUrl);
   };
   inp.click();
 }
@@ -2174,8 +2200,9 @@ function arrivalPhotoFallback(){
   inp.onchange = async () => {
     const file = inp.files[0]; if(!file) return;
     showToast('Processing photo…');
-    const dataUrl = await compressImage(file, 640, 0.55);
-    finishArrival(dataUrl);
+    const r = await preparePhotoFile(await compressImage(file, 640, 0.55), file, 'ARRIVAL');
+    if(!acceptPhotoIssue(r.issue, true)) return;
+    finishArrival(r.dataUrl);
   };
   inp.click();
 }
@@ -2233,16 +2260,7 @@ async function finishArrival(photoDataUrl){
       // getting stuck on "Marking arrival…" indefinitely — some Android browsers/WebViews simply
       // never invoke either callback if location is in a stuck permission/service state, ignoring
       // the `timeout` option entirely. withTimeout is the real safety net here.
-      try{
-        geo = await withTimeout(new Promise(resolve => {
-          if(!navigator.geolocation){ resolve(null); return; }
-          navigator.geolocation.getCurrentPosition(
-            pos => resolve({ lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }),
-            () => resolve(null),
-            { enableHighAccuracy:true, timeout:8000 }
-          );
-        }), 10000);
-      }catch(e){ geo = null; } // timed out at the outer boundary — proceed without location rather than hang
+      try{ const r = await withTimeout(warmLocation(), 15000); geo = r.geo || null; }catch(e){ geo = null; } // already running since the camera opened // timed out at the outer boundary — proceed without location rather than hang
     }
     let photoUrl = photoDataUrl;
     try{ photoUrl = await uploadVisitPhoto(photoDataUrl, arrivalId, 0); }catch(e){ console.error('Arrival photo upload failed, keeping embedded copy:', e); }
@@ -2250,7 +2268,7 @@ async function finishArrival(photoDataUrl){
     const mismatch = checkLocationMismatch(d.accountId, geo);
     const arrival = {
       id: arrivalId, accountId:d.accountId, accountName:d.accountName, branch:d.branch,
-      channel:d.channel||'', region:d.region||'', auditor: identityLabel(),
+      channel:d.channel||'', region:d.region||'', auditor: identityLabel(), auditorCode: State.merchCode || null,
       date: todayStr(), arrivedAt, photo: photoUrl, geo: geo||null, status:'active', visitId:null,
       locationMismatch: mismatch,
     };
@@ -2292,6 +2310,128 @@ function attachCameraStream(){
   const video = document.getElementById('cam-live-video');
   if(video && State.cameraStream && !State.cameraPreview){ video.srcObject = State.cameraStream; video.play().catch(()=>{}); }
 }
+/* ============================= PHOTO CHECKS =============================
+   Every photo is judged at the moment it is taken — before it is saved — and has the customer, branch,
+   merchandiser and the exact date/time burned into the picture itself. So a photo that was black, blank,
+   too blurry, or of the floor never gets saved quietly, and a photo can't exist without a timestamp.
+   What this CAN'T do: recognise that a picture is "a Shahd shelf" or read a shop sign (that needs a
+   trained model), or reliably tell a photo of another screen from a real scene. It rules out the clear
+   failures, makes everything else self-documenting, and leaves the final "is this the right place" call
+   to the person approving — with a one-tap "Bad photo" rejection.
+   Thresholds below were measured on real photographs, blurred/darkened copies, and textures (gravel,
+   brick, grass) standing in for pavement: real scenes scored structure ≥ 0.58 and detail ≥ 440; the
+   textures scored structure ≤ 0.15; heavy blur scored detail ≈ 30. */
+const PHOTO_CHECK = { BLOCK_MEAN_LOW:22, BLOCK_MEAN_HIGH:238, BLOCK_DARK_FRAC:0.92, BLOCK_BRIGHT_FRAC:0.90, BLOCK_STD:8, BLOCK_SHARP:15,
+  WARN_MEAN_LOW:45, WARN_SHARP:100, WARN_BRIGHT_FRAC:0.45, FLAT_STRUCTURE:0.2, FLAT_SAT:0.3, MAX_FILE_AGE_MIN:15, WARN_FILE_AGE_MIN:2 };
+const PHOTO_MSG = {
+  black:  ['Photo is black or far too dark — uncover the lens or add light', 'الصورة سوداء أو مظلمة جدًا'],
+  white:  ['Photo is washed out / pure white — move away from the glare', 'الصورة بيضاء بالكامل — ابتعد عن الإضاءة'],
+  blank:  ['Photo is blank / one flat colour — point the camera at the shelf', 'الصورة فارغة — وجّه الكاميرا للرف'],
+  blur:   ['Photo is far too blurry to read', 'الصورة غير واضحة إطلاقًا'],
+  'flat-surface': ['Looks like a floor, wall or ground — the customer sign or Shahd shelf must be clearly in the frame', 'تبدو كأرضية أو جدار — يجب أن يظهر اسم العميل أو رف شهد بوضوح'],
+  dim:    ['Quite dark', 'الصورة معتمة'],
+  blurry: ['Quite blurry', 'الصورة غير واضحة'],
+  overexposed: ['Overexposed — glare is hiding the shelf', 'إضاءة زائدة تخفي الرف'],
+  'old-file': ['This photo wasn\'t taken just now', 'هذه الصورة لم تُلتقط الآن'],
+};
+const PHOTO_FLAG_LABEL = { black:'black', white:'washed out', blank:'blank', blur:'unreadable', 'flat-surface':'looked like a floor/wall', dim:'dark', blurry:'blurry', overexposed:'overexposed', 'old-file':'not freshly taken' };
+function photoMsg(codes){ return codes.map(k=>`${PHOTO_MSG[k][0]} / ${PHOTO_MSG[k][1]}`).join(' · '); }
+/* Measures a photo from its pixels. Pure function (no DOM) so it can be tested. `d` is RGBA, as from getImageData. */
+function photoMetricsFromPixels(d, w, h){
+  const n = w*h, Y = new Float32Array(n);
+  let sum = 0, dark = 0, bright = 0, satSum = 0;
+  for(let i=0, p=0; i<n; i++, p+=4){
+    const r = d[p], g = d[p+1], b = d[p+2];
+    const y = 0.299*r + 0.587*g + 0.114*b; Y[i] = y; sum += y;
+    if(y < 25) dark++; if(y > 235) bright++;
+    const mx = Math.max(r,g,b), mn = Math.min(r,g,b); satSum += mx===0 ? 0 : (mx-mn)/mx;
+  }
+  const mean = sum/n; let v = 0;
+  for(let i=0; i<n; i++){ const dd = Y[i]-mean; v += dd*dd; }
+  const std = Math.sqrt(v/n);
+  // sharpness: variance of the Laplacian (how much fine edge detail there is)
+  let l1 = 0, l2 = 0, c = 0;
+  for(let y=1; y<h-1; y++) for(let x=1; x<w-1; x++){ const i = y*w+x, lap = 4*Y[i]-Y[i-1]-Y[i+1]-Y[i-w]-Y[i+w]; l1 += lap; l2 += lap*lap; c++; }
+  const sharp = c ? (l2/c - (l1/c)*(l1/c)) : 0;
+  // structure: does brightness change across the frame (shelves, doors, signs, products) or is it one
+  // even texture everywhere (floor, wall, ground)? Compares the spread of coarse-block averages to the
+  // spread of individual pixels.
+  const gx = 8, gy = 6, bw = Math.floor(w/gx), bh = Math.floor(h/gy), means = [];
+  for(let by=0; by<gy; by++) for(let bx=0; bx<gx; bx++){
+    let s = 0; for(let y=by*bh; y<(by+1)*bh; y++) for(let x=bx*bw; x<(bx+1)*bw; x++) s += Y[y*w+x];
+    means.push(s/(bw*bh));
+  }
+  const mm = means.reduce((a,b)=>a+b,0)/means.length;
+  const blockStd = Math.sqrt(means.reduce((a,b)=>a+(b-mm)*(b-mm),0)/means.length);
+  return { mean, std, darkFrac: dark/n, brightFrac: bright/n, sat: satSum/n, sharp, structure: std>0 ? blockStd/std : 0 };
+}
+
+function judgePhotoMetrics(m){
+  const P = PHOTO_CHECK, block = k => ({ level:'block', codes:[k], text:photoMsg([k]) });
+  if(m.mean < P.BLOCK_MEAN_LOW || m.darkFrac > P.BLOCK_DARK_FRAC) return block('black');
+  if(m.mean > P.BLOCK_MEAN_HIGH || m.brightFrac > P.BLOCK_BRIGHT_FRAC) return block('white');
+  if(m.std < P.BLOCK_STD) return block('blank');
+  if(m.sharp < P.BLOCK_SHARP) return block('blur');
+  const codes = [];
+  if(m.structure < P.FLAT_STRUCTURE && m.sat < P.FLAT_SAT) codes.push('flat-surface');
+  if(m.mean < P.WARN_MEAN_LOW) codes.push('dim');
+  if(m.sharp < P.WARN_SHARP) codes.push('blurry');
+  if(m.brightFrac > P.WARN_BRIGHT_FRAC) codes.push('overexposed');
+  return codes.length ? { level:'confirm', codes, text:photoMsg(codes) } : { level:'ok', codes:[], text:'' };
+}
+function assessPhotoCanvas(canvas){
+  const W = 160, H = Math.max(24, Math.round(W*canvas.height/canvas.width));
+  const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+  const x = tmp.getContext('2d'); x.drawImage(canvas, 0, 0, W, H);
+  return judgePhotoMetrics(photoMetricsFromPixels(x.getImageData(0,0,W,H).data, W, H));
+}
+function photoStampInfo(tag){
+  const gt = State.cameraMode==='gallery' && State.galleryTarget;
+  const fix = State.draft.geo || (State.__lastFix && Date.now()-State.__lastFix.at < 120000 ? State.__lastFix.geo : null);
+  return { tag, customer: gt ? gt.accountName : State.draft.accountName, branch: gt ? gt.branch : State.draft.branch, who: identityLabel(), time: new Date(), geo: fix };
+}
+// Burns the facts into the picture's own pixels, so they travel with it and can't be left out.
+function stampPhotoCanvas(canvas, info){
+  const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
+  const pad = Math.round(w*0.018), p2 = n => String(n).padStart(2,'0'), t = info.time || new Date();
+  const when = `${t.getFullYear()}-${p2(t.getMonth()+1)}-${p2(t.getDate())} ${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}`;
+  const seg1 = [info.customer, info.branch].filter(Boolean); if(!seg1.length) seg1.push('Shelf Pulse');
+  const seg2 = [info.tag, when, info.who, info.geo ? `${info.geo.lat.toFixed(4)},${info.geo.lng.toFixed(4)} ±${info.geo.accuracy}m` : ''].filter(Boolean);
+  // Each piece is drawn on its own. Putting an Arabic name and numbers in one string lets the text-direction
+  // rules reorder the digits and units around the name ("±11m" came out as "11±" … "m"), which is worse than no stamp.
+  const SEP = '  ·  ';
+  const widthOf = (segs, size, bold) => { ctx.font = `${bold?'bold ':''}${size}px sans-serif`; return segs.reduce((a,s)=>a+ctx.measureText(s).width, 0) + ctx.measureText(SEP).width*(segs.length-1); };
+  const fit = (segs, size, bold) => { while(widthOf(segs, size, bold) > w-2*pad && size > 9) size--; return size; };
+  const draw = (segs, size, bold, y) => { ctx.font = `${bold?'bold ':''}${size}px sans-serif`; let x = pad; segs.forEach((s,i)=>{ if(i){ ctx.fillText(SEP, x, y); x += ctx.measureText(SEP).width; } ctx.fillText(s, x, y); x += ctx.measureText(s).width; }); };
+  const s1 = fit(seg1, Math.max(12, Math.round(w/38)), true), s2 = fit(seg2, Math.max(11, Math.round(w/44)), false);
+  const band = Math.round(s1 + s2 + pad*2.4);
+  ctx.fillStyle = 'rgba(0,0,0,0.66)'; ctx.fillRect(0, h-band, w, band);
+  ctx.fillStyle = '#fff'; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+  draw(seg1, s1, true, h-band+pad);
+  draw(seg2, s2, false, h-band+pad+s1+Math.round(pad*0.5));
+}
+// For photos that arrive as a file (the fallback when the in-page camera can't open): same checks, plus
+// a freshness test — a gallery picture or one forwarded from another device is days old, a camera shot is seconds old.
+async function preparePhotoFile(dataUrl, file, tag){
+  const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = dataUrl; });
+  const canvas = document.createElement('canvas'); canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+  canvas.getContext('2d').drawImage(img, 0, 0);
+  let issue = assessPhotoCanvas(canvas);
+  const ageMin = file && file.lastModified ? (Date.now()-file.lastModified)/60000 : null;
+  if(ageMin != null && ageMin > PHOTO_CHECK.MAX_FILE_AGE_MIN) issue = { level:'block', codes:['old-file'], text:photoMsg(['old-file']) + ` (${Math.round(ageMin)} min old)` };
+  else if(ageMin != null && ageMin > PHOTO_CHECK.WARN_FILE_AGE_MIN && issue.level !== 'block'){ const codes = [...new Set([...issue.codes, 'old-file'])]; issue = { level:'confirm', codes, text:photoMsg(codes) }; }
+  stampPhotoCanvas(canvas, photoStampInfo(tag));
+  return { dataUrl: canvas.toDataURL('image/jpeg', 0.6), issue };
+}
+function recordPhotoFlags(codes){ State.draft.photoFlags = [...new Set([...(State.draft.photoFlags||[]), ...codes])]; }
+// block -> refuse; confirm -> ask, and remember that the check was overridden so the reviewer sees it
+function acceptPhotoIssue(issue, record){
+  if(!issue || issue.level === 'ok') return true;
+  if(issue.level === 'block'){ showToast(issue.text); return false; }
+  if(!confirm(issue.text + '\n\nUse this photo anyway?')) return false;
+  if(record) recordPhotoFlags(issue.codes);
+  return true;
+}
 function snapPhoto(){
   const video = document.getElementById('cam-live-video');
   if(!video || !video.videoWidth){ showToast('Camera still starting — try again in a second'); return; }
@@ -2302,12 +2442,17 @@ function snapPhoto(){
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
   canvas.getContext('2d').drawImage(video, 0, 0, w, h);
-  State.cameraPreview = canvas.toDataURL('image/jpeg', 0.55);
+  State.cameraPreviewIssue = assessPhotoCanvas(canvas);          // judged on the clean picture, before the stamp is drawn over it
+  stampPhotoCanvas(canvas, photoStampInfo(State.cameraMode==='arrival' ? 'ARRIVAL' : State.cameraMode==='gallery' ? 'STORE' : 'SHELF'));
+  State.cameraPreview = canvas.toDataURL('image/jpeg', 0.6);
   render();
 }
-function retakePhoto(){ State.cameraPreview = null; render(); }
+function retakePhoto(){ State.cameraPreview = null; State.cameraPreviewIssue = null; render(); }
 function confirmCameraPhoto(){
   if(!State.cameraPreview) return;
+  const q = State.cameraPreviewIssue;
+  if(q && q.level === 'block'){ showToast(q.text); return; }
+  if(q && q.level === 'confirm' && State.cameraMode !== 'gallery') recordPhotoFlags(q.codes);
   if(State.cameraMode === 'arrival') finishArrival(State.cameraPreview);
   else if(State.cameraMode === 'gallery') finishGalleryPhoto(State.cameraPreview);
   else addCapturedPhoto(State.cameraPreview);
@@ -2317,6 +2462,7 @@ function closeCamera(){
   if(State.cameraStream){ try{ State.cameraStream.getTracks().forEach(t=>t.stop()); }catch(e){} }
   State.cameraStream = null;
   State.cameraPreview = null;
+  State.cameraPreviewIssue = null;
   State.cameraOpen = false;
   render();
 }
@@ -2332,10 +2478,11 @@ function cameraOverlayHtml(){
         ? `<img src="${State.cameraPreview}"/>`
         : `<video id="cam-live-video" autoplay playsinline muted></video>`}
     </div>
+    ${State.cameraPreview && State.cameraPreviewIssue && State.cameraPreviewIssue.level!=='ok' ? `<div style="background:${State.cameraPreviewIssue.level==='block'?'#b00020':'#9a6700'};color:#fff;padding:10px 14px;font-size:13px;line-height:1.4;font-weight:600">${State.cameraPreviewIssue.level==='block'?'⛔ ':'⚠️ '}${State.cameraPreviewIssue.text}</div>` : ''}
     <div class="cam-controls">
       ${State.cameraPreview
         ? `<button class="cam-side-btn" onclick="retakePhoto()">↺ Retake</button>
-           <button class="cam-side-btn" style="background:var(--red)" onclick="confirmCameraPhoto()">✓ Use photo</button>`
+           ${State.cameraPreviewIssue && State.cameraPreviewIssue.level==='block' ? '' : `<button class="cam-side-btn" style="background:var(--red)" onclick="confirmCameraPhoto()">${State.cameraPreviewIssue && State.cameraPreviewIssue.level==='confirm' ? 'Use anyway' : '✓ Use photo'}</button>`}`
         : `<div class="cam-shutter" onclick="snapPhoto()"></div>`}
     </div>
   </div>`;
@@ -2357,41 +2504,70 @@ function compressImage(file, maxDim, quality){
     reader.readAsDataURL(file);
   });
 }
-function captureGeo(){
-  if(!navigator.geolocation){ showToast('Location not supported on this device'); saveDraftLocal(); render(); return; }
-  // Wrapped in withTimeout as an outer safety net — some Android browsers/WebViews never invoke
-  // either callback at all when location is in a stuck permission/service state, silently ignoring
-  // the per-call `timeout` option below. Without this, the "No location" state (and the retry
-  // button) would just sit there with a request that's never actually going to resolve.
-  const attempt = new Promise(resolve => {
-    navigator.geolocation.getCurrentPosition(
-      pos => resolve({ ok:true, geo: { lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) } }),
-      err => {
-        // A first high-accuracy (GPS-only) attempt often fails or times out indoors, inside a store with
-        // no clear sky view — that's a signal problem, not a permission problem. Retry once using
-        // network/Wi-Fi-based positioning (enableHighAccuracy:false), which works far better indoors,
-        // before concluding the visit should be flagged unverified.
-        if(err.code !== 1 /* not an actual permission denial */){
-          navigator.geolocation.getCurrentPosition(
-            pos => resolve({ ok:true, geo: { lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) } }),
-            err2 => resolve({ ok:false, err:err2 }),
-            { enableHighAccuracy:false, timeout:15000, maximumAge:60000 }
-          );
-          return;
-        }
-        resolve({ ok:false, err });
-      },
-      { enableHighAccuracy:true, timeout:8000 }
-    );
+/* ============================= LOCATION =============================
+   One way of asking a phone where it is, used everywhere (arrival, photo, submit). The old code made a
+   single GPS-only request with an 8-second limit in two of its three places, and told the person
+   nothing about WHY it failed. A phone gives a location in two stages — an immediate rough one from
+   Wi-Fi/cell, then a sharper GPS one that can take 20+ seconds indoors — so this asks for both at once,
+   stops as soon as the fix is good, and otherwise settles for the best one it saw. It only reports
+   failure when nothing at all arrived, and says which kind of failure it was. */
+function geoFromPos(pos){ return { lat:+pos.coords.latitude.toFixed(5), lng:+pos.coords.longitude.toFixed(5), accuracy:Math.round(pos.coords.accuracy) }; }
+function acquireLocation(opts){
+  const maxWaitMs = (opts && opts.maxWaitMs) || 20000, goodAccuracy = (opts && opts.goodAccuracy) || 40;
+  return new Promise(resolve => {
+    if(!navigator.geolocation){ resolve({ geo:null, err:{ code:0 } }); return; }
+    let best = null, lastErr = null, done = false, watchId = null, timer = null;
+    const finish = () => {
+      if(done) return; done = true; clearTimeout(timer);
+      try{ if(watchId!=null) navigator.geolocation.clearWatch(watchId); }catch(e){}
+      resolve(best ? { geo:best } : { geo:null, err:lastErr || { code:3 } });
+    };
+    const consider = pos => { const g = geoFromPos(pos); if(!best || g.accuracy < best.accuracy) best = g; if(best.accuracy <= goodAccuracy) finish(); };
+    const onErr = err => { lastErr = err; if(err && err.code === 1) finish(); }; // permission refused — waiting longer can't help
+    try{
+      navigator.geolocation.getCurrentPosition(consider, onErr, { enableHighAccuracy:false, timeout:8000, maximumAge:30000 }); // rough fix, fast
+      watchId = navigator.geolocation.watchPosition(consider, onErr, { enableHighAccuracy:true, timeout:maxWaitMs, maximumAge:0 }); // GPS, keeps sharpening
+    }catch(e){ lastErr = { code:2 }; finish(); return; }
+    timer = setTimeout(finish, maxWaitMs); // some Android browsers never call either callback — this is the real stop
   });
-  withTimeout(attempt, 25000).then(
-    result => {
-      if(result.ok){ State.draft.geo = result.geo; }
-      else { State.draft.geo = null; showToast(geoErrorMessage(result.err)); }
-      saveDraftLocal(); render();
-    },
-    () => { State.draft.geo = null; showToast(geoErrorMessage({code:3})); saveDraftLocal(); render(); }
-  );
+}
+// Started BEFORE the camera opens, so by the time the photo comes back the phone has usually already
+// found itself (the old code only started looking after the photo — a cold start while the camera app had
+// the phone's attention). A recent result is reused; `force` is for the Retry button.
+function warmLocation(force){
+  const w = State.__warm;
+  if(!force && w && Date.now() - w.at < 60000) return w.p;
+  const p = acquireLocation({ maxWaitMs:25000, goodAccuracy:40 });
+  State.__warm = { p, at: Date.now() };
+  p.then(r => { if(r && r.geo) State.__lastFix = { geo:r.geo, at:Date.now() }; });
+  return p;
+}
+async function checkGeoPermission(){
+  try{
+    if(!(navigator.permissions && navigator.permissions.query)) return;
+    const p = await navigator.permissions.query({ name:'geolocation' });
+    if(State.geoPermission !== p.state){ State.geoPermission = p.state; render(); }
+    p.onchange = () => { State.geoPermission = p.state; render(); };
+  }catch(e){}
+}
+function geoHelpHtml(code){
+  const denied = code === 1 || State.geoPermission === 'denied';
+  return `<div class="card" style="background:var(--amber-tint);border-color:var(--amber);margin-top:10px">
+    <p style="margin:0 0 6px;font-weight:700">${denied ? 'الموقع محظور لهذا الموقع / Location is blocked for this site' : 'تعذّر تحديد الموقع / Couldn\'t get a location'}</p>
+    <p class="hint" style="margin:0 0 6px">${denied
+      ? 'Android (Chrome): اضغط على 🔒 بجوار عنوان الموقع ← الأذونات ← الموقع ← السماح.<br>iPhone (Safari): الإعدادات ← الخصوصية ← خدمات الموقع ← Safari ← أثناء الاستخدام، ثم aA ← إعدادات الموقع ← الموقع ← السماح.'
+      : 'تأكد أن الموقع (GPS) مفعّل في إعدادات الهاتف، وأنك لست في وضع توفير الطاقة، ثم اخرج لمكان مفتوح أو اقترب من نافذة وأعد المحاولة.<br>Make sure Location is ON in phone settings and battery-saver is off, then move near a window/door and retry.'}</p>
+    <button class="btn btn-primary btn-sm" onclick="captureGeo(true)">↻ Retry location / إعادة المحاولة</button>
+  </div>`;
+}
+async function captureGeo(force){
+  if(!navigator.geolocation){ showToast('Location not supported on this device'); saveDraftLocal(); render(); return; }
+  State.geoPending = true; render();
+  const r = await withTimeout(warmLocation(force), 30000).catch(() => ({ geo:null, err:{ code:3 } }));
+  State.geoPending = false;
+  if(r.geo){ State.draft.geo = r.geo; State.draft.geoError = null; }
+  else { State.draft.geo = null; State.draft.geoError = (r.err && r.err.code) || 3; showToast(geoErrorMessage(r.err || { code:3 })); }
+  saveDraftLocal(); render();
 }
 function cancelArrivalPending(){
   arrivalAttemptGen++; // invalidates whatever finishArrival() call is still in flight
@@ -2400,6 +2576,7 @@ function cancelArrivalPending(){
   showToast('Cancelled — tap Mark arrival to try again');
 }
 function geoErrorMessage(err){
+  if(err.code === 0) return 'This browser can\'t provide a location — try Chrome (Android) or Safari (iPhone).';
   if(err.code === 1) return 'Location permission denied for this site — check Safari/Chrome site settings, then retry. Visit will be flagged unverified until then.';
   if(err.code === 2) return 'Could not get a location fix indoors — visit will be flagged unverified. You can retry, or continue without it.';
   return 'Location timed out — signal may be weak indoors. Visit will be flagged unverified. You can retry, or continue without it.';
@@ -2459,10 +2636,10 @@ function emptyState(icon,title,sub){ return `<div class="empty"><div class="big"
 /* Merchandiser visit-target lookup from route plan (best-effort name match) */
 function targetForMerch(name){
   if(!name) return 0;
-  return State.accounts.filter(a => (a.merch||'').trim() === name.trim()).reduce((s,a)=>s+(a.target||0),0);
+  return State.accounts.filter(a => sameName(a.merch, name)).reduce((s,a)=>s+(a.target||0),0);
 }
 function achievedForMerch(name){
-  return State.visits.filter(v=>v.auditor===name).length;
+  return State.visits.filter(v=>sameName(v.auditor, name)).length;
 }
 function normalizeArabicName(s){
   // Strips characters that look identical in a route-cycle Excel export but aren't byte-identical —
@@ -2478,17 +2655,19 @@ function normalizeArabicName(s){
     .trim();
 }
 function isSameSupervisor(supValueFromAccount, loggedInSupervisorName){
-  return normalizeArabicName(supValueFromAccount) === normalizeArabicName(loggedInSupervisorName);
+  return nameKey(supValueFromAccount) === nameKey(loggedInSupervisorName);
 }
 function supervisorOfMerch(merchName){
   const counts = {};
-  State.accounts.forEach(a=>{ if((a.merch||'').trim()===(merchName||'').trim() && a.sup){ counts[a.sup]=(counts[a.sup]||0)+1; } });
+  State.accounts.forEach(a=>{ if(sameName(a.merch, merchName) && a.sup){ const k = nameKey(a.sup); counts[k] = counts[k] || { n:0, raw:a.sup }; counts[k].n++; } });
   let best=null, bestN=0;
-  Object.entries(counts).forEach(([s,n])=>{ if(n>bestN){ best=s; bestN=n; } });
+  Object.values(counts).forEach(o=>{ if(o.n>bestN){ best=o.raw; bestN=o.n; } });
   return best;
 }
 function myMerchandisers(){
-  const all = [...new Set(State.accounts.map(a=>(a.merch||'').trim()).filter(Boolean))];
+  // one entry per PERSON (by name key), shown in its cleaned form — "فاطمة" and "فاطمه" are one merchandiser
+  const seen = new Set(); const all = [];
+  State.accounts.forEach(a=>{ const n = cleanName(a.merch); const k = nameKey(n); if(n && !seen.has(k)){ seen.add(k); all.push(n); } });
   if(State.role==='supervisor') return all.filter(n=>isSameSupervisor(supervisorOfMerch(n), State.name));
   return all;
 }
@@ -2521,7 +2700,12 @@ function screenLogin(){
       </div>
     </div>`;
   }
-  const merchNames = [...new Set(State.accounts.map(a=>a.merch).filter(Boolean))].sort();
+  // one entry per person: trimmed, and spelling variants of the same name collapsed (most common wins)
+  const merchNames = (() => {
+    const groups = {};
+    State.accounts.forEach(a=>{ const n = cleanName(a.merch); if(!n || a.medium==='ecomm') return; const k = nameKey(n); (groups[k] = groups[k] || {})[n] = ((groups[k]||{})[n]||0) + 1; });
+    return Object.values(groups).map(g=>Object.entries(g).sort((x,y)=>y[1]-x[1])[0][0]).sort();
+  })();
   return `<div class="screen" style="padding-top:40px">
     <div style="text-align:center;margin-bottom:20px">
       <div class="brand-mark" style="background:var(--red);color:#fff;margin:0 auto 12px;width:52px;height:52px;font-size:18px;">C3A</div>
@@ -2570,7 +2754,7 @@ function screenHome(){
   const aggs = approved.map(v=>visitAggregate(v));
 
   if(State.navContext === 'field'){
-    const mine = State.visits.filter(v=>v.auditor===identityLabel());
+    const mine = State.visits.filter(v=>sameName(v.auditor, identityLabel()));
     const target = targetForMerch(State.name);
     const achieved = mine.length;
     return `<div class="screen">
@@ -2667,10 +2851,11 @@ function screenNewVisit(){
             </div>`).join('')}
         </div>
         <div class="verify-row">
-          ${d.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع') : statusChip('off','⚠️ No location / لا يوجد موقع')}
+          ${d.geo ? statusChip('on','📍 Location captured / تم تحديد الموقع' + (d.geo.accuracy>200 ? ' (weak ±'+d.geo.accuracy+'m)' : '')) : (State.geoPending ? statusChip('watch','⏳ Locating… / جارٍ تحديد الموقع') : statusChip('off','⚠️ No location / لا يوجد موقع'))}
           ${d.capturedAt ? statusChip('neutral', new Date(d.capturedAt).toLocaleTimeString()) : ''}
-          ${!d.geo ? `<button class="btn btn-ghost btn-sm" onclick="captureGeo()">↻ Retry location / إعادة المحاولة</button>` : ''}
+          ${!d.geo && !State.geoPending ? `<button class="btn btn-ghost btn-sm" onclick="captureGeo(true)">↻ Retry location / إعادة المحاولة</button>` : ''}
         </div>
+        ${!d.geo && !State.geoPending && (d.geoError || State.geoPermission==='denied') ? geoHelpHtml(d.geoError) : ''}
         ${d.photos.length < MAX_PHOTOS ? `<button class="btn btn-ghost btn-sm" style="margin-top:10px" onclick="capturePhoto()">＋ Add another photo / إضافة صورة</button>` : `<p class="hint" style="margin-top:8px">Max ${MAX_PHOTOS} reached / الحد الأقصى</p>`}
       ` : `
         <div class="photo-box">
@@ -2741,16 +2926,19 @@ function myAccounts(){
     // delegation: the old code compared toMerch to State.name with a strict, untrimmed ===, right
     // next to an "own accounts" check that already trimmed both sides defensively — a name-string
     // variant that didn't exactly match (extra space, different row's spelling) just vanished.
+    // A session saved before codes existed has no merchCode — recover it from the directory by name, and
+    // match names by key so one person stored under two spellings still sees every branch of theirs.
+    const myCode = State.merchCode || merchCodeForName(State.name);
     const own = State.accounts.filter(a =>
       a.medium!=='ecomm' && (
-        (a.merchCode && State.merchCode && a.merchCode===State.merchCode) ||
-        (a.merch||'').trim()===State.name.trim()
+        (a.merchCode && myCode && String(a.merchCode)===String(myCode)) ||
+        sameName(a.merch, State.name)
       )
     );
     const ownIds = new Set(own.map(a=>a.id));
     const delegatedIds = new Set(State.delegations.filter(x => x.date===State.draft.date && (
       (x.toMerchCode && State.merchCode && x.toMerchCode===State.merchCode) ||
-      (x.toMerch||'').trim()===State.name.trim()
+      sameName(x.toMerch, State.name)
     )).map(x=>x.accountId));
     const delegated = State.accounts.filter(a=>delegatedIds.has(a.id) && !ownIds.has(a.id));
     return [...own, ...delegated];
@@ -2764,7 +2952,7 @@ function accountResultsHtml(){
   if(results.length===0) return `<p class="hint">No matches — try a different spelling.</p>`;
   return `<div style="margin-top:8px">${results.map(a=>`
     <div class="search-result" onclick="pickAccount('${a.id}')">
-      <div><div class="sr-main">${a.name}${State.role==='merchandiser' && (a.merch||'').trim()!==State.name.trim()?' <span class="hint" style="text-transform:none">(delegated to you today)</span>':''}</div><div class="sr-sub">${a.branch} · ${a.region}</div></div>
+      <div><div class="sr-main">${a.name}${State.role==='merchandiser' && !sameName(a.merch, State.name)?' <span class="hint" style="text-transform:none">(delegated to you today)</span>':''}</div><div class="sr-sub">${a.branch} · ${a.region}</div></div>
       <div class="sr-sub">${a.target||0} visits/wk</div>
     </div>`).join('')}</div>`;
 }
@@ -2773,7 +2961,7 @@ function accountSearchAreaHtml(){
   return `<p class="hint">Type at least 2 letters to search, or pick from the full list:</p>
     <select onchange="if(this.value)pickAccount(this.value)">
       <option value="">Browse all ${myAccounts().length} accounts…</option>
-      ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}${State.role==='merchandiser' && (a.merch||'').trim()!==State.name.trim()?' (delegated)':''}</option>`).join('')}
+      ${[...myAccounts()].sort((a,b)=>(a.name+a.branch).localeCompare(b.name+b.branch)).map(a=>`<option value="${a.id}">${a.name} — ${a.branch}${State.role==='merchandiser' && !sameName(a.merch, State.name)?' (delegated)':''}</option>`).join('')}
     </select>`;
 }
 function skuLineHtml(it, idx){
@@ -2817,14 +3005,143 @@ function skuLineHtml(it, idx){
 }
 
 function screenMyVisits(){
-  const mine = State.visits.filter(v=>v.auditor===(State.name||'Unnamed'));
+  const mine = State.visits.filter(v=>sameName(v.auditor, State.name||'Unnamed'));
   return `<div class="screen"><h1>My visits / زياراتي</h1><p class="lede">Everything you've submitted, with live status.</p>
   ${mine.map(visitRowHtml).join('') || emptyState('📋','Nothing submitted yet','Your submitted visits will appear here.')}</div>`;
 }
 
+/* ============================= VISIT INTEGRITY =============================
+   What a web page CANNOT do: read whether the phone is using a "mock location" app — that flag exists
+   only for installed Android apps, not for websites. So this doesn't try to detect the app. It looks for
+   the traces fake locations and made-up numbers leave in the data itself, and shows them to whoever is
+   approving so a human decides. They're signals, not verdicts: every one has an innocent explanation
+   (a big mall, a bad indoor fix), which is why none of them blocks a submission.
+     far      — the visit's location is far from where the branch's OTHER visits were recorded (visits
+                from the very same spot are left out of that reference, so repeating one fake spot
+                doesn't make it look normal)
+     travel   — moved faster than a car could since the same person's previous visit
+     samespot — one person used the exact same spot (11 m) for 3+ different branches: a pin that never moved
+     copied   — stock counts identical to the previous visit at the same branch */
+const INTEGRITY = { FAR_MEDIUM_M:500, FAR_HIGH_M:1500, MIN_REF_VISITS:2, TRUST_ACCURACY_M:300,
+  MAX_KMH:110, MIN_TRAVEL_M:1500, MAX_TRAVEL_GAP_MS:6*3600*1000, SAME_SPOT_ACCOUNTS:3,
+  COPY_SHARE:0.85, COPY_MIN_SKUS:8, COPY_MAX_GAP_DAYS:45 };
+function medianOf(arr){ const s=[...arr].sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2 ? s[m] : (s[m-1]+s[m])/2; }
+function computeIntegrityIndex(){
+  const key = State.visits.length+':'+State.visits.reduce((m,v)=>Math.max(m,v.submittedAt||0),0)+':'+State.visits.filter(v=>v.status==='rejected').length;
+  if(State.__integrity && State.__integrity.key===key) return State.__integrity.map;
+  const I = INTEGRITY, flags = new Map();
+  const add = (v, code, severity, text) => { if(!flags.has(v.id)) flags.set(v.id, []); const a = flags.get(v.id); if(!a.some(f=>f.code===code)) a.push({ code, severity, text }); };
+  const field = State.visits.filter(v=>v.medium!=='ecomm' && v.status!=='rejected');
+  const hasGeo = v => v.geo && isFinite(v.geo.lat) && isFinite(v.geo.lng);
+  const geoVisits = field.filter(hasGeo);
+  const cell = v => v.geo.lat.toFixed(4)+','+v.geo.lng.toFixed(4);
+  const when = v => v.capturedAt || v.submittedAt || 0;
+  const who = v => nameKey(v.auditor);
+  const trusted = v => (v.geo.accuracy||0) <= I.TRUST_ACCURACY_M;
+  field.forEach(v=>{ if(Array.isArray(v.photoFlags) && v.photoFlags.length) add(v,'photo','medium','Photo check overridden: '+v.photoFlags.map(k=>PHOTO_FLAG_LABEL[k]||k).join(', ')); });
+
+  const byAccount = {};
+  geoVisits.forEach(v=>{ (byAccount[v.accountId] = byAccount[v.accountId] || []).push(v); });
+  geoVisits.forEach(v=>{
+    if(!trusted(v)) return;
+    const refs = (byAccount[v.accountId]||[]).filter(o=>o.id!==v.id && cell(o)!==cell(v) && trusted(o));
+    if(refs.length < I.MIN_REF_VISITS) return;
+    const dist = haversineMeters(v.geo.lat, v.geo.lng, medianOf(refs.map(o=>o.geo.lat)), medianOf(refs.map(o=>o.geo.lng)));
+    if(dist > I.FAR_HIGH_M) add(v,'far','high',`Location is ${(dist/1000).toFixed(1)} km from where this branch is normally recorded`);
+    else if(dist > I.FAR_MEDIUM_M) add(v,'far','medium',`Location is ${Math.round(dist)} m from where this branch is normally recorded`);
+  });
+
+  const byPerson = {};
+  geoVisits.forEach(v=>{ (byPerson[who(v)] = byPerson[who(v)] || []).push(v); });
+  Object.values(byPerson).forEach(list=>{
+    list.sort((a,b)=>when(a)-when(b));
+    for(let i=1;i<list.length;i++){
+      const p = list[i-1], q = list[i], dt = when(q)-when(p);
+      if(dt<=0 || dt>I.MAX_TRAVEL_GAP_MS || !trusted(p) || !trusted(q)) continue;
+      const dist = haversineMeters(p.geo.lat,p.geo.lng,q.geo.lat,q.geo.lng);
+      if(dist < I.MIN_TRAVEL_M) continue;
+      const kmh = (dist/1000)/(dt/3600000);
+      if(kmh > I.MAX_KMH) add(q,'travel','high',`Moved ${(dist/1000).toFixed(1)} km in ${Math.max(1,Math.round(dt/60000))} min since the previous visit (${Math.round(kmh)} km/h)`);
+    }
+  });
+
+  const spots = new Map();
+  geoVisits.forEach(v=>{ const k = who(v)+'|'+cell(v); if(!spots.has(k)) spots.set(k,{ accounts:new Set(), visits:[] }); const s = spots.get(k); s.accounts.add(v.accountId); s.visits.push(v); });
+  spots.forEach(s=>{ if(s.accounts.size >= I.SAME_SPOT_ACCOUNTS) s.visits.forEach(v=>add(v,'samespot','high',`Exact same location used for ${s.accounts.size} different branches`)); });
+
+  const byBranch = {};
+  field.forEach(v=>{ (byBranch[v.accountId] = byBranch[v.accountId] || []).push(v); });
+  const num = x => (x===''||x==null||isNaN(parseFloat(x))) ? null : parseFloat(x);
+  const compareCounts = (p, q) => {
+    const prev = {}; (p.items||[]).forEach(it=>{ prev[it.skuId] = it; });
+    let compared = 0, same = 0;
+    (q.items||[]).forEach(it=>{
+      const pi = prev[it.skuId]; if(!pi) return;
+      const c1 = num(pi.closing), c2 = num(it.closing), k1 = num(pi.actualCapacity), k2 = num(it.actualCapacity);
+      if(c1==null || c2==null || (c1===0 && c2===0)) return; // two empty shelves prove nothing
+      compared++;
+      if(c1===c2 && (k1==null || k2==null || k1===k2)) same++;
+    });
+    return { compared, same };
+  };
+  Object.values(byBranch).forEach(list=>{
+    list.sort((a,b)=>when(a)-when(b));
+    for(let i=1;i<list.length;i++){
+      const q = list[i];
+      // compared against the visit just before it at this branch (whoever made it) AND this person's own
+      // last visit there — copying your own old numbers shouldn't escape just because someone else
+      // happened to visit in between
+      const candidates = [list[i-1]];
+      for(let j=i-2;j>=0;j--){ if(nameKey(list[j].auditor)===nameKey(q.auditor)){ candidates.push(list[j]); break; } }
+      for(const p of candidates){
+        if(when(q)-when(p) > I.COPY_MAX_GAP_DAYS*86400000) continue;
+        const { compared, same } = compareCounts(p, q);
+        if(compared >= I.COPY_MIN_SKUS && same/compared >= I.COPY_SHARE){ add(q,'copied','medium',`Stock counts identical to ${nameKey(p.auditor)===nameKey(q.auditor)?'this person\'s own previous':'the previous'} visit on ${same} of ${compared} SKUs`); break; }
+      }
+    }
+  });
+  State.__integrity = { key, map: flags };
+  return flags;
+}
+function integrityChipsHtml(v){
+  const fl = computeIntegrityIndex().get(v.id);
+  if(!fl || !fl.length) return '';
+  return `<div class="verify-row" style="margin-bottom:8px">${fl.map(f=>statusChip(f.severity==='high'?'off':'watch','🚩 '+f.text)).join('')}</div>`;
+}
+function manageBackendIntegrityHtml(){
+  const idx = computeIntegrityIndex();
+  const since = new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+  const recent = State.visits.filter(v=>v.medium!=='ecomm' && v.status!=='rejected' && (v.date||'')>=since);
+  const people = {};
+  recent.forEach(v=>{
+    const k = nameKey(v.auditor); const p = people[k] = people[k] || { name:cleanName(v.auditor), visits:0, flagged:0, high:0, noGeo:0 };
+    p.visits++;
+    if(!v.geo) p.noGeo++;
+    const fl = idx.get(v.id);
+    if(fl && fl.length){ p.flagged++; if(fl.some(f=>f.severity==='high')) p.high++; }
+  });
+  const rows = Object.values(people).sort((a,b)=>(b.high-a.high)||(b.flagged-a.flagged));
+  const flaggedVisits = recent.filter(v=>(idx.get(v.id)||[]).length).sort((a,b)=>(b.submittedAt||0)-(a.submittedAt||0)).slice(0,80);
+  return `
+    <p class="lede">Last 30 days, field visits. A web app can't see whether a phone is using a mock-location app, so this looks for what fake locations and made-up numbers leave behind. These are signals to check, not proof — a large mall or a weak indoor signal can trigger some of them.</p>
+    <div class="card">
+      <h3>By merchandiser</h3>
+      ${rows.length===0 ? '<p class="hint">No visits in the last 30 days.</p>' : `
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch"><table class="mini">
+        <tr><th>Merchandiser</th><th>Visits</th><th>Flagged</th><th>High</th><th>No location</th></tr>
+        ${rows.map(r=>`<tr><td>${r.name}</td><td>${r.visits}</td><td>${r.flagged}</td><td style="${r.high?'color:var(--red);font-weight:700':''}">${r.high}</td><td>${r.noGeo}</td></tr>`).join('')}
+      </table></div>`}
+    </div>
+    <div class="sectitle">Flagged visits (${flaggedVisits.length})</div>
+    ${flaggedVisits.length===0 ? emptyState('✅','Nothing flagged','No visit in the last 30 days tripped a check.') : flaggedVisits.map(v=>`
+      <div class="card">
+        <div class="visit-row" style="border:none;padding:0 0 6px"><div><div class="visit-main">${v.accountName} · ${v.branch}</div><div class="visit-sub">${v.date} · ${cleanName(v.auditor)} · ${v.status}</div></div></div>
+        ${integrityChipsHtml(v)}
+      </div>`).join('')}`;
+}
 function screenApprovals(){
-  const mySet = new Set(myMerchandisers());
-  const pending = State.visits.filter(v=>v.status==='pending' && (State.role!=='supervisor' || mySet.has(v.auditor)));
+  const mySet = makeTeamSet(myMerchandisers());
+  const pending = State.visits.filter(v=>v.status==='pending' && (State.role!=='supervisor' || mySet.hasVisit(v)));
   return `<div class="screen"><h1>Approvals / الموافقات</h1><p class="lede">Review and approve incoming field audits.</p>
   ${pending.map(v=>approvalCardHtml(v)).join('') || emptyState('✅','All caught up','No visits waiting for review.')}</div>`;
 }
@@ -2848,6 +3165,7 @@ function approvalCardHtml(v){
       ${statusChip(agg.visitDonePct>=95?'on':'watch', fmt(agg.visitDonePct)+'% data complete / اكتمال البيانات')}
       ${(() => { const mins = visitDurationMinutes(v); return mins!==null ? statusChip(mins<SHORT_VISIT_MINUTES?'off':'neutral', '⏱ '+fmtDuration(mins)+(mins<SHORT_VISIT_MINUTES?' — too fast to be real':'')) : ''; })()}
     </div>
+    ${integrityChipsHtml(v)}
     <div class="verify-row" style="margin-bottom:8px">
       ${statusChip('neutral', `Category facings: ${fmt(agg.catFacingsTotal)}`)}
       ${statusChip(exceedsCategory?'off':'neutral', `Shahd facings: ${fmt(shahdFacingsSum)}`)}
@@ -2867,6 +3185,7 @@ function approvalCardHtml(v){
       ${roleConf().canApprove ? `
       <button class="btn btn-green btn-sm" style="flex:1" onclick="setVisitStatus('${v.id}','approved')">Approve / اعتماد</button>
       <button class="btn btn-danger btn-sm" style="flex:1" onclick="rejectPrompt('${v.id}')">Reject / رفض</button>
+      <button class="btn btn-ghost btn-sm" style="flex:1" onclick="rejectBadPhoto('${v.id}')">📷 Bad photo / صورة غير صالحة</button>
       ` : `<p class="hint">View-only — you don't have approval rights.</p>`}
     </div>
   </div>`;
@@ -2893,7 +3212,7 @@ async function closeStaleArrivals(){
 // day-to-day team management.
 const STALE_ARRIVAL_MINUTES = 24*60;
 function screenArrivals(){
-  const mySet = new Set(myMerchandisers());
+  const mySet = makeTeamSet(myMerchandisers());
   const scoped = State.arrivals.filter(a => State.role!=='supervisor' || mySet.has(a.auditor));
   const active = scoped.filter(a=>a.status==='active');
   const recent = scoped.filter(a=>a.status!=='active').slice(0, 20);
@@ -3428,8 +3747,8 @@ function screenEcommDashboard(){
 function screenAccounts(){
   let approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
   if(State.role==='supervisor'){
-    const mySet = new Set(myMerchandisers());
-    approved = approved.filter(v=>mySet.has(v.auditor));
+    const mySet = makeTeamSet(myMerchandisers());
+    approved = approved.filter(v=>mySet.hasVisit(v));
   }
   const customers = computeCustomerAnalysis(approved);
   if(customers.length===0) return `<div class="screen"><h1>Customers / العملاء</h1>${emptyState('🏬','No approved visits yet','Data appears here once visits are approved.')}</div>`;
@@ -4696,7 +5015,7 @@ function loadRouteCycleSheet(sheetName){
       updatedAccounts++;
       matchedIds.add(matched.id);
       const newMerch = String(row[ROUTE_CYCLE_COLUMNS.merchName]||'').trim();
-      if(newMerch && (matched.merch||'').trim()!==newMerch) merchChanges++;
+      if(newMerch && !sameName(matched.merch, newMerch)) merchChanges++;
     } else newAccounts++;
   });
   const notInFile = State.accounts.filter(a=>a.medium!=='ecomm' && !matchedIds.has(a.id)).length;
@@ -4963,11 +5282,11 @@ async function addMerchandiserManually(){
 
 /* ---- Team ---- */
 function screenTeam(){
-  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
-  const names = [...new Set(State.visits.map(v=>v.auditor))].filter(n=>!mySet || mySet.has(n));
+  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
+  const names = (() => { const seen = new Set(); const out = []; State.visits.forEach(v=>{ const k = nameKey(v.auditor); if(!k || seen.has(k)) return; if(mySet && !mySet.hasVisit(v)) return; seen.add(k); out.push(cleanName(v.auditor)); }); return out; })();
   if(names.length===0) return `<div class="screen"><h1>Team / الفريق</h1><p class="lede">Merchandiser performance vs targets.</p>${emptyState('👥','No visits yet','')}</div>`;
   const rows = names.map(name=>{
-    const mine = State.visits.filter(v=>v.auditor===name);
+    const mine = State.visits.filter(v=>sameName(v.auditor, name));
     const approved = mine.filter(v=>v.status==='approved' && v.medium!=='ecomm');
     const aggs = approved.map(visitAggregate);
     const avg = f => aggs.length ? aggs.reduce((s,a)=>s+f(a),0)/aggs.length : 0;
@@ -5003,8 +5322,9 @@ function computeMonthlyScorecard(month){
   const monthVisits = State.visits.filter(v => v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
   const byMerch = {};
   monthVisits.forEach(v=>{
-    byMerch[v.auditor] = byMerch[v.auditor] || { all:[], approved:[], rejected:[], pending:[] };
-    const g = byMerch[v.auditor];
+    const k = cleanName(v.auditor); const key = Object.keys(byMerch).find(x=>sameName(x, k)) || k;
+    byMerch[key] = byMerch[key] || { all:[], approved:[], rejected:[], pending:[] };
+    const g = byMerch[key];
     g.all.push(v);
     if(v.status==='approved') g.approved.push(v);
     else if(v.status==='rejected') g.rejected.push(v);
@@ -5052,7 +5372,7 @@ function screenMonthlyScorecard(){
 
   // Supervisor role: no picker needed, they only ever see their own team.
   if(State.role==='supervisor'){
-    const mySet = new Set(myMerchandisers());
+    const mySet = makeTeamSet(myMerchandisers());
     const teamRows = rows.filter(r=>mySet.has(r.merch));
     return screenMonthlyTeamView(month, monthLabel, monthPicker, State.name, teamRows, false);
   }
@@ -5165,12 +5485,13 @@ function scorecardPillRow(){
 function screenScorecard(){
   if(State.scorecardView==='monthly') return screenMonthlyScorecard();
   const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
-  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
+  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
   const byMerch = {};
   approved.forEach(v=>{
-    if(mySet && !mySet.has(v.auditor)) return;
-    byMerch[v.auditor] = byMerch[v.auditor] || [];
-    byMerch[v.auditor].push(v);
+    if(mySet && !mySet.hasVisit(v)) return;
+    const k = cleanName(v.auditor); const key = Object.keys(byMerch).find(x=>sameName(x, k)) || k;
+    byMerch[key] = byMerch[key] || [];
+    byMerch[key].push(v);
   });
   const rows = Object.entries(byMerch).map(([merch, visits])=>{
     const aggs = visits.map(visitAggregate);
@@ -5210,8 +5531,8 @@ function screenScorecard(){
 /* ---- All Visits (browse + edit, control roles only) ---- */
 function visitListResultsHtml(){
   const q = State.visitSearch.toLowerCase();
-  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
-  const pool = mySet ? State.visits.filter(v=>mySet.has(v.auditor)) : State.visits;
+  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
+  const pool = mySet ? State.visits.filter(v=>mySet.hasVisit(v)) : State.visits;
   const list = pool.filter(v => !q || (v.accountName+' '+v.branch+' '+v.auditor).toLowerCase().includes(q));
   return `${list.slice(0,60).map(v=>{
       const agg = visitAggregate(v);
@@ -5229,8 +5550,8 @@ function visitListResultsHtml(){
     ${list.length>60 ? `<p class="hint">Showing first 60 of ${list.length} matches — search to narrow down.</p>` : ''}`;
 }
 function screenAllVisits(){
-  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
-  const scopedCount = mySet ? State.visits.filter(v=>mySet.has(v.auditor)).length : State.visits.length;
+  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
+  const scopedCount = mySet ? State.visits.filter(v=>mySet.hasVisit(v)).length : State.visits.length;
   return `<div class="screen">
     <h1>All visits / كل الزيارات</h1>
     <p class="lede">${mySet ? 'Browse and correct visits for your team' : 'Browse and correct any submitted visit'} — ${scopedCount} total.</p>
@@ -5320,7 +5641,7 @@ function delegateListHtml(){
     ${list.length>80 ? `<p class="hint">Showing first 80 of ${list.length} matches — search to narrow down.</p>` : ''}`;
 }
 function activeDelegationsHtml(){
-  const mySet = State.role==='supervisor' ? new Set(myMerchandisers()) : null;
+  const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
   const today = todayStr();
   const list = State.delegations
     .filter(x => x.date >= today) // hide ones that have already passed
@@ -5572,6 +5893,7 @@ function screenManageBackend(){
     {id:'merging', label:'Merging'},
     {id:'deletion', label:'Deletion'},
     {id:'photos', label:'Photos'},
+    {id:'integrity', label:'Integrity'},
   ];
   const bodies = {
     skus: manageBackendSkusHtml,
@@ -5581,6 +5903,7 @@ function screenManageBackend(){
     merging: manageBackendMergingHtml,
     deletion: manageBackendDeletionHtml,
     photos: manageBackendPhotosHtml,
+    integrity: manageBackendIntegrityHtml,
   };
   return `<div class="screen">
     <h1>Manage Backend / إدارة النظام</h1>
@@ -6157,6 +6480,10 @@ function clearAccount(){
 function toggleLine(idx){ State.draft.items[idx]._open = !State.draft.items[idx]._open; render(); }
 function lineField(idx,field,val){ State.draft.items[idx][field]=val; saveDraftLocal(); }
 function lineFieldBlur(){ render(); }
+function rejectBadPhoto(id){
+  if(!confirm('Reject this visit because the photo is not valid (black, wrong place, floor, another screen…)? The merchandiser will be told to retake it.')) return;
+  setVisitStatus(id,'rejected','Photo not valid — retake it so the customer name/sign or the Shahd shelf is clearly visible / الصورة غير صالحة — أعد التصوير بحيث يظهر اسم العميل أو رف شهد بوضوح');
+}
 function rejectPrompt(id){ const note = prompt('Reason for rejection (optional):') || ''; setVisitStatus(id,'rejected',note); }
 function openVisit(id){
   const v = State.visits.find(v=>v.id===id); if(!v) return;
@@ -6279,7 +6606,7 @@ Object.assign(window, {
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
-  forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
+  rejectBadPhoto, forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
   selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
   delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
