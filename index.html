@@ -1550,7 +1550,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-08 · scorecard drill-down';
+const APP_BUILD = '2026-10-12 · 2 PPT formats';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -3336,11 +3336,8 @@ function pptExportMenuHtml(){
     <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:8px;text-align:left" id="ppt-exec-btn" onclick="exportPptExecutive()">
       Executive Summary <span class="hint" style="color:inherit;opacity:.85">— top-level KPIs only, ~6 slides, for leadership</span>
     </button>
-    <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:8px;text-align:left" id="ppt-btn" onclick="exportPpt()">
-      Full Network Detail <span class="hint" style="color:inherit;opacity:.85">— every section, customer &amp; branch action plans</span>
-    </button>
-    <button class="btn btn-primary btn-sm" style="width:100%;text-align:left" onclick="choosePptAccountMode()">
-      Single Account <span class="hint" style="color:inherit;opacity:.85">— pick one customer, its full branch detail only</span>
+    <button class="btn btn-primary btn-sm" style="width:100%;text-align:left" id="ppt-btn" onclick="exportPpt()">
+      Full Network <span class="hint" style="color:inherit;opacity:.85">— every section + an accounts index; click an account to jump to its full SKU tables</span>
     </button>
   </div>`;
 }
@@ -4602,26 +4599,39 @@ async function exportPpt(){
     // total issues) get a dedicated slide — named explicitly on the customer's own slide, with a note
     // on how many more exist. The full, unlimited, always-current branch list stays one tap away in
     // the app's own Opportunities tab.
-    const CUST_DETAIL_MIN_BRANCHES = 10;
-    const BRANCH_SLIDES_PER_CUSTOMER = 4;
-    const detailedCustomers = sortedCustomers.filter(c=>c.branchCount >= CUST_DETAIL_MIN_BRANCHES);
-    const smallCustomers = sortedCustomers.filter(c=>c.branchCount < CUST_DETAIL_MIN_BRANCHES);
-
-    detailedCustomers.forEach(c=>{
+    // Full-network deck = the network sections + EVERY account's complete section (the former
+    // "Single Account" deck, now built in): an Accounts Index slide of clickable names, then for each
+    // account its overview slide and every branch, with every SKU shown. Clicking a name jumps to that
+    // account's first slide; each account slide carries a "↑ Accounts index" link back.
+    const INDEX_PER_SLIDE = 45, INDEX_COLS = 3, INDEX_ROWS = 15;
+    const indexPages = Math.max(1, Math.ceil(sortedCustomers.length / INDEX_PER_SLIDE));
+    const indexSlides = [];
+    for(let p=0; p<indexPages; p++){
+      const si = pptx.addSlide();
+      si.addText(indexPages>1 ? `Accounts Index (${p+1}/${indexPages})` : 'Accounts Index', { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:24, bold:true, color:DARK });
+      si.addText('Click an account name to jump to its section — overview, action plan and every branch with the full SKU table.', { x:0.5, y:0.85, w:12.3, h:0.3, fontSize:10.5, italic:true, color:SOFT });
+      footer(si, 'Accounts Index');
+      indexSlides.push(si);
+    }
+    const indexFirstNum = pptx.slides.length - indexPages + 1;
+    sortedCustomers.forEach((c, i)=>{
      try{
       const custOpp = custOpps.find(co=>co.name===c.name);
-      buildCustomerDetailSlides(pptx, c, custOpp, BRANCH_SLIDES_PER_CUSTOMER, false); // all-customers deck: capped, see addOppTableSlides
-     }catch(e){ console.error('Skipping customer action-plan detail', c && c.name, e); }
+      const startNum = pptx.slides.length + 1;
+      buildCustomerDetailSlides(pptx, c, custOpp, Infinity, true);
+      const endNum = pptx.slides.length;
+      const page = Math.floor(i / INDEX_PER_SLIDE), k = i % INDEX_PER_SLIDE;
+      const col = Math.floor(k / INDEX_ROWS), row = k % INDEX_ROWS;
+      if(endNum >= startNum){
+        indexSlides[page].addText(`${c.name}  (${c.branchCount})`, { x:0.5 + col*4.15, y:1.3 + row*0.38, w:4.05, h:0.34, fontSize:11, color:'0563C1', valign:'middle', hyperlink:{ slide:startNum, tooltip:`Go to ${c.name}` } });
+        for(let n=startNum; n<=endNum; n++){
+          pptx.slides[n-1].addText('↑ Accounts index', { x:10.8, y:0.05, w:2.0, h:0.25, fontSize:9, align:'right', color:'0563C1', hyperlink:{ slide:indexFirstNum + page, tooltip:'Back to the accounts index' } });
+        }
+      } else {
+        indexSlides[page].addText(`${c.name}  (${c.branchCount}) — no data`, { x:0.5 + col*4.15, y:1.3 + row*0.38, w:4.05, h:0.34, fontSize:11, color:SOFT, valign:'middle' });
+      }
+     }catch(e){ console.error('Skipping account section', c && c.name, e); }
     });
-    if(smallCustomers.length>0){
-     try{
-      let scN = pptx.addSlide();
-      scN.addText('Smaller Customers', { x:0.5, y:0.35, w:12, h:0.5, fontSize:24, bold:true, color:DARK });
-      scN.addText(`${smallCustomers.length} customer(s) with only 1-2 branches each — fully covered in the overview table above; listed here for completeness.`, { x:0.5, y:0.85, w:12, h:0.4, fontSize:10.5, italic:true, color:SOFT });
-      scN.addText(smallCustomers.map(c=>`${c.name} (${c.branchCount})`).join('   ·   '), { x:0.5, y:1.4, w:12.3, h:5.5, fontSize:10, color:DARK, valign:'top' });
-      footer(scN, 'Smaller Customers');
-     }catch(e){ console.error('Smaller Customers slide failed', e); }
-    }
 
         } catch(e) { console.error('Customer Analysis slide failed', e); }
 // ---------- ECOMM (separate section — only added when there's ECOMM data to show) ----------
