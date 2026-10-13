@@ -1550,7 +1550,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-12 · 2 PPT formats';
+const APP_BUILD = '2026-10-13 · dashboard coverage';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -3341,6 +3341,13 @@ function pptExportMenuHtml(){
     </button>
   </div>`;
 }
+function dashCoverageText(approved){
+  try{
+    const cs = computeCustomerAnalysis(approved);
+    const branches = cs.reduce((n,c)=>n+(c.branchCount||0),0);
+    return ` across ${cs.length} customer${cs.length===1?'':'s'} · ${branches} branch${branches===1?'':'es'}`;
+  }catch(e){ return ''; }
+}
 function screenDashboard(){
   const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
   if(approved.length===0){
@@ -3350,7 +3357,7 @@ function screenDashboard(){
   }
   return `<div class="screen">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-      <div><h1>Dashboard / لوحة التحكم</h1><p class="lede">Auto-rolled up from ${approved.length} approved visit${approved.length>1?'s':''}.</p></div>
+      <div><h1>Dashboard / لوحة التحكم</h1><p class="lede">Auto-rolled up from ${approved.length} approved visit${approved.length>1?'s':''}${dashCoverageText(approved)}.</p></div>
       <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
         <button class="btn-sm" style="background:var(--red);color:#fff;border:none;border-radius:9px;padding:8px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap" onclick="openPptExportMenu()" id="ppt-menu-btn">⬇ Export PPT</button>
         <button class="btn-sm" style="background:var(--green);color:#fff;border:none;border-radius:9px;padding:8px 12px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap" onclick="exportExcel()" id="xlsx-btn">⬇ Export Excel</button>
