@@ -1550,7 +1550,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-13 · dashboard coverage';
+const APP_BUILD = '2026-10-13 · velocity in score';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -4312,36 +4312,49 @@ function buildCustomerDetailSlides(pptx, c, custOpp, branchCap, full){
 
 /* ---- Executive additions: accounts ranked by velocity and by performance, best/worst category & SKU ---- */
 // Account performance score = the Scorecard's own weights, shelf metrics only (SUC 25 · OSA 15 ·
-// Price 20 · SOS 15), rescaled to 100 — so an account is judged the same way a merchandiser is.
+// Price 20 · SOS 15) plus sales velocity per branch (25), rescaled to 100. Velocity is judged per branch
+// (units/day ÷ branches) so a big account isn't rewarded just for having many stores: 2× the network's
+// average per-branch velocity = full marks, the network average = 50.
 function pptAccountStats(customers){
   const clamp = x => Math.max(0, Math.min(100, x||0));
   const rows = customers.map(c=>{
     const totalVel = c.branches.reduce((s,b)=>s+b.skuList.reduce((x,sk)=>x+(sk.avgVel||0),0),0);
     const osa = c.branches.length ? c.branches.reduce((s,b)=>s+(b.osaPct||0),0)/c.branches.length : 0;
-    const score = (clamp(c.avgSfr)*25 + clamp(osa)*15 + clamp(c.priceOkPct)*20 + clamp(c.avgSos)*15) / 75;
-    return { name:c.name, branchCount:c.branchCount, totalVel, avgSfr:c.avgSfr, avgSos:c.avgSos, osaPct:osa, priceOkPct:c.priceOkPct, score };
+    return { name:c.name, branchCount:c.branchCount, totalVel, velPerBranch: c.branchCount ? totalVel/c.branchCount : 0, avgSfr:c.avgSfr, avgSos:c.avgSos, osaPct:osa, priceOkPct:c.priceOkPct };
   });
   const networkVel = rows.reduce((s,r)=>s+r.totalVel,0);
-  rows.forEach(r=>{ r.velShare = networkVel>0 ? r.totalVel/networkVel*100 : 0; });
-  return { rows, networkVel };
+  const networkBranches = rows.reduce((s,r)=>s+r.branchCount,0);
+  const networkVelPerBranch = networkBranches ? networkVel/networkBranches : 0;
+  rows.forEach(r=>{
+    r.velShare = networkVel>0 ? r.totalVel/networkVel*100 : 0;
+    const velScore = networkVelPerBranch>0 ? clamp(r.velPerBranch/(2*networkVelPerBranch)*100) : 0;
+    r.score = (clamp(r.avgSfr)*25 + clamp(r.osaPct)*15 + clamp(r.priceOkPct)*20 + clamp(r.avgSos)*15 + velScore*25) / 100;
+  });
+  return { rows, networkVel, networkVelPerBranch };
 }
 function addTopAccountsSlide(pptx, customers){
-  const { rows, networkVel } = pptAccountStats(customers);
+  const { rows, networkVel, networkVelPerBranch } = pptAccountStats(customers);
   const top = rows.filter(r=>r.totalVel>0).sort((a,b)=>b.totalVel-a.totalVel).slice(0,10);
   const s = pptx.addSlide();
   s.addText('Top Selling Accounts', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
-  s.addText(`Ranked by total units/day across all of an account's branches — with each account's average SOS and SUC. Network total: ${fmt(networkVel)} units/day.`, { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:11, italic:true, color:PPT_SOFT });
-  const header = ['#','Account','Branches','Units/day','% of network','Avg SOS%','Avg SUC%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}));
+  s.addText(`Ranked by total units/day across all of an account's branches — with units/day per branch and each account's average SOS and SUC. Network total: ${fmt(networkVel)} units/day.`, { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:11, italic:true, color:PPT_SOFT });
+  const header = ['#','Account','Branches','Units/day','% of network','Units/day per branch','Avg SOS%','Avg SUC%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}));
   const table = [header];
   top.forEach((r,i)=>{
     const fillC = i%2?'F6F2EF':'FFFFFF';
-    const cells = [String(i+1), r.name, String(r.branchCount), fmt(r.totalVel), fmt(r.velShare,1)+'%', fmt(r.avgSos), fmt(r.avgSfr)];
+    const cells = [String(i+1), r.name, String(r.branchCount), fmt(r.totalVel), fmt(r.velShare,1)+'%', fmt(r.velPerBranch,1), fmt(r.avgSos), fmt(r.avgSfr)];
     table.push(cells.map((v,ci)=>({ text:v, options:{ fill:{color:fillC},
-      color: (ci===5 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===6 && r.avgSfr<OPP_LOW_SUC_PCT) ? PPT_RED : PPT_DARK,
-      bold: (ci===5 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===6 && r.avgSfr<OPP_LOW_SUC_PCT) } })));
+      color: (ci===5 && r.velPerBranch<networkVelPerBranch) || (ci===6 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===7 && r.avgSfr<OPP_LOW_SUC_PCT) ? PPT_RED : PPT_DARK,
+      bold: (ci===5 && r.velPerBranch<networkVelPerBranch) || (ci===6 && r.avgSos<OPP_LOW_SOS_PCT) || (ci===7 && r.avgSfr<OPP_LOW_SUC_PCT) } })));
   });
-  s.addTable(table, { x:0.5, y:1.4, w:12.3, colW:[0.5,4.6,1.2,1.4,1.6,1.5,1.5], fontSize:11, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.4 });
-  s.addText(`Red = below the bar (SOS under ${OPP_LOW_SOS_PCT}%, SUC under ${OPP_LOW_SUC_PCT}%). SOS and SUC are each branch's latest visit, averaged across the account.`, { x:0.5, y:6.55, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
+  s.addTable(table, { x:0.5, y:1.4, w:12.3, colW:[0.5,3.6,1.1,1.2,1.4,1.9,1.3,1.3], fontSize:11, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.4 });
+  const weakPerBranch = top.filter(r=>r.velPerBranch<networkVelPerBranch);
+  const topPerBranch = [...top].sort((a,b)=>b.velPerBranch-a.velPerBranch)[0];
+  let perBranchNote = `Real impact per branch: the network averages ${fmt(networkVelPerBranch,1)} units/day per branch.`;
+  if(topPerBranch) perBranchNote += ` Strongest per branch among these: ${topPerBranch.name} (${fmt(topPerBranch.velPerBranch,1)}).`;
+  if(weakPerBranch.length) perBranchNote += ` High total but below-average per branch: ${weakPerBranch.map(r=>`${r.name} — ${fmt(r.velPerBranch,1)}`).join('  |  ')} — their volume comes from the number of branches, not from branch-level strength.`;
+  s.addText(perBranchNote, { x:0.5, y:5.85, w:12.3, h:0.65, fontSize:10.5, bold:true, color:PPT_DARK, valign:'top' });
+  s.addText(`Red = below the bar (per-branch velocity under the network average, SOS under ${OPP_LOW_SOS_PCT}%, SUC under ${OPP_LOW_SUC_PCT}%). SOS and SUC are each branch's latest visit, averaged across the account.`, { x:0.5, y:6.55, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
   pptFooter(s, 'Top Selling Accounts');
 }
 function addBestWorstAccountsSlide(pptx, customers){
@@ -4351,21 +4364,21 @@ function addBestWorstAccountsSlide(pptx, customers){
   const worst = ranked.slice(5).slice(-5).reverse(); // no account can appear in both lists when there are fewer than 10
   const s = pptx.addSlide();
   s.addText('Best & Worst Accounts', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
-  s.addText('Performance score = SUC 25% · OSA 15% · Price compliance 20% · SOS 15% (the Scorecard weights, shelf metrics only), latest visit per branch.', { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:10.5, italic:true, color:PPT_SOFT });
+  s.addText('Performance score = SUC 25% · OSA 15% · Price compliance 20% · SOS 15% · Velocity per branch 25% (shelf metrics + sales velocity), latest visit per branch.', { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:10.5, italic:true, color:PPT_SOFT });
   const mk = (list, color, x, label) => {
     s.addText(label, { x, y:1.4, w:6.0, h:0.35, fontSize:14, bold:true, color });
-    const header = ['Account','Br.','Score','SUC%','SOS%','OSA%','Price%'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color}}}));
+    const header = ['Account','Br.','Score','SUC%','SOS%','OSA%','Price%','Vel/br'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color}}}));
     const table = [header];
     list.forEach((r,i)=>{
       const fillC = i%2?'F6F2EF':'FFFFFF';
-      table.push([r.name, String(r.branchCount), fmt(r.score), fmt(r.avgSfr), fmt(r.avgSos), fmt(r.osaPct), fmt(r.priceOkPct)].map((v,ci)=>({ text:v, options:{ fill:{color:fillC}, bold:ci===2 } })));
+      table.push([r.name, String(r.branchCount), fmt(r.score), fmt(r.avgSfr), fmt(r.avgSos), fmt(r.osaPct), fmt(r.priceOkPct), fmt(r.velPerBranch,1)].map((v,ci)=>({ text:v, options:{ fill:{color:fillC}, bold:ci===2 } })));
     });
     if(list.length===0) s.addText('Not enough accounts to rank.', { x, y:1.85, w:6.0, h:0.4, fontSize:11, italic:true, color:PPT_SOFT });
-    else s.addTable(table, { x, y:1.85, w:6.0, colW:[2.1,0.5,0.7,0.65,0.65,0.7,0.7], fontSize:10, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.42 });
+    else s.addTable(table, { x, y:1.85, w:6.0, colW:[1.75,0.45,0.65,0.6,0.6,0.65,0.65,0.65], fontSize:10, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.42 });
   };
   mk(best, PPT_GREEN, 0.5, 'Best 5');
   mk(worst, PPT_RED, 6.8, 'Worst 5');
-  s.addText('Br. = number of branches in the account — small accounts can swing widely on one or two branches.', { x:0.5, y:5.2, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
+  s.addText('Br. = number of branches · Vel/br = units/day per branch (2× the network average per-branch velocity = full velocity marks). Small accounts can swing widely on one or two branches.', { x:0.5, y:5.2, w:12.3, h:0.3, fontSize:9, italic:true, color:PPT_SOFT });
   pptFooter(s, 'Best & Worst Accounts');
 }
 function addBestWorstCategorySkuSlide(pptx, catRows, skuRows){
