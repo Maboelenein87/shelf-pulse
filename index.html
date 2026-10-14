@@ -1550,7 +1550,11 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
    GPS, and ECOMM visits never have photos, so this happens automatically without extra filtering. */
 // Shown on the login screen and in Manage Backend, so "is this phone running the new upload?" is a
 // glance, not a guess. Change it whenever index.html changes.
-const APP_BUILD = '2026-10-13 · velocity in score';
+/* One set of shelf-KPI targets for the whole app and every PPT: a store at or above target is green, below is red. */
+const KPI_TARGET = { OSA:60, SOS:15, SUC:80 };
+function kpiOk(kind, v){ return v!=null && isFinite(v) && v >= KPI_TARGET[kind]; }
+function kpiChip(kind, v, label){ return v==null ? statusChip('neutral', label) : statusChip(kpiOk(kind,v)?'on':'off', label); }
+const APP_BUILD = '2026-10-14 · scorecard score + KPI targets';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -2638,6 +2642,14 @@ function targetForMerch(name){
   if(!name) return 0;
   return State.accounts.filter(a => sameName(a.merch, name)).reduce((s,a)=>s+(a.target||0),0);
 }
+function monthlyTargetForMerch(name){
+  // Route-cycle imports store the monthly visit target per store in visitTarget ("Total Visits");
+  // the older target field (visits/week) is 0 for imported stores, so it's only a fallback.
+  if(!name) return 0;
+  const mine = State.accounts.filter(a => sameName(a.merch, name));
+  const monthly = mine.reduce((s,a)=>s+(a.visitTarget||0),0);
+  return monthly>0 ? monthly : mine.reduce((s,a)=>s+(a.target||0),0);
+}
 function achievedForMerch(name){
   return State.visits.filter(v=>sameName(v.auditor, name)).length;
 }
@@ -2877,7 +2889,7 @@ function screenNewVisit(){
         const exceeds = catTotal>0 && shahdTotal>catTotal;
         return `<div class="verify-row" style="margin-top:10px">
           ${statusChip('neutral', `Total Shahd so far / إجمالي شهد: ${fmt(shahdTotal)}`)}
-          ${catTotal>0 ? statusChip(sosOverall>=15?'on':'watch', `Overall SOS / حصة الرف: ${fmt(sosOverall)}%`) : statusChip('neutral','Enter category total to see SOS')}
+          ${catTotal>0 ? statusChip(sosOverall>=KPI_TARGET.SOS?'on':'off', `Overall SOS / حصة الرف: ${fmt(sosOverall)}%`) : statusChip('neutral','Enter category total to see SOS')}
         </div>
         ${exceeds ? `
         <p class="hint" style="color:var(--red);font-weight:700;margin:8px 0">⚠️ Total Shahd facings (${fmt(shahdTotal)}) can't exceed total category facings (${fmt(catTotal)}) — recheck your counts, or confirm below if Shahd genuinely has extra display space beyond the main category shelf (e.g. an end-cap or secondary display).</p>
@@ -2996,7 +3008,7 @@ function skuLineHtml(it, idx){
       </div>
       ${it.actualCapacity!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
         ${statusChip('neutral', 'Utilization vs total / التعبئة من الإجمالي '+fmt(c.sfr)+'%')}
-        ${statusChip('neutral', 'SOS / حصة الرف '+fmt(c.sos)+'%')}
+        ${kpiChip('SOS', c.sos, 'SOS / حصة الرف '+fmt(c.sos)+'%')}
         ${statusChip(c.osa==='Y'?'on':'off', 'OSA / التوافر '+c.osa)}
         ${statusChip(c.priceStatus, c.priceLbl)}
       </div>` : ''}
@@ -3336,9 +3348,15 @@ function pptExportMenuHtml(){
     <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:8px;text-align:left" id="ppt-exec-btn" onclick="exportPptExecutive()">
       Executive Summary <span class="hint" style="color:inherit;opacity:.85">— top-level KPIs only, ~6 slides, for leadership</span>
     </button>
-    <button class="btn btn-primary btn-sm" style="width:100%;text-align:left" id="ppt-btn" onclick="exportPpt()">
+    <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:0;text-align:left" id="ppt-btn" onclick="exportPpt()">
       Full Network <span class="hint" style="color:inherit;opacity:.85">— every section + an accounts index; click an account to jump to its full SKU tables</span>
     </button>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+      <button class="btn btn-primary btn-sm" style="flex:1;text-align:left" id="ppt-team-btn" onclick="exportPptTeamPerformance()">
+        Team Performance <span class="hint" style="color:inherit;opacity:.85">— merchandisers &amp; supervisors vs targets</span>
+      </button>
+      <input type="month" value="${State.pptTeamMonth||todayStr().slice(0,7)}" onchange="setPptTeamMonth(this.value)" style="width:140px"/>
+    </div>
   </div>`;
 }
 function dashCoverageText(approved){
@@ -3730,7 +3748,7 @@ function screenEcommDashboard(){
         <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleEcommPlatform('${p.name}')">
           <div><div class="sr-main">${p.name}</div><div class="sr-sub">${p.storeCount} dark store${p.storeCount===1?'':'s'}</div></div>
           <div style="display:flex;gap:6px;align-items:center">
-            ${statusChip(p.osaPct>=90?'on':p.osaPct>=70?'watch':'off', `${fmt(p.osaPct)}% avail`)}
+            ${kpiChip('OSA', p.osaPct, `${fmt(p.osaPct)}% avail`)}
             ${statusChip(p.priceOkPct>=90?'on':'watch', `${fmt(p.priceOkPct)}% price`)}
             <span style="font-size:14px">${open?'−':'+'}</span>
           </div>
@@ -3738,7 +3756,7 @@ function screenEcommDashboard(){
         ${open ? `
         <div style="margin-top:10px;overflow-x:auto;-webkit-overflow-scrolling:touch">
           <table class="mini"><tr><th>Dark store</th><th>Availability</th><th>Price match</th><th>Last visit</th>${canEditEcomm()?'<th></th>':''}</tr>
-          ${p.stores.map(s=>`<tr><td>${s.branch}</td><td>${statusChip(s.osaPct>=90?'on':s.osaPct>=70?'watch':'off', fmt(s.osaPct)+'%')}</td><td>${statusChip(s.priceOkPct>=90?'on':'watch', fmt(s.priceOkPct)+'%')}</td><td>${s.lastVisitDate||'—'}</td>${canEditEcomm()?`<td><button class="btn btn-ghost btn-sm" onclick="openEcommStoreFromDashboard('${s.accountId}')">Edit</button></td>`:''}</tr>`).join('')}
+          ${p.stores.map(s=>`<tr><td>${s.branch}</td><td>${kpiChip('OSA', s.osaPct, fmt(s.osaPct)+'%')}</td><td>${statusChip(s.priceOkPct>=90?'on':'watch', fmt(s.priceOkPct)+'%')}</td><td>${s.lastVisitDate||'—'}</td>${canEditEcomm()?`<td><button class="btn btn-ghost btn-sm" onclick="openEcommStoreFromDashboard('${s.accountId}')">Edit</button></td>`:''}</tr>`).join('')}
           </table>
         </div>
         ` : ''}
@@ -3800,9 +3818,9 @@ function screenAccounts(){
           </div>
           ${bOpen ? `<div class="verify-row" style="margin:0 0 10px">
             ${statusChip('neutral', `Vel ${fmt(totalVel,1)}/d total`)}
-            ${statusChip(b.osaPct>=80?'on':'watch', `OSA ${fmt(b.osaPct)}%`)}
-            ${statusChip(b.sfr>=80?'on':'watch', `SUC ${fmt(b.sfr)}%`)}
-            ${statusChip(b.sos>=15?'on':'watch', `SOS ${fmt(b.sos)}% (${fmt(shahdFacingsAbs)} / ${fmt(catFacingsAbs)} facings)`)}
+            ${kpiChip('OSA', b.osaPct, `OSA ${fmt(b.osaPct)}%`)}
+            ${kpiChip('SUC', b.sfr, `SUC ${fmt(b.sfr)}%`)}
+            ${kpiChip('SOS', b.sos, `SOS ${fmt(b.sos)}% (${fmt(shahdFacingsAbs)} / ${fmt(catFacingsAbs)} facings)`)}
             ${acct && acct.visitTarget ? statusChip(visitsThisMonth>=acct.visitTarget?'on':'watch', `Visits this month: ${visitsThisMonth} / ${fmt(acct.visitTarget)} target`) : ''}
             ${statusChip('neutral', `Merch: ${acct?acct.merch:'—'}`)}
             ${statusChip('neutral', `Supervisor: ${acct?acct.sup:'—'}`)}
@@ -3983,13 +4001,13 @@ function dashCategories(approved){
    a network average, and never a cross-branch "best performer" comparison. Five checks only:
    1. Low stock vs this branch's own sales — under 3 days of cover, using this branch's own velocity.
    2. Price not matching RSP.
-   3. Low shelf share — SOS under 20%.
-   4. Low shelf utilization — SUC under 70%.
+   3. Low shelf share — SOS under the SOS target (15%).
+   4. Low shelf utilization — SUC under the SUC target (80%).
    5. Overstock vs this branch's own sales — over 3 weeks (21 days) of cover. */
 const OPP_LOW_STOCK_DAYS = 3;
 const OPP_OVERSTOCK_DAYS = 21; // 3 weeks
-const OPP_LOW_SOS_PCT = 20;
-const OPP_LOW_SUC_PCT = 70;
+const OPP_LOW_SOS_PCT = KPI_TARGET.SOS;
+const OPP_LOW_SUC_PCT = KPI_TARGET.SUC;
 // One row per SKU — stock and price are checked side by side on the SAME row (Stock Status/Stock Risk,
 // Price vs RSP/Price Risk), not split into separate rows by issue type. SOS/SUC are branch-wide (not
 // a single SKU), so they stay as a flag on the branch heading rather than a row of their own. Risk is
@@ -4024,7 +4042,7 @@ function computeCustomerOpportunities(approved){
         });
       });
       skuRows.sort((a,b2)=>(OPP_RISK_RANK[a.stockRisk] ?? 3)-(OPP_RISK_RANK[b2.stockRisk] ?? 3)); // High stock risk first
-      return { branch:b.branch, sfr:b.sfr, sos:b.sos, sosLow, sfrLow, skuRows };
+      return { branch:b.branch, sfr:b.sfr, sos:b.sos, sosLow, sfrLow, skuRows, space:b.shahdSpaceTotal||0, units:b.skuList.reduce((s,x)=>s+(x.stock||0),0) };
     }).filter(b=>b.skuRows.length>0 || b.sosLow || b.sfrLow);
     const totalIssues = branches.reduce((s,b)=>s+b.skuRows.length+(b.sosLow?1:0)+(b.sfrLow?1:0),0);
     return { name:c.name, branches, totalIssues };
@@ -4300,8 +4318,9 @@ function buildCustomerDetailSlides(pptx, c, custOpp, branchCap, full){
     ]);
     const sosTxt = `SOS ${fmt(b.sos)}%${b.sosLow?` ⚠ below ${OPP_LOW_SOS_PCT}%`:''}`;
     const sucTxt = `SUC ${fmt(b.sfr)}%${b.sfrLow?` ⚠ below ${OPP_LOW_SUC_PCT}%`:''}`;
+    const capTxt = `Shelf capacity ${fmt(b.space||0)} units  ·  ${fmt(b.units||0)} units available now`;
     addOppTableSlides(pptx, {
-      title: `${c.name} — ${b.branch}`, subtitle: `${sosTxt}  ·  ${sucTxt}`,
+      title: `${c.name} — ${b.branch}`, subtitle: `${sosTxt}  ·  ${sucTxt}  ·  ${capTxt}`,
       header: ['SKU','Vel/d','Stock','Coverage','Price','RSP','Stock Status','Stock Risk','Price vs RSP','Price Risk'],
       rows, colW: [3.4,0.7,0.7,0.85,0.75,0.7,2.1,0.95,1.2,0.95], riskCols: [7,9], actions: pptPickTop3(cands),
       label: `${c.name} — ${b.branch}`, full,
@@ -4932,6 +4951,236 @@ async function exportPptAccount(customerName){
   }
 }
 
+/* ============================= TEAM PERFORMANCE DECK (merchandisers + supervisors) =============================
+   One month, one scoring model:
+   - Visits 35%: achieved visits (submitted, not rejected) vs the monthly visit target, judged against the
+     time gone in the month (achieved ÷ target × share of the month elapsed), capped at 100. A month that is
+     over counts as 100% elapsed, so the score then equals achieved ÷ target. Broken down per customer so the
+     gap can be traced to the customer it comes from.
+   - Data accuracy 25%: approved ÷ (approved + rejected). Pending visits aren't judged yet, so they're left out.
+   - Shelf KPIs 40%: OSA (target 60), SOS (target 15), SUC (target 80) from each store's LAST approved visit in the
+     month; each is attainment vs its target (capped at 100), averaged.
+   A component with no data (e.g. no reviewed visits yet) is left out and the remaining weights rescale.
+   Supervisors use the same maths on their whole team. */
+const PERF = { OSA:KPI_TARGET.OSA, SOS:KPI_TARGET.SOS, SUC:KPI_TARGET.SUC, W_VISITS:35, W_ACC:25, W_SHELF:40 };
+function perfTimeGone(month){
+  const [y,m] = month.split('-').map(Number);
+  const dim = new Date(y, m, 0).getDate();
+  const now = new Date();
+  const cur = now.getFullYear()*12 + now.getMonth(), sel = y*12 + (m-1);
+  if(sel < cur) return 1;
+  if(sel > cur) return 0;
+  return Math.min(1, now.getDate()/dim);
+}
+function perfScore(c){ // c: { visitsScore, accuracy, shelfScore } — any may be null
+  const parts = [[c.visitsScore, PERF.W_VISITS], [c.accuracy, PERF.W_ACC], [c.shelfScore, PERF.W_SHELF]].filter(p=>p[0]!=null);
+  const w = parts.reduce((s,p)=>s+p[1],0);
+  return w>0 ? parts.reduce((s,p)=>s+p[0]*p[1],0)/w : null;
+}
+function perfMetrics(visits, targetByCust, gone){
+  // visits: this person's/team's field visits in the month (all statuses)
+  const live = visits.filter(v=>v.status!=='rejected');
+  const approved = visits.filter(v=>v.status==='approved');
+  const rejected = visits.filter(v=>v.status==='rejected');
+  const pending = visits.filter(v=>v.status!=='approved' && v.status!=='rejected');
+  const byCust = {};
+  Object.entries(targetByCust).forEach(([name,t])=>{ byCust[name] = { name, target:t, achieved:0 }; });
+  live.forEach(v=>{ const n = canonicalCustomerName(v.accountName); (byCust[n] = byCust[n] || { name:n, target:0, achieved:0 }).achieved++; });
+  const customers = Object.values(byCust).map(c=>({ ...c, expected: c.target*gone, gap: c.achieved - c.target*gone }));
+  const target = customers.reduce((s,c)=>s+c.target,0);
+  const achieved = live.length;
+  const expected = target*gone;
+  const visitsScore = expected>0 ? Math.min(100, achieved/expected*100) : (target>0 ? null : null);
+  const reviewed = approved.length + rejected.length;
+  const accuracy = reviewed>0 ? approved.length/reviewed*100 : null;
+  const sc = lastVisitScores(approved);
+  const att = (v,t) => Math.min(100, Math.max(0, v)/t*100);
+  const shelfScore = sc.n ? (att(sc.osa,PERF.OSA) + att(sc.sos,PERF.SOS) + att(sc.suc,PERF.SUC))/3 : null;
+  const out = { target, achieved, expected, visitsScore, accuracy, approvedN:approved.length, rejectedN:rejected.length, pendingN:pending.length,
+    stores: sc.n, osa: sc.n?sc.osa:null, sos: sc.n?sc.sos:null, suc: sc.n?sc.suc:null, shelfScore, customers };
+  out.score = perfScore(out);
+  return out;
+}
+function computeTeamPerformance(month){
+  const gone = perfTimeGone(month);
+  const visits = State.visits.filter(v=>v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
+  // roster: every merchandiser on the route plan, with their supervisor and per-customer monthly targets
+  const roster = {}; // nameKey -> { name, sup, targetByCust }
+  State.accounts.forEach(a=>{
+    const n = cleanName(a.merch); if(!n) return;
+    const k = nameKey(n);
+    const r = roster[k] = roster[k] || { name:n, targetByCust:{} };
+    const cn = canonicalCustomerName(a.name);
+    r.targetByCust[cn] = (r.targetByCust[cn]||0) + (a.visitTarget||0);
+  });
+  // visits by merchandiser (name-key match, so spelling variants fall into one person)
+  const visitsOf = {};
+  visits.forEach(v=>{ const k = nameKey(cleanName(v.auditor)); (visitsOf[k] = visitsOf[k]||[]).push(v); });
+  Object.keys(visitsOf).forEach(k=>{ if(!roster[k]) roster[k] = { name: cleanName(visitsOf[k][0].auditor), targetByCust:{} }; });
+  const supMemo = {};
+  const merchs = Object.entries(roster).map(([k,r])=>{
+    const m = perfMetrics(visitsOf[k]||[], r.targetByCust, gone);
+    const sup = supervisorOfMerch(r.name);
+    return { name:r.name, sup, ...m, _k:k };
+  }).filter(m=>m.target>0 || m.achieved>0);
+  // supervisors: pool the team
+  const bySup = {};
+  merchs.forEach(m=>{ const sk = m.sup ? nameKey(cleanName(m.sup)) : '_none'; (bySup[sk] = bySup[sk] || { name: m.sup || 'No supervisor assigned', members:[] }).members.push(m); });
+  const sups = Object.values(bySup).map(s=>{
+    const tbc = {}; const vs = [];
+    s.members.forEach(m=>{
+      const r = roster[m._k];
+      Object.entries(r.targetByCust).forEach(([n,t])=>{ tbc[n] = (tbc[n]||0)+t; });
+      (visitsOf[m._k]||[]).forEach(v=>vs.push(v));
+    });
+    const m = perfMetrics(vs, tbc, gone);
+    s.members.sort((a,b)=>(b.score??-1)-(a.score??-1));
+    return { name:s.name, members:s.members, ...m };
+  }).sort((a,b)=>(b.score??-1)-(a.score??-1));
+  return { month, gone, merchs, sups };
+}
+function perfColor(score){ return score==null ? PPT_SOFT : score>=80 ? PPT_GREEN : score>=60 ? PPT_AMBER : PPT_RED; }
+function perfRow(name, m, extra){
+  const f = x => x==null ? '—' : fmt(x);
+  const cell = (text, color, bold) => ({ text:String(text), options:{ color: color||PPT_DARK, bold:!!bold } });
+  return [
+    cell(name), ...(extra?[cell(extra)]:[]),
+    cell(`${m.achieved} / ${fmt(m.target)}`),
+    cell(m.visitsScore==null?'—':fmt(m.visitsScore)+'%', m.visitsScore!=null && m.visitsScore<80 ? PPT_RED : PPT_DARK),
+    cell(m.accuracy==null?'—':fmt(m.accuracy)+'%', m.accuracy!=null && m.accuracy<90 ? PPT_RED : PPT_DARK),
+    cell(f(m.osa), m.osa!=null && m.osa<PERF.OSA ? PPT_RED : PPT_DARK),
+    cell(f(m.sos), m.sos!=null && m.sos<PERF.SOS ? PPT_RED : PPT_DARK),
+    cell(f(m.suc), m.suc!=null && m.suc<PERF.SUC ? PPT_RED : PPT_DARK),
+    cell(m.score==null?'—':fmt(m.score), perfColor(m.score), true),
+  ];
+}
+function perfHeader(firstLabel, extra){
+  return [firstLabel, ...(extra?[extra]:[]), 'Visits (ach / target)', 'Pace score', 'Accuracy', `OSA (${PERF.OSA})`, `SOS (${PERF.SOS})`, `SUC (${PERF.SUC})`, 'Score']
+    .map(h=>({ text:h, options:{ bold:true, color:'FFFFFF', fill:{color:PPT_RED} } }));
+}
+function addPerfTable(s, rows, hdr, y, colW){
+  const table = [hdr, ...rows.map((r,i)=>r.map(c=>({ text:c.text, options:{ ...c.options, fill:{color: i%2?'F6F2EF':'FFFFFF'} } })))];
+  s.addTable(table, { x:0.5, y, w:12.3, colW, fontSize:10, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.34 });
+}
+function addPerfCustomerTable(s, customers, x, y, w, maxRows, title){
+  const sorted = [...customers].filter(c=>c.target>0 || c.achieved>0).sort((a,b)=>a.gap-b.gap);
+  const shown = sorted.slice(0, maxRows);
+  s.addText(title, { x, y, w, h:0.32, fontSize:12, bold:true, color:PPT_DARK });
+  const hdr = ['Customer','Target','Achieved','Expected by now','Gap'].map(h=>({ text:h, options:{ bold:true, color:'FFFFFF', fill:{color:PPT_RED} } }));
+  const rows = shown.map((c,i)=>{
+    const g = c.gap;
+    return [c.name, fmt(c.target), String(c.achieved), fmt(c.expected,1), (g>0?'+':'')+fmt(g,1)].map((v,ci)=>({ text:String(v), options:{ fill:{color:i%2?'F6F2EF':'FFFFFF'}, color: ci===4 ? (g<-0.5?PPT_RED:PPT_GREEN) : PPT_DARK, bold: ci===4 } }));
+  });
+  if(!rows.length){ s.addText('No customer targets or visits this month.', { x, y:y+0.4, w, h:0.3, fontSize:10, italic:true, color:PPT_SOFT }); return; }
+  s.addTable([hdr, ...rows], { x, y:y+0.35, w, colW:[w*0.38, w*0.14, w*0.15, w*0.19, w*0.14], fontSize:9.5, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.3 });
+  if(sorted.length>shown.length) s.addText(`Showing the ${shown.length} largest gaps of ${sorted.length} customers.`, { x, y:y+0.4+0.3*(rows.length+1), w, h:0.25, fontSize:8.5, italic:true, color:PPT_SOFT });
+}
+function addPerfKpiTable(s, m, x, y, w){
+  const f = (v,d=0) => v==null ? '—' : fmt(v,d);
+  const att = (v,t) => v==null ? '—' : fmt(Math.min(100, v/t*100))+'%';
+  const rows = [
+    ['Visits vs pace', `${m.achieved}`, `${f(m.expected,1)} by now (${fmt(m.target)} month)`, m.visitsScore==null?'—':fmt(m.visitsScore)+'%', PERF.W_VISITS+'%'],
+    ['Data accuracy', `${m.approvedN} ok / ${m.rejectedN} rejected`, '100% approved', m.accuracy==null?'—':fmt(m.accuracy)+'%', PERF.W_ACC+'%'],
+    ['OSA', f(m.osa)+'%', PERF.OSA+'%', att(m.osa,PERF.OSA), ''],
+    ['SOS', f(m.sos)+'%', PERF.SOS+'%', att(m.sos,PERF.SOS), ''],
+    ['SUC', f(m.suc)+'%', PERF.SUC+'%', att(m.suc,PERF.SUC), ''],
+    ['Shelf KPIs (avg of 3)', `${m.stores} store${m.stores===1?'':'s'}`, '', m.shelfScore==null?'—':fmt(m.shelfScore)+'%', PERF.W_SHELF+'%'],
+  ];
+  const hdr = ['KPI','Achieved','Target','Attainment','Weight'].map(h=>({ text:h, options:{ bold:true, color:'FFFFFF', fill:{color:PPT_RED} } }));
+  const body = rows.map((r,i)=>r.map((v,ci)=>({ text:String(v), options:{ fill:{color:i%2?'F6F2EF':'FFFFFF'}, bold: ci===3 || i===5, color:PPT_DARK } })));
+  s.addTable([hdr, ...body], { x, y, w, colW:[w*0.23, w*0.24, w*0.23, w*0.17, w*0.13], fontSize:9, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.34 });
+  s.addText(m.score==null?'—':fmt(m.score), { x, y:y+0.34*7+0.15, w:1.6, h:0.8, fontSize:40, bold:true, color:perfColor(m.score) });
+  s.addText('Overall score\n(weighted)', { x:x+1.7, y:y+0.34*7+0.25, w:2.5, h:0.6, fontSize:11, color:PPT_SOFT });
+}
+async function exportPptTeamPerformance(){
+  const btn = document.getElementById('ppt-team-btn');
+  if(btn){ btn.textContent = 'Building…'; btn.disabled = true; }
+  try{
+    await loadPptxLib();
+    const month = State.pptTeamMonth || todayStr().slice(0,7);
+    const monthLabel = new Date(month+'-01T00:00:00').toLocaleDateString('en-GB',{year:'numeric', month:'long'});
+    const P = computeTeamPerformance(month);
+    const gonePct = fmt(P.gone*100);
+    const pptx = newPptx(`Team Performance — ${monthLabel}`);
+
+    const s1 = pptx.addSlide();
+    s1.background = { color: PPT_RED };
+    s1.addText('Team Performance', { x:0.7, y:2.5, w:11.9, h:1, fontSize:42, bold:true, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText(`Merchandisers & Supervisors — ${monthLabel}`, { x:0.7, y:3.45, w:11.9, h:0.6, fontSize:20, color:'FFFFFF', fontFace:'Arial' });
+    s1.addText(`${gonePct}% of the month gone · ${P.merchs.length} merchandisers · ${P.sups.length} supervisor team(s) · Shelf Pulse, Cairo 3A (Shahd)`, { x:0.7, y:4.15, w:11.9, h:0.5, fontSize:13, color:'FBEAEA', fontFace:'Arial' });
+
+    // method
+    const s2 = pptx.addSlide();
+    s2.addText('How the score works', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+    s2.addText(`${monthLabel} · ${gonePct}% of the month gone`, { x:0.5, y:0.9, w:12, h:0.3, fontSize:12, italic:true, color:PPT_SOFT });
+    s2.addText([
+      { text:`Visits — ${PERF.W_VISITS}%`, options:{ bold:true, breakLine:true } },
+      { text:'Achieved visits (submitted, not rejected) against the monthly visit target, judged against the time gone: achieved ÷ (target × share of month elapsed), capped at 100%. Shown per customer, so you can see which customer the gap comes from.', options:{ breakLine:true } },
+      { text:' ', options:{ breakLine:true } },
+      { text:`Data accuracy — ${PERF.W_ACC}%`, options:{ bold:true, breakLine:true } },
+      { text:'Approved visits ÷ (approved + rejected). Pending visits are not counted until reviewed.', options:{ breakLine:true } },
+      { text:' ', options:{ breakLine:true } },
+      { text:`Shelf KPIs — ${PERF.W_SHELF}%`, options:{ bold:true, breakLine:true } },
+      { text:`OSA (target ${PERF.OSA}%), SOS (target ${PERF.SOS}%), SUC (target ${PERF.SUC}%) from each store's last approved visit this month — attainment against target (capped at 100%), averaged over the three.`, options:{ breakLine:true } },
+      { text:' ', options:{ breakLine:true } },
+      { text:'Supervisors are measured on the same KPIs, pooled over their whole team. If a component has no data yet (for example no reviewed visits), it is left out and the other weights rescale. Red = below target.', options:{ italic:true, color:PPT_SOFT } },
+    ], { x:0.5, y:1.4, w:12.3, h:5.2, fontSize:13, color:PPT_DARK, valign:'top' });
+    pptFooter(s2, 'Team Performance');
+
+    // supervisor league
+    const s3 = pptx.addSlide();
+    s3.addText('Supervisors — team performance', { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+    s3.addText(`${monthLabel} · pooled over each supervisor's whole team · ${gonePct}% of the month gone`, { x:0.5, y:0.9, w:12, h:0.3, fontSize:11, italic:true, color:PPT_SOFT });
+    const supRows = P.sups.slice(0,14).map(s=>perfRow(s.name, s, `${s.members.length}`));
+    addPerfTable(s3, supRows, perfHeader('Supervisor','Merch'), 1.4, [3.0,0.8,1.5,1.2,1.1,1.1,1.1,1.1,1.0]);
+    pptFooter(s3, 'Team Performance');
+
+    // per supervisor: merchandiser table, then team customer gaps
+    P.sups.forEach(sup=>{
+      try{
+        const MAXR = 13;
+        for(let i=0, page=0; i<Math.max(1,sup.members.length); i+=MAXR, page++){
+          const s = pptx.addSlide();
+          const pages = Math.ceil(sup.members.length/MAXR);
+          s.addText(`${sup.name}${pages>1?` (${page+1}/${pages})`:''}`, { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:22, bold:true, color:PPT_DARK });
+          s.addText(`Team: ${sup.achieved} / ${fmt(sup.target)} visits · accuracy ${sup.accuracy==null?'—':fmt(sup.accuracy)+'%'} · OSA ${sup.osa==null?'—':fmt(sup.osa)} · SOS ${sup.sos==null?'—':fmt(sup.sos)} · SUC ${sup.suc==null?'—':fmt(sup.suc)} · team score ${sup.score==null?'—':fmt(sup.score)}`, { x:0.5, y:0.82, w:12.3, h:0.32, fontSize:11, italic:true, color:PPT_SOFT });
+          const rows = sup.members.slice(i, i+MAXR).map(m=>perfRow(m.name, m));
+          addPerfTable(s, rows, perfHeader('Merchandiser'), 1.3, [3.2,1.7,1.3,1.2,1.1,1.1,1.1,1.6]);
+          pptFooter(s, 'Team Performance');
+        }
+        const sc = pptx.addSlide();
+        sc.addText(`${sup.name} — visits by customer`, { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:22, bold:true, color:PPT_DARK });
+        sc.addText('Team target vs achieved, per customer — gap = achieved minus what should be done by now.', { x:0.5, y:0.82, w:12.3, h:0.3, fontSize:11, italic:true, color:PPT_SOFT });
+        addPerfCustomerTable(sc, sup.customers, 0.5, 1.25, 12.3, 15, 'Largest gaps first');
+        pptFooter(sc, 'Team Performance');
+      }catch(e){ console.error('Skipping supervisor slides', sup && sup.name, e); }
+    });
+
+    // per merchandiser (grouped by supervisor order)
+    P.sups.forEach(sup=>{
+      sup.members.forEach(m=>{
+        try{
+          const s = pptx.addSlide();
+          s.addText(m.name, { x:0.5, y:0.3, w:12.3, h:0.5, fontSize:24, bold:true, color:PPT_DARK });
+          s.addText(`Supervisor: ${sup.name} · ${monthLabel} · ${gonePct}% of the month gone`, { x:0.5, y:0.82, w:12.3, h:0.3, fontSize:11, italic:true, color:PPT_SOFT });
+          addPerfKpiTable(s, m, 0.5, 1.3, 5.6);
+          addPerfCustomerTable(s, m.customers, 6.4, 1.3, 6.4, 13, 'Visits by customer — where the gap comes from');
+          pptFooter(s, 'Team Performance');
+        }catch(e){ console.error('Skipping merchandiser slide', m && m.name, e); }
+      });
+    });
+
+    await pptx.writeFile({ fileName: `Shelf-Pulse-Team-Performance-${month}.pptx` });
+    showToast('PowerPoint downloaded ✓');
+  } catch(err){
+    console.error(err);
+    showToast(err.message || 'Could not build the PowerPoint.');
+  } finally {
+    if(btn){ btn.textContent = 'Team Performance'; btn.disabled = false; }
+  }
+}
+function setPptTeamMonth(v){ State.pptTeamMonth = v; }
+
 /* ============================= EXCEL EXPORT (raw merch input) ============================= */
 async function loadXlsxLib(){
   if(window.XLSX) return;
@@ -4949,6 +5198,7 @@ async function exportExcel(){
         const sku = SKU_MAP[it.skuId] || {};
         const c = computeItem(it);
         rows.push({
+          'Customer Code': (State.accounts.find(a=>a.id===v.accountId)||{}).customerId||'',
           Account: v.accountName, Branch: v.branch, Channel: v.channel||'', Region: v.region||'',
           Date: v.date, Auditor: v.auditor, Status: v.status,
           SKU: sku.name||'', Category: sku.category||'',
@@ -5334,8 +5584,8 @@ function screenTeam(){
           <div style="font-weight:800;color:${r.target?barColor(r.achieved/r.target*100):'var(--ink-soft)'}">${r.achieved}${r.target?'/'+r.target:''}</div>
         </div>
         <div class="verify-row">
-          ${statusChip('neutral','SUC / تعبئة الرف '+fmt(r.avgSfr)+'%')}
-          ${statusChip('neutral','SOS / حصة الرف '+fmt(r.avgSos)+'%')}
+          ${kpiChip('SUC', r.avgSfr, 'SUC / تعبئة الرف '+fmt(r.avgSfr)+'%')}
+          ${kpiChip('SOS', r.avgSos, 'SOS / حصة الرف '+fmt(r.avgSos)+'%')}
           ${statusChip(r.dataCompletion>=95?'on':'watch', fmt(r.dataCompletion)+'% complete / اكتمال')}
           ${statusChip(r.verifiedPct>=90?'on':'off', fmt(r.verifiedPct)+'% verified / موثق')}
         </div>
@@ -5360,9 +5610,9 @@ function lastVisitScores(visits){
 }
 function scoreChipsHtml(sc){
   if(!sc.n) return statusChip('neutral','No approved visits');
-  return statusChip('neutral','SOS / حصة الرف '+fmt(sc.sos)+'%')
-    + statusChip('neutral','SUC / تعبئة '+fmt(sc.suc)+'%')
-    + statusChip(sc.osa>=90?'on':sc.osa>=75?'watch':'off','OSA / توافر '+fmt(sc.osa)+'%')
+  return kpiChip('SOS', sc.sos, 'SOS / حصة الرف '+fmt(sc.sos)+'%')
+    + kpiChip('SUC', sc.suc, 'SUC / تعبئة '+fmt(sc.suc)+'%')
+    + kpiChip('OSA', sc.osa, 'OSA / توافر '+fmt(sc.osa)+'%')
     + statusChip(sc.done>=95?'on':'watch','Data / اكتمال '+fmt(sc.done)+'%');
 }
 function visitsOfSupervisor(pool, sup){
@@ -5377,7 +5627,54 @@ function visitsOfMerch(pool, merch){
   return pool.filter(v=>sameName(cleanName(v.auditor), merch));
 }
 function jsq(x){ return String(x).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+/* ---- Monthly performance score in the Scorecard (same model as the Team Performance PPT) ---- */
+function perfScoreBadge(score){
+  const col = score==null ? 'var(--ink-soft)' : score>=80 ? 'var(--green)' : score>=60 ? 'var(--amber)' : 'var(--red)';
+  return `<div style="text-align:right"><div style="font-size:24px;font-weight:800;color:${col};line-height:1">${score==null?'—':fmt(score)}</div><div class="hint" style="margin:0">score</div></div>`;
+}
+function perfChipsHtml(m){
+  const paceChip = m.visitsScore==null ? statusChip('neutral', `${m.achieved}/${fmt(m.target)} visits`)
+    : statusChip(m.visitsScore>=80?'on':'off', `${m.achieved}/${fmt(m.target)} visits · ${fmt(m.visitsScore)}% of pace`);
+  const accChip = m.accuracy==null ? statusChip('neutral','No reviewed visits yet') : statusChip(m.accuracy>=90?'on':'off', fmt(m.accuracy)+'% accurate / دقة');
+  return paceChip + accChip + kpiChip('OSA', m.osa, 'OSA '+(m.osa==null?'—':fmt(m.osa)+'%'))
+    + kpiChip('SOS', m.sos, 'SOS '+(m.sos==null?'—':fmt(m.sos)+'%')) + kpiChip('SUC', m.suc, 'SUC '+(m.suc==null?'—':fmt(m.suc)+'%'));
+}
+function perfDetailHtml(m){
+  if(!m) return '';
+  const f = (v,d=0) => v==null ? '—' : fmt(v,d);
+  const att = (v,t) => v==null ? '—' : fmt(Math.min(100, v/t*100))+'%';
+  const custs = m.customers.filter(c=>c.target>0||c.achieved>0).sort((a,b)=>a.gap-b.gap);
+  const gone = Math.round(perfTimeGone(State.scorecardMonth || todayStr().slice(0,7))*100);
+  return `<div class="card" style="border-color:var(--red)">
+      <div class="visit-row" style="border:none;padding:0 0 6px"><h3 style="margin:0;color:var(--red)">Performance score</h3>${perfScoreBadge(m.score)}</div>
+      <p class="hint">Visits ${PERF.W_VISITS}% · Data accuracy ${PERF.W_ACC}% · Shelf KPIs ${PERF.W_SHELF}% — ${gone}% of the month gone.</p>
+      <table class="mini"><thead><tr><th>KPI</th><th>Achieved</th><th>Target</th><th>Attain.</th><th>Weight</th></tr></thead><tbody>
+        <tr><td>Visits vs pace</td><td>${m.achieved}</td><td>${f(m.expected,1)} by now / ${fmt(m.target)}</td><td>${m.visitsScore==null?'—':fmt(m.visitsScore)+'%'}</td><td>${PERF.W_VISITS}%</td></tr>
+        <tr><td>Data accuracy</td><td>${m.approvedN} ok / ${m.rejectedN} rejected</td><td>100%</td><td>${m.accuracy==null?'—':fmt(m.accuracy)+'%'}</td><td>${PERF.W_ACC}%</td></tr>
+        <tr><td>OSA</td><td>${kpiChip('OSA', m.osa, f(m.osa)+'%')}</td><td>${PERF.OSA}%</td><td>${att(m.osa,PERF.OSA)}</td><td rowspan="3">${PERF.W_SHELF}%</td></tr>
+        <tr><td>SOS</td><td>${kpiChip('SOS', m.sos, f(m.sos)+'%')}</td><td>${PERF.SOS}%</td><td>${att(m.sos,PERF.SOS)}</td></tr>
+        <tr><td>SUC</td><td>${kpiChip('SUC', m.suc, f(m.suc)+'%')}</td><td>${PERF.SUC}%</td><td>${att(m.suc,PERF.SUC)}</td></tr>
+      </tbody></table>
+    </div>
+    <div class="card">
+      <h3>Visits by customer — where the gap comes from</h3>
+      ${custs.length===0 ? '<p class="hint">No customer targets or visits this month.</p>' : `<table class="mini"><thead><tr><th>Customer</th><th>Target</th><th>Done</th><th>Expected</th><th>Gap</th></tr></thead><tbody>
+        ${custs.map(c=>`<tr><td>${c.name}</td><td>${fmt(c.target)}</td><td>${c.achieved}</td><td>${fmt(c.expected,1)}</td><td style="font-weight:800;color:${c.gap<-0.5?'var(--red)':'var(--green)'}">${c.gap>0?'+':''}${fmt(c.gap,1)}</td></tr>`).join('')}
+      </tbody></table>`}
+    </div>`;
+}
 function scorecardSupCardHtml(sup, pool, month){
+  if(month){
+    const P = computeTeamPerformance(month);
+    const S = P.sups.find(x=>isSameSupervisor(x.name, sup));
+    return `<div class="card" style="cursor:pointer" onclick="selectScorecardSupervisor('${jsq(sup)}')">
+      <div class="visit-row" style="border:none;padding:0 0 8px">
+        <div><div class="visit-main">${sup}</div><div class="hint">${S?S.members.length:0} merchandiser${S&&S.members.length===1?'':'s'} · team</div></div>
+        ${perfScoreBadge(S?S.score:null)}
+      </div>
+      <div class="verify-row">${S ? perfChipsHtml(S) : statusChip('neutral','No visits or targets this month')}</div>
+    </div>`;
+  }
   const sc = lastVisitScores(visitsOfSupervisor(pool, sup));
   let extra = '';
   if(month){
@@ -5398,7 +5695,32 @@ function scorecardSupCardHtml(sup, pool, month){
     <div class="verify-row">${scoreChipsHtml(sc)}</div>${extra}
   </div>`;
 }
+function scorecardTeamViewMonthly(supName, month, showBack, label){
+  const P = computeTeamPerformance(month);
+  const S = P.sups.find(x=>isSameSupervisor(x.name, supName));
+  const members = S ? S.members : [];
+  return `<div class="screen">
+    ${showBack ? `<button class="btn btn-ghost btn-sm" style="margin-bottom:10px" onclick="backToScorecardSupervisors()">← Back to supervisors</button>` : ''}
+    <h1>${supName}</h1>
+    ${scorecardPillRow()}
+    <p class="lede">${label} · performance score per merchandiser (visits ${PERF.W_VISITS}% · accuracy ${PERF.W_ACC}% · shelf KPIs ${PERF.W_SHELF}%). Tap one for the full breakdown and their stores.</p>
+    <input type="month" value="${month}" onchange="setScorecardMonth(this.value)" style="margin-bottom:12px"/>
+    ${S ? `<div class="card" style="border-color:var(--red)">
+      <div class="visit-row" style="border:none;padding:0 0 8px"><h3 style="margin:0;color:var(--red)">Team summary</h3>${perfScoreBadge(S.score)}</div>
+      <div class="verify-row">${perfChipsHtml(S)}</div>
+    </div>` : ''}
+    ${members.length===0 ? emptyState('👥','No visits or targets this month','') : members.map(m=>`
+      <div class="card" style="cursor:pointer" onclick="selectScorecardMerch('${jsq(m.name)}')">
+        <div class="visit-row" style="border:none;padding:0 0 8px">
+          <div><div class="visit-main">${m.name}</div><div class="hint">${m.stores} store${m.stores===1?'':'s'} with approved visits</div></div>
+          ${perfScoreBadge(m.score)}
+        </div>
+        <div class="verify-row">${perfChipsHtml(m)}</div>
+      </div>`).join('')}
+  </div>`;
+}
 function scorecardTeamView(pool, supName, allTimeRows, month, showBack, label){
+  if(month) return scorecardTeamViewMonthly(supName, month, showBack, label);
   const supVisits = visitsOfSupervisor(pool, supName);
   const sc = lastVisitScores(supVisits);
   // merchandisers: everyone with visits in the pool, plus (monthly) anyone with visits of any status
@@ -5468,7 +5790,7 @@ function computeMonthlyScorecard(month){
     else g.pending.push(v);
   });
   return Object.entries(byMerch).map(([merch, g])=>{
-    const target = targetForMerch(merch);
+    const target = monthlyTargetForMerch(merch);
     const totalVisits = g.all.length;
     const reviewed = g.approved.length + g.rejected.length; // pending visits haven't been judged yet, so they're excluded from accuracy
     const accuracyPct = reviewed>0 ? g.approved.length/reviewed*100 : null;
@@ -5516,7 +5838,7 @@ function screenMonthlyScorecard(){
   const isSup = State.role==='supervisor';
   if(State.scorecardMerch){
     const r = computeMonthlyScorecard(month).find(x=>sameName(x.merch, State.scorecardMerch));
-    return scorecardMerchStoresView(pool, State.scorecardMerch, monthLabel, null, { picker: monthPicker, detailHtml: monthlyMerchCardsHtml(r) });
+    return scorecardMerchStoresView(pool, State.scorecardMerch, monthLabel, null, { picker: monthPicker, detailHtml: perfDetailHtml(computeTeamPerformance(month).merchs.find(x=>sameName(x.name, State.scorecardMerch))) + monthlyMerchCardsHtml(r) });
   }
   const supSel = isSup ? State.name : State.scorecardSupervisor;
   if(supSel) return scorecardTeamView(pool, supSel, null, month, !isSup, monthLabel);
@@ -6655,7 +6977,7 @@ Object.assign(window, {
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
   toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
-  openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
+  exportPptTeamPerformance, setPptTeamMonth, openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
   rejectBadPhoto, forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
   selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
