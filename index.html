@@ -1498,9 +1498,9 @@ const VALID_EMPIDS = new Set(["4370", "4446", "4469", "4505", "4506", "4508", "4
 const ROLES = {
   merchandiser: { label:'Merchandiser', needsPassword:false, contexts:['field'], canApprove:false, canEditRef:false, manageTabs:[] },
   supervisor:   { label:'Supervisor', needsPassword:true, contexts:['field','manage'], canApprove:true, canEditRef:false, manageTabs:['approvals','arrivals','accounts','team','scorecard','allvisits','delegate'] },
-  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','ecomm','accounts','scorecard','allvisits','storemap','managebackend'] },
-  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','ecomm','accounts','scorecard','allvisits','storemap','managebackend'] },
-  commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','ecomm','accounts','scorecard','allvisits','storemap'] },
+  merch_head:   { label:'Merchandising Head', needsPassword:true, password:'shahd-head2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','npd','ecomm','accounts','scorecard','allvisits','storemap','managebackend'] },
+  trade_marketing: { label:'Trade Marketing & Market Development', needsPassword:true, password:'shahd-tmmd2026', contexts:['field','manage'], canApprove:true, canEditRef:true, manageTabs:['approvals','arrivals','visitcalendar','dashboard','npd','ecomm','accounts','scorecard','allvisits','storemap','managebackend'] },
+  commercial: { label:'Commercial', needsPassword:true, password:'shahd-comm2026', contexts:['manage'], canApprove:false, canEditRef:false, manageTabs:['dashboard','npd','ecomm','accounts','scorecard','allvisits','storemap'] },
 };
 function roleConf(){ return ROLES[State.role] || ROLES.merchandiser; }
 /* ============================= NAME IDENTITY =============================
@@ -1554,7 +1554,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
 const KPI_TARGET = { OSA:60, SOS:15, SUC:80 };
 function kpiOk(kind, v){ return v!=null && isFinite(v) && v >= KPI_TARGET[kind]; }
 function kpiChip(kind, v, label){ return v==null ? statusChip('neutral', label) : statusChip(kpiOk(kind,v)?'on':'off', label); }
-const APP_BUILD = '2026-10-14 · scorecard score + KPI targets';
+const APP_BUILD = '2026-11-02 · NPD tracking';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -3447,7 +3447,7 @@ function dashOverview(approved){
     <div class="kpi"><div class="num">${fmt(stockSummary.avgCoverage,1)}d</div><div class="lbl">Avg stock coverage / تغطية المخزون</div></div>
     <div class="kpi"><div class="num">${fmt(aggs.filter(a=>a.hasPhoto&&a.hasGeo).length/aggs.length*100)}%</div><div class="lbl">Visits verified / الزيارات الموثقة</div></div>
     <div class="kpi"><div class="num">${avgDuration!==null?fmtDuration(avgDuration):'—'}</div><div class="lbl">Avg visit duration (photo→submit) / متوسط مدة الزيارة</div></div>
-  </div>`;
+  </div` + dashNpdBlock(approved);
 }
 
 /* Canonical customer-name mapping — the same physical chain gets typed differently across
@@ -3585,7 +3585,7 @@ function computeCustomerAnalysis(approved){
       const pricedReadings = readings.filter(r=>r.priceStatus!=='neutral');
       const oosCount = readings.filter(r=>r.isOos).length;
       return {
-        name: meta.name, category: meta.category, rsp: meta.rsp,
+        id: skuId, name: meta.name, category: meta.category, rsp: meta.rsp,
         avgVelPerStore: velVals.length ? velVals.reduce((a,b2)=>a+b2,0)/velVals.length : 0, totalVelNetwork,
         sfr: sfrVals.length ? sfrVals.reduce((a,b2)=>a+b2,0)/sfrVals.length : null,
         osaPct: readings.length ? (readings.length-oosCount)/readings.length*100 : 0,
@@ -3901,7 +3901,7 @@ function dashCustomers(approved){
             <div style="font-size:14px">${bOpen?'−':'+'}</div>
           </div>
           ${bOpen ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini" style="margin-bottom:8px"><tr><th>SKU</th><th>Actual price</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Facings</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-            ${b.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
+            ${b.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}${npdBadgeById(s.id)}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
           </table></div>` : ''}`;
         }).join('')}
 
@@ -3912,7 +3912,7 @@ function dashCustomers(approved){
 
         <div class="sectitle">By SKU — price, stock &amp; coverage / حسب المنتج <span class="hint">(vel = avg units/day per store; not a company total)</span></div>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/store/d</th><th>In branches</th><th>Total stock</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Avg days cover</th><th>OOS</th></tr>
-          ${r.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`; }).join('')}
+          ${r.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}${npdBadgeById(s.id)}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.priceOkPct>0||s.actualPrice>0?statusChip(s.priceOkPct>=80?'on':'watch',fmt(s.priceOkPct)+'%'):'—'}</td><td>${s.avgVelPerStore>0?fmt(s.avgVelPerStore,1):'—'}</td><td>${s.coverage}/${r.branchCount}</td><td>${fmt(s.totalStock)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${fmtCoverage(s.avgCoverageDays)}</td><td>${s.oosCount>0?statusChip('off',s.oosCount+'x'):'—'}</td></tr>`; }).join('')}
         </table></div>
         <div class="verify-row" style="margin-top:8px">
           ${statusChip('neutral', `Total stock on hand / إجمالي المخزون: ${fmt(r.totalStock)}`)}
@@ -4740,7 +4740,7 @@ async function exportPpt(){
         footer(se3, 'ECOMM');
       }
     } catch(e) { console.error('ECOMM section failed', e); }
-await pptx.writeFile({ fileName: `Shelf-Pulse-Analysis-${todayStr()}.pptx` });
+await pptx.writeFile({ compression:true, fileName: `Shelf-Pulse-Analysis-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
   } catch(err){
     console.error(err);
@@ -4906,7 +4906,7 @@ async function exportPptExecutive(){
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
     addExecutiveRankingSlides(pptx, customers, catRows, skuRows);
 
-    await pptx.writeFile({ fileName: `Shelf-Pulse-Executive-Summary-${todayStr()}.pptx` });
+    await pptx.writeFile({ compression:true, fileName: `Shelf-Pulse-Executive-Summary-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
   } catch(err){
     console.error(err);
@@ -4941,7 +4941,7 @@ async function exportPptAccount(customerName){
 
     buildCustomerDetailSlides(pptx, c, custOpp, Infinity, true); // single account: show every SKU, no cap
 
-    await pptx.writeFile({ fileName: `${customerName.replace(/[^\w\u0600-\u06FF]+/g,'-')}-Account-Summary-${todayStr()}.pptx` });
+    await pptx.writeFile({ compression:true, fileName: `${customerName.replace(/[^\w\u0600-\u06FF]+/g,'-')}-Account-Summary-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
   } catch(err){
     console.error(err);
@@ -5001,6 +5001,14 @@ function perfMetrics(visits, targetByCust, gone){
   out.score = perfScore(out);
   return out;
 }
+/* The same person sometimes appears under a shorter name (e.g. "فاطمه احمد عبد المنعم" next to the roster's
+   "فاطمة احمد عبد المنعم عبد الرحيم"). Treat two names as one person when, after the usual spelling folds, one
+   is the other's leading words and the shorter one has at least 3 words. */
+function namePrefixMatch(a, b){
+  const wa = nameKey(cleanName(a)).split(' ').filter(Boolean), wb = nameKey(cleanName(b)).split(' ').filter(Boolean);
+  const [sh, lg] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+  return sh.length >= 3 && sh.every((w,i)=>lg[i]===w);
+}
 function computeTeamPerformance(month){
   const gone = perfTimeGone(month);
   const visits = State.visits.filter(v=>v.medium!=='ecomm' && (v.date||'').slice(0,7)===month);
@@ -5017,7 +5025,20 @@ function computeTeamPerformance(month){
   const visitsOf = {};
   visits.forEach(v=>{ const k = nameKey(cleanName(v.auditor)); (visitsOf[k] = visitsOf[k]||[]).push(v); });
   Object.keys(visitsOf).forEach(k=>{ if(!roster[k]) roster[k] = { name: cleanName(visitsOf[k][0].auditor), targetByCust:{} }; });
-  const supMemo = {};
+  // fold short-name variants into the one fuller name (unique matches only)
+  const allKeys = [...new Set([...Object.keys(roster), ...Object.keys(visitsOf)])];
+  const display = k => (roster[k] ? roster[k].name : cleanName((visitsOf[k]||[{auditor:k}])[0].auditor));
+  allKeys.forEach(k=>{
+    const longer = allKeys.filter(o=>o!==k && o.split(' ').length > k.split(' ').length && namePrefixMatch(display(k), display(o)));
+    if(longer.length!==1) return;
+    const L = longer[0];
+    if(visitsOf[k]){ visitsOf[L] = (visitsOf[L]||[]).concat(visitsOf[k]); delete visitsOf[k]; }
+    if(roster[k]){
+      const into = roster[L] = roster[L] || { name:display(L), targetByCust:{} };
+      Object.entries(roster[k].targetByCust).forEach(([n,t])=>{ into.targetByCust[n] = (into.targetByCust[n]||0)+t; });
+      delete roster[k];
+    }
+  });
   const merchs = Object.entries(roster).map(([k,r])=>{
     const m = perfMetrics(visitsOf[k]||[], r.targetByCust, gone);
     const sup = supervisorOfMerch(r.name);
@@ -5170,7 +5191,7 @@ async function exportPptTeamPerformance(){
       });
     });
 
-    await pptx.writeFile({ fileName: `Shelf-Pulse-Team-Performance-${month}.pptx` });
+    await pptx.writeFile({ compression:true, fileName: `Shelf-Pulse-Team-Performance-${month}.pptx` });
     showToast('PowerPoint downloaded ✓');
   } catch(err){
     console.error(err);
@@ -5624,7 +5645,7 @@ function visitsOfSupervisor(pool, sup){
   });
 }
 function visitsOfMerch(pool, merch){
-  return pool.filter(v=>sameName(cleanName(v.auditor), merch));
+  return pool.filter(v=>sameName(cleanName(v.auditor), merch) || namePrefixMatch(v.auditor, merch));
 }
 function jsq(x){ return String(x).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 /* ---- Monthly performance score in the Scorecard (same model as the Team Performance PPT) ---- */
@@ -6239,7 +6260,7 @@ function screenBranchDetail(){
       <div class="card">
         <h3>By SKU — price, stock &amp; coverage</h3>
         <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Actual</th><th>RSP</th><th>Status</th><th>Vel/d</th><th>Stock (units)</th><th>Filled (units)</th><th>Facings</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>SOS vs category%</th><th>Days cover</th></tr>
-          ${branchRow.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
+          ${branchRow.skuList.map(s=>{ const excl = s.category==='Marinated Fresh'; return `<tr><td>${s.name}${npdBadgeById(s.id)}</td><td>${s.actualPrice>0?fmt(s.actualPrice)+' EGP':'—'}</td><td>${s.rsp?fmt(s.rsp)+' EGP':'—'}</td><td>${s.actualPrice>0?statusChip(s.priceStatus, s.priceStatus==='on'?'Matching':s.priceStatus==='watch'?'Above':s.priceStatus==='off'?'Below':'—'):'—'}</td><td>${s.avgVel>0?fmt(s.avgVel,1):'—'}</td><td>${fmt(s.stock)}</td><td>${fmt(s.capacity)}</td><td>${fmt(s.shahdFacings)}</td><td>${excl?'—':fmt(s.sfr)+'%'}</td><td>${excl?'—':fmt(s.sosVsShahd)+'%'}</td><td>${excl?'—':fmt(s.sos)+'%'}</td><td>${fmtCoverage(s.coverageDays)}</td></tr>`; }).join('')}
         </table></div>
       </div>
     `}
@@ -6461,6 +6482,16 @@ function manageBackendSkusHtml(){
           <div><label>Category / الفئة</label><input type="text" value="${s.category}" oninput="skuField(${idx},'category',this.value)"/></div>
           <div><label>RSP (EGP) / السعر الموصى به</label><input type="number" value="${s.rsp}" oninput="skuField(${idx},'rsp',this.value)"/></div>
         </div>
+        <div class="row2">
+          <div><label>NPD? / منتج جديد؟</label>
+            <select onchange="setSkuNpd(${idx}, this.value)">
+              <option value="" ${!s.npdType?'selected':''}>No — regular SKU</option>
+              <option value="new" ${s.npdType==='new'?'selected':''}>Yes — New SKU</option>
+              <option value="innovation" ${s.npdType==='innovation'?'selected':''}>Yes — Innovation</option>
+            </select></div>
+          <div><label>Launch date (optional) / تاريخ الإطلاق</label><input type="date" value="${s.npdLaunch||''}" onchange="skuField(${idx},'npdLaunch',this.value)"/></div>
+        </div>
+        ${s.npdType ? `<p class="hint" style="margin:2px 0 6px">${npdBadgeHtml(s)} Tracked automatically in the NPDs tab and on the Dashboard.</p>` : ''}
         ${(() => { const raw = skuScopeRaw(s); return `
         <div style="margin-top:8px">
           <label>Sold at / يُباع في</label>
@@ -6862,6 +6893,7 @@ function openVisit(id){
   const agg = visitAggregate(v);
   alert(`${v.accountName} · ${v.branch}\n${v.date} · ${v.auditor}\nStatus: ${v.status}\n\nAvg SUC ${fmt(agg.avgSfr)}% · Avg SOS ${fmt(agg.avgSos)}%\nOSA ${fmt(agg.osaPct)}% · Price OK ${fmt(agg.priceOkPct)}%\nData complete ${fmt(agg.visitDonePct)}%` + (v.reviewNote ? `\nNote: ${v.reviewNote}` : ''));
 }
+function setSkuNpd(idx,val){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus[idx].npdType = val||''; if(!val) State.skus[idx].npdLaunch=''; saveSkus(); render(); }
 function skuField(idx,field,val){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus[idx][field] = val; saveSkus(); }
 function addSku(){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.push({id:'sku_'+uid(), name:'New SKU', nameAr:'', category:'', rsp:0}); saveSkus(); render(); }
 function removeSku(idx){ if(!roleConf().canEditRef){ showToast('You do not have edit permission'); return; } State.skus.splice(idx,1); saveSkus(); render(); }
@@ -6871,6 +6903,154 @@ function renderPartial(){ if(renderTimer) clearTimeout(renderTimer); renderTimer
 
 /* ============================= NAV ============================= */
 function setNavContext(ctx){ State.navContext = ctx; State.tab = ctx==='field' ? 'home' : firstManageTab(roleConf()); render(); }
+
+
+/* ============================= NPDs (new SKUs & innovations) =============================
+   A SKU is flagged in Manage Backend → SKUs (npdType: 'new' | 'innovation', optional npdLaunch date).
+   Everything below is derived from each branch's LATEST reading (same rule as the rest of the app):
+   - Coverage = outlets where the NPD is on shelf (not OOS) ÷ outlets of the customers it is sold at,
+     compared to the best-covered regular SKU (the benchmark).
+   - Stock days = network stock ÷ network daily velocity.
+   - Best/weakest customer & branch = by average velocity per outlet among outlets carrying it. */
+function npdSkuList(){ return State.skus.filter(s=>s.npdType==='new'||s.npdType==='innovation'); }
+function npdTypeLabel(t){ return t==='innovation' ? 'Innovation' : 'New SKU'; }
+function npdBadgeHtml(s){
+  if(!s || !s.npdType) return '';
+  const inn = s.npdType==='innovation';
+  return `<span style="display:inline-block;margin-left:5px;padding:1px 7px;border-radius:10px;font-size:9.5px;font-weight:800;letter-spacing:.3px;vertical-align:middle;background:${inn?'#EDE7F6':'#FFF3E0'};color:${inn?'#5E35B1':'#E65100'}">${inn?'💡 INNOVATION':'🆕 NEW'}</span>`;
+}
+function npdBadgeById(id){ return npdBadgeHtml(SKU_MAP[id]); }
+function computeNpdAnalysis(approved){
+  const npds = npdSkuList();
+  if(!npds.length) return { items:[], benchmark:null };
+  const customers = computeCustomerAnalysis(approved);
+  const stat = {};
+  State.skus.forEach(s=>{ stat[s.id] = { eligible:0, carrying:0, custEligible:new Set(), custCarry:new Set(), rows:[] }; });
+  customers.forEach(c=>{
+    State.skus.forEach(s=>{
+      if(!skuAppliesToCustomer(s, c.name)) return;
+      stat[s.id].eligible += c.branches.length; stat[s.id].custEligible.add(c.name);
+    });
+    c.branches.forEach(b=>b.skuList.forEach(x=>{
+      const st = stat[x.id]; if(!st) return;
+      const carrying = !x.isOos;
+      st.rows.push({ customer:c.name, branch:b.branch, carrying, vel:x.avgVel||0, stock:x.stock||0, sfr:x.sfr, sos:x.sos, sosVsShahd:x.sosVsShahd, priceStatus:x.priceStatus, excl:x.category==='Marinated Fresh' });
+      if(carrying){ st.carrying++; st.custCarry.add(c.name); }
+    }));
+  });
+  // benchmark = best-covered regular (non-NPD) SKU
+  let benchmark = null;
+  State.skus.forEach(s=>{
+    if(s.npdType) return;
+    const st = stat[s.id]; if(!st || !st.eligible) return;
+    const cov = st.carrying/st.eligible*100;
+    if(!benchmark || cov>benchmark.cov) benchmark = { name:s.name, cov, outlets:st.carrying, eligible:st.eligible };
+  });
+  const avgOf = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
+  const items = npds.map(s=>{
+    const st = stat[s.id];
+    const carry = st.rows.filter(r=>r.carrying);
+    const velRows = carry.filter(r=>r.vel>0);
+    const velTotal = velRows.reduce((x,r)=>x+r.vel,0);
+    const stockTotal = carry.reduce((x,r)=>x+r.stock,0);
+    const cov = st.eligible ? st.carrying/st.eligible*100 : 0;
+    // per-customer roll-up
+    const byCust = {};
+    st.custEligible.forEach(name=>{ byCust[name] = { name, outlets:0, eligible:0, velSum:0, velN:0, stock:0, oos:0 }; });
+    customers.forEach(c=>{ if(byCust[c.name]) byCust[c.name].eligible = c.branches.length; });
+    st.rows.forEach(r=>{
+      const c = byCust[r.customer]; if(!c) return;
+      if(r.carrying){ c.outlets++; c.stock += r.stock; if(r.vel>0){ c.velSum += r.vel; c.velN++; } } else c.oos++;
+    });
+    const custRows = Object.values(byCust).map(c=>({ ...c, vel: c.velN ? c.velSum/c.velN : 0, velTotal:c.velSum, days: c.velSum>0 ? c.stock/c.velSum : null }))
+      .sort((a,b)=>b.vel-a.vel || b.outlets-a.outlets);
+    const carryingCust = custRows.filter(c=>c.outlets>0);
+    const notListed = custRows.filter(c=>c.outlets===0).map(c=>c.name);
+    const bestCust = carryingCust.filter(c=>c.vel>0)[0] || null;
+    const weakCust = [...carryingCust].sort((a,b)=>a.vel-b.vel)[0] || null;
+    const branchRows = carry.slice().sort((a,b)=>b.vel-a.vel);
+    const bestBranch = branchRows.filter(r=>r.vel>0)[0] || null;
+    const weakBranch = branchRows.length>1 ? branchRows[branchRows.length-1] : null;
+    const sfrVals = carry.filter(r=>!r.excl && r.sfr!=null).map(r=>r.sfr);
+    const sosVals = carry.filter(r=>!r.excl && r.sos!=null).map(r=>r.sos);
+    const sosShVals = carry.filter(r=>!r.excl && r.sosVsShahd!=null).map(r=>r.sosVsShahd);
+    const priced = st.rows.filter(r=>r.priceStatus!=='neutral');
+    const daysSince = s.npdLaunch ? Math.floor((Date.now()-new Date(s.npdLaunch+'T00:00:00').getTime())/86400000) : null;
+    return {
+      sku:s, type:s.npdType, launch:s.npdLaunch||'', daysSince: (daysSince!=null && daysSince>=0) ? daysSince : null,
+      outlets:st.carrying, eligible:st.eligible, cov, vsTop: benchmark && benchmark.cov>0 ? cov/benchmark.cov*100 : null,
+      customers:st.custCarry.size, customersEligible:st.custEligible.size,
+      velPerOutlet: velRows.length ? velTotal/velRows.length : 0, velTotal,
+      stockTotal, stockDays: velTotal>0 ? stockTotal/velTotal : null,
+      oosOutlets: st.rows.filter(r=>!r.carrying).length,
+      sfr: avgOf(sfrVals), sos: avgOf(sosVals), sosVsShahd: avgOf(sosShVals),
+      priceOkPct: priced.length ? priced.filter(r=>r.priceStatus==='on').length/priced.length*100 : null,
+      custRows, notListed, bestCust, weakCust, bestBranch, weakBranch,
+    };
+  });
+  return { items, benchmark };
+}
+function npdKpiTile(num, lbl, accent){ return `<div class="kpi${accent?' accent':''}"><div class="num" style="font-size:20px">${num}</div><div class="lbl">${lbl}</div></div>`; }
+function npdCardHtml(n, benchmark){
+  const s = n.sku;
+  const open = State.expandedCategory === 'npd:'+s.id;
+  const stockChip = n.stockDays==null ? '' : statusChip(n.stockDays<OPP_LOW_STOCK_DAYS?'off':(n.stockDays>OPP_OVERSTOCK_DAYS?'watch':'on'), fmt(n.stockDays,1)+'d');
+  return `<div class="card">
+    <div class="visit-main">${s.name}${npdBadgeHtml(s)}</div>
+    <div class="visit-sub">${s.category||''}${s.rsp?` · RSP ${fmt(s.rsp)} EGP`:''}${n.launch?` · launched ${n.launch}${n.daysSince!=null?` (${n.daysSince} days ago)`:''}`:''}</div>
+    <div class="kpi-grid" style="margin-top:10px">
+      ${npdKpiTile(fmt(n.velPerOutlet,1), 'Velocity / outlet / day / السرعة', true)}
+      ${npdKpiTile(fmt(n.cov)+'%', `Coverage · ${n.outlets}/${n.eligible} outlets / التغطية`)}
+      ${npdKpiTile(n.vsTop!=null?fmt(n.vsTop)+'%':'—', benchmark?`vs top SKU coverage (${benchmark.name}: ${fmt(benchmark.cov)}%)`:'vs top SKU coverage')}
+      ${npdKpiTile(n.stockDays!=null?fmt(n.stockDays,1)+'d':'—', `Stock level in days (${fmt(n.stockTotal)} units) ${stockChip}`)}
+      ${npdKpiTile(`${n.customers}/${n.customersEligible}`, 'Customers carrying / العملاء')}
+      ${npdKpiTile(fmt(n.outlets), 'Outlets available / الفروع')}
+      ${npdKpiTile(n.sos!=null?fmt(n.sos)+'%':'—', 'SOS (share of category shelf) / حصة الرف')}
+      ${npdKpiTile(n.sfr!=null?fmt(n.sfr)+'%':'—', 'SUC (share of Shahd space)')}
+    </div>
+    <div class="hint" style="line-height:1.7">
+      ${n.bestCust?`🏆 <b>Best customer:</b> ${n.bestCust.name} — ${fmt(n.bestCust.vel,1)}/outlet/day across ${n.bestCust.outlets} outlet${n.bestCust.outlets===1?'':'s'}<br>`:''}
+      ${n.weakCust&&n.bestCust&&n.weakCust.name!==n.bestCust.name?`⚠️ <b>Weakest customer:</b> ${n.weakCust.name} — ${fmt(n.weakCust.vel,1)}/outlet/day<br>`:''}
+      ${n.bestBranch?`🏆 <b>Best branch:</b> ${n.bestBranch.customer} · ${n.bestBranch.branch} — ${fmt(n.bestBranch.vel,1)}/day<br>`:''}
+      ${n.weakBranch&&n.bestBranch&&n.weakBranch!==n.bestBranch?`⚠️ <b>Weakest branch:</b> ${n.weakBranch.customer} · ${n.weakBranch.branch} — ${fmt(n.weakBranch.vel,1)}/day<br>`:''}
+      ${n.oosOutlets?`🔴 <b>Out of stock / not on shelf:</b> ${n.oosOutlets} audited outlet${n.oosOutlets===1?'':'s'}<br>`:''}
+      ${n.priceOkPct!=null?`💲 <b>Price matching RSP:</b> ${fmt(n.priceOkPct)}%<br>`:''}
+      ${n.notListed.length?`🚫 <b>Not yet on shelf at:</b> ${n.notListed.join('، ')}`:''}
+    </div>
+    <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="toggleCategory('npd:${s.id}')">${open?'Hide':'Show'} customer breakdown</button>
+    ${open ? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px -2px 0"><table class="mini"><tr><th>Customer</th><th>Outlets</th><th>Vel/outlet/d</th><th>Stock (units)</th><th>Stock days</th><th>OOS</th></tr>
+      ${n.custRows.map(c=>`<tr><td>${c.name}</td><td>${c.outlets}/${c.eligible}</td><td>${c.vel>0?fmt(c.vel,1):'—'}</td><td>${fmt(c.stock)}</td><td>${c.days!=null?fmt(c.days,1)+'d':'—'}</td><td>${c.oos>0?statusChip('off',c.oos+'x'):'—'}</td></tr>`).join('')}
+    </table></div>` : ''}
+  </div>`;
+}
+function screenNpd(){
+  const approved = State.visits.filter(v=>v.status==='approved' && v.medium!=='ecomm');
+  const flagged = npdSkuList();
+  if(!flagged.length){
+    return `<div class="screen"><h1>NPDs / المنتجات الجديدة</h1><p class="lede">New SKUs and innovations performance.</p>
+    ${emptyState('🚀','No NPDs marked yet','In Manage Backend → SKUs, set “NPD?” to New SKU or Innovation on a product and it appears here automatically.')}</div>`;
+  }
+  if(!approved.length){
+    return `<div class="screen"><h1>NPDs / المنتجات الجديدة</h1><p class="lede">${flagged.length} NPD${flagged.length>1?'s':''} marked.</p>${emptyState('📊','No approved data yet','Approve some visits to see NPD performance.')}</div>`;
+  }
+  const { items, benchmark } = computeNpdAnalysis(approved);
+  return `<div class="screen"><h1>NPDs / المنتجات الجديدة</h1>
+    <p class="lede">${items.length} NPD${items.length>1?'s':''} tracked from each branch's latest approved visit${benchmark?` · benchmark: ${benchmark.name} (${fmt(benchmark.cov)}% coverage, ${benchmark.outlets}/${benchmark.eligible} outlets)`:''}.</p>
+    ${items.map(n=>npdCardHtml(n, benchmark)).join('')}
+  </div>`;
+}
+function dashNpdBlock(approved){
+  if(!npdSkuList().length) return '';
+  let res; try{ res = computeNpdAnalysis(approved); }catch(e){ console.error('NPD block failed', e); return ''; }
+  const canOpen = (roleConf().manageTabs||[]).includes('npd');
+  return `<div class="card" style="margin-top:4px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><div class="visit-main">🚀 NPDs / المنتجات الجديدة</div>${canOpen?`<button class="btn btn-ghost btn-sm" onclick="go('npd')">Open NPDs tab →</button>`:''}</div>
+    ${res.items.map(n=>`<div style="border-top:1px solid var(--line);margin-top:10px;padding-top:10px">
+      <div class="visit-sub" style="font-weight:700;color:var(--ink)">${n.sku.name}${npdBadgeHtml(n.sku)}</div>
+      <div class="hint" style="line-height:1.7">Velocity ${fmt(n.velPerOutlet,1)}/outlet/day · Coverage ${fmt(n.cov)}% (${n.outlets}/${n.eligible} outlets${n.vsTop!=null?`, ${fmt(n.vsTop)}% of top SKU`:''}) · Stock ${n.stockDays!=null?fmt(n.stockDays,1)+' days':'—'} · ${n.customers} customer${n.customers===1?'':'s'}${n.sos!=null?` · SOS ${fmt(n.sos)}%`:''}${n.bestCust?`<br>🏆 ${n.bestCust.name}${n.weakCust&&n.weakCust.name!==n.bestCust.name?` · ⚠️ ${n.weakCust.name}`:''}`:''}</div>
+    </div>`).join('')}
+  </div>`;
+}
 
 function navHtml(){
   const conf = roleConf();
@@ -6889,6 +7069,7 @@ function navHtml(){
     scorecard: {id:'scorecard', ico:'🏆', lbl:bi('Scorecard','بطاقة الأداء')},
     allvisits: {id:'allvisits', ico:'🗂', lbl:bi('All Visits','كل الزيارات')},
     storemap: {id:'storemap', ico:'🗺️', lbl:bi('Store Map','الخريطة')},
+    npd: {id:'npd', ico:'🚀', lbl:bi('NPDs','المنتجات الجديدة')},
     ecomm: {id:'ecomm', ico:'🛒', lbl:bi('ECOMM','التجارة الإلكترونية')},
     delegate: {id:'delegate', ico:'🔁', lbl:bi('Delegate','نقل الزيارة')},
     managebackend: {id:'managebackend', ico:'⚙', lbl:bi('Manage Backend','إدارة النظام')},
@@ -6925,6 +7106,7 @@ function render(){
     else if(State.tab==='skus' || State.tab==='managebackend') body = screenManageBackend();
     else if(State.tab==='allvisits') body = screenAllVisits();
     else if(State.tab==='storemap') body = screenStoreMap();
+    else if(State.tab==='npd') body = screenNpd();
     else if(State.tab==='ecomm') body = screenEcommDashboard();
     else if(State.tab==='ecommnewvisit') body = screenNewEcommVisit();
     else if(State.tab==='branchdetail') body = screenBranchDetail();
@@ -6975,7 +7157,7 @@ function render(){
 Object.assign(window, {
   go, setNavContext, logout, selectLoginRole, backToLoginMenu, attemptMerchandiserLogin, attemptMerchEmpidLogin, cancelMerchLogin, attemptPasswordLogin, setLoginPassword,
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
-  toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, addSku, removeSku,
+  toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, setSkuNpd, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   exportPptTeamPerformance, setPptTeamMonth, openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
   rejectBadPhoto, forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
