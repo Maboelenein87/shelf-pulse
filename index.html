@@ -1266,6 +1266,7 @@ async function delegationDelete(id){
   await deleteDoc(doc(db, 'delegations', id));
 }
 /* ============================= DATA CORRECTION TOOLS (decimal-error detection + fixing) ============================= */
+const MIN_PLAUSIBLE_PRICE = 100; // business rule: nothing is sold below this — anything under is a data-entry error (e.g. a missing digit)
 const MAX_PLAUSIBLE_PRICE = 600; // business rule: no Shahd pack costs anywhere near this — anything above is a data-entry error
 function findSuspiciousPrices(){
   const candidates = [];
@@ -1280,6 +1281,19 @@ function findSuspiciousPrices(){
     });
   });
   return candidates.sort((a,b)=>b.original-a.original);
+}
+// Prices under the floor — no safe auto-fix (a missing digit could be anything), so these always go to manual review.
+function findLowPrices(){
+  const candidates = [];
+  State.visits.forEach(v=>{
+    (v.items||[]).forEach(it=>{
+      const sku = SKU_MAP[it.skuId]; if(!sku) return;
+      const price = parseFloat(it.actualPrice);
+      if(!price || price <= 0 || price >= MIN_PLAUSIBLE_PRICE) return;
+      candidates.push({ visitId:v.id, skuId:it.skuId, skuName:sku.name, account:v.accountName, branch:v.branch, date:v.date, original:price, rsp:sku.rsp||0 });
+    });
+  });
+  return candidates.sort((a,b)=>a.original-b.original);
 }
 function findSuspiciousCapacity(){
   const candidates = [];
@@ -1554,7 +1568,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
 const KPI_TARGET = { OSA:60, SOS:15, SUC:80 };
 function kpiOk(kind, v){ return v!=null && isFinite(v) && v >= KPI_TARGET[kind]; }
 function kpiChip(kind, v, label){ return v==null ? statusChip('neutral', label) : statusChip(kpiOk(kind,v)?'on':'off', label); }
-const APP_BUILD = '2026-11-03 · coverage = latest visit';
+const APP_BUILD = '2026-11-03 · price alerts';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -1888,6 +1902,10 @@ async function submitVisit(){
   if(State.submitting) return; // guards against double-tap / double-submit
   if(!d.accountName || !d.branch){ showToast('Select an account first'); return; }
   if(d.items.length === 0){ showToast('No SKUs loaded — reselect the account'); return; }
+  {
+    const bad = visitPriceIssues(d.items);
+    if(bad.length){ alert(`⚠️ Revise these prices before submitting / راجع الأسعار قبل الإرسال\n\n${priceIssueLines(bad)}\n\nWe don't sell anything under ${MIN_PLAUSIBLE_PRICE} EGP or above ${MAX_PLAUSIBLE_PRICE} EGP.`); return; }
+  }
   if(!d.photos || d.photos.length === 0){
     showToast('Take at least one photo before submitting — it also captures your location');
     return;
@@ -1973,6 +1991,44 @@ async function submitVisit(){
     State.submitting = false; render();
   }
 }
+
+/* ---- Price sanity alerts: nothing is sold under MIN_PLAUSIBLE_PRICE or above MAX_PLAUSIBLE_PRICE. Used at entry
+   (merchandiser pop-up on the price field + blocked submit) and before a supervisor approves a visit. ---- */
+function priceIssueFor(price){
+  const p = parseFloat(price);
+  if(!p || p<=0) return null;
+  if(p > MAX_PLAUSIBLE_PRICE) return 'above';
+  if(p < MIN_PLAUSIBLE_PRICE) return 'below';
+  return null;
+}
+function visitPriceIssues(items){
+  return (items||[]).map(it=>{
+    const kind = priceIssueFor(it.actualPrice); if(!kind) return null;
+    const sku = SKU_MAP[it.skuId];
+    return { skuId:it.skuId, name: sku ? sku.name : 'SKU', price: parseFloat(it.actualPrice), kind };
+  }).filter(Boolean);
+}
+function priceIssueLines(list){
+  return list.map(i=>`• ${i.name}: ${i.price} EGP — ${i.kind==='above' ? 'above '+MAX_PLAUSIBLE_PRICE+' (missing decimal point?)' : 'below '+MIN_PLAUSIBLE_PRICE+' (missing digit?)'}`).join('\n');
+}
+function alertPriceIssue(items, idx){
+  const it = items[idx]; if(!it) return;
+  const list = visitPriceIssues([it]); if(!list.length) return;
+  setTimeout(()=>alert(`⚠️ Please revise this price / راجع السعر\n\n${priceIssueLines(list)}\n\nWe don't sell anything under ${MIN_PLAUSIBLE_PRICE} EGP or above ${MAX_PLAUSIBLE_PRICE} EGP. Check the shelf price again and correct it.\nلا نبيع أي منتج بأقل من ${MIN_PLAUSIBLE_PRICE} أو بأكثر من ${MAX_PLAUSIBLE_PRICE} جنيه — راجع سعر الرف وصححه.`), 60);
+}
+function priceBlur(idx){ render(); alertPriceIssue(State.draft.items, idx); }
+function editPriceBlur(idx){ render(); alertPriceIssue(State.editDraft.items, idx); }
+async function approveVisit(id){
+  const v = State.visits.find(x=>x.id===id); if(!v) return;
+  const custName = canonicalCustomerName(v.accountName);
+  const issues = visitPriceIssues((v.items||[]).filter(it=>skuAppliesToCustomer(SKU_MAP[it.skuId], custName)));
+  if(issues.length){
+    const reviseNow = confirm(`⚠️ Revise price before approving / راجع السعر قبل الاعتماد\n\n${v.accountName} · ${v.branch}\n${priceIssueLines(issues)}\n\nOK = open the visit now to revise these prices.\nCancel = go on to approve.`);
+    if(reviseNow){ openVisitEditor(id); return; }
+    if(!confirm('Approve this visit with the prices exactly as entered?')) return;
+  }
+  await setVisitStatus(id,'approved');
+}
 async function setVisitStatus(id, status, note){
   const patch = { status, reviewedAt: Date.now(), reviewedBy: identityLabel() };
   if(note) patch.reviewNote = note;
@@ -2039,7 +2095,7 @@ function pickEcommAccount(id){
 function clearEcommAccount(){ State.ecommDraft = null; render(); }
 function setEcommAvailable(idx, val){ State.ecommDraft.items[idx].available = val; render(); }
 function setEcommPrice(idx, val){ State.ecommDraft.items[idx].actualPrice = val; }
-function ecommPriceBlur(){ render(); }
+function ecommPriceBlur(idx){ render(); if(State.ecommDraft && State.ecommDraft.items[idx] && State.ecommDraft.items[idx].available) alertPriceIssue(State.ecommDraft.items, idx); }
 function ecommPriceStatusFor(price, rsp){
   if(!rsp || price===''||price===null||isNaN(parseFloat(price))||parseFloat(price)<=0) return 'neutral';
   const diffPct = ((parseFloat(price)-rsp)/rsp)*100;
@@ -2104,7 +2160,7 @@ function screenNewEcommVisit(){
         </label>
         <div style="margin-top:8px">
           <label>Listed price (EGP) — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label>
-          <input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="setEcommPrice(${idx}, this.value)" onblur="ecommPriceBlur()" ${!it.available?'disabled placeholder="Out of stock"':''}/>
+          <input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="setEcommPrice(${idx}, this.value)" onblur="ecommPriceBlur(${idx})" ${!it.available?'disabled placeholder="Out of stock"':''}/>
           ${it.actualPrice && status!=='neutral' ? statusChip(status, status==='on'?'Matching RSP':status==='watch'?'Above RSP':'Below RSP') : ''}
         </div>
       </div>`;
@@ -2124,6 +2180,10 @@ async function submitEcommVisit(){
     const skuName = (SKU_MAP[missingPrice.skuId]||{}).name || 'a SKU';
     showToast(`Enter a price for "${skuName}" — or mark it out of stock`);
     return;
+  }
+  {
+    const bad = visitPriceIssues(d.items.filter(it=>it.available));
+    if(bad.length){ alert(`⚠️ Revise these prices before submitting / راجع الأسعار قبل الإرسال\n\n${priceIssueLines(bad)}\n\nWe don't sell anything under ${MIN_PLAUSIBLE_PRICE} EGP or above ${MAX_PLAUSIBLE_PRICE} EGP.`); return; }
   }
   State.submitting = true; render();
   try{
@@ -3004,7 +3064,7 @@ function skuLineHtml(it, idx){
         <div><label>Shahd facings (this SKU only) / واجهات هذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="lineField(${idx},'shahdFacings',this.value)" onblur="lineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)" onblur="lineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point / تحقق من الفاصلة العشرية</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP) — please double-check / تحقق من السعر</p>` : ''}</div>
+        <div><label>Shelf price (EGP) / سعر الرف — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" inputmode="decimal" value="${it.actualPrice}" oninput="lineField(${idx},'actualPrice',this.value)" onblur="priceBlur(${idx})"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point / تحقق من الفاصلة العشرية</p>` : (it.actualPrice && parseFloat(it.actualPrice)>0 && parseFloat(it.actualPrice)<MIN_PLAUSIBLE_PRICE) ? `<p class="hint" style="color:var(--red)">⚠️ We don't sell anything under ${MIN_PLAUSIBLE_PRICE} EGP — check for a missing digit / لا نبيع أي منتج بأقل من ${MIN_PLAUSIBLE_PRICE} جنيه، تحقق من السعر</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP) — please double-check / تحقق من السعر</p>` : ''}</div>
       </div>
       ${it.actualCapacity!=='' ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
         ${statusChip('neutral', 'Utilization vs total / التعبئة من الإجمالي '+fmt(c.sfr)+'%')}
@@ -3191,11 +3251,11 @@ function approvalCardHtml(v){
     ${v.geo ? `<p class="hint">📍 ${v.geo.lat}, ${v.geo.lng} (±${v.geo.accuracy}m) · ${v.capturedAt?new Date(v.capturedAt).toLocaleString():''}</p>` : ''}
     <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini">
       <tr><th>SKU</th><th>Stock</th><th>Velocity</th><th>Price</th></tr>
-      ${agg.items.map(it=>`<tr><td>${(SKU_MAP[it.skuId]||{}).name||'—'}</td><td>${fmt(it.calc.actualShelfStock)}</td><td>${fmt(it.calc.velocity,1)}/d</td><td>${statusChip(it.calc.priceStatus,it.calc.priceLbl)}</td></tr>`).join('')}
+      ${agg.items.map(it=>`<tr><td>${(SKU_MAP[it.skuId]||{}).name||'—'}</td><td>${fmt(it.calc.actualShelfStock)}</td><td>${fmt(it.calc.velocity,1)}/d</td><td>${statusChip(it.calc.priceStatus,it.calc.priceLbl)}${priceIssueFor(it.actualPrice)?` <span style="color:var(--red);font-weight:700">⚠️ ${fmt(parseFloat(it.actualPrice),2)} — revise</span>`:''}</td></tr>`).join('')}
     </table></div>
     <div style="display:flex;gap:8px;margin-top:12px">
       ${roleConf().canApprove ? `
-      <button class="btn btn-green btn-sm" style="flex:1" onclick="setVisitStatus('${v.id}','approved')">Approve / اعتماد</button>
+      <button class="btn btn-green btn-sm" style="flex:1" onclick="approveVisit('${v.id}')">Approve / اعتماد</button>
       <button class="btn btn-danger btn-sm" style="flex:1" onclick="rejectPrompt('${v.id}')">Reject / رفض</button>
       <button class="btn btn-ghost btn-sm" style="flex:1" onclick="rejectBadPhoto('${v.id}')">📷 Bad photo / صورة غير صالحة</button>
       ` : `<p class="hint">View-only — you don't have approval rights.</p>`}
@@ -6205,7 +6265,7 @@ function editLineHtml(it, idx){
         <div><label>Shahd facings (this SKU) / واجهات شهد لهذا المنتج</label><input type="number" inputmode="decimal" value="${it.shahdFacings}" oninput="editLineField(${idx},'shahdFacings',this.value)" onblur="editLineFieldBlur()"/></div>
       </div>
       <div class="row2">
-        <div><label>${bi('Shelf price (EGP)','مراقبة السعر')} — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editLineFieldBlur()"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
+        <div><label>${bi('Shelf price (EGP)','مراقبة السعر')} — RSP ${sku.rsp?sku.rsp+' EGP':'—'}</label><input type="number" step="0.01" inputmode="decimal" value="${it.actualPrice}" oninput="editLineField(${idx},'actualPrice',this.value)" onblur="editPriceBlur(${idx})"/>${it.actualPrice && parseFloat(it.actualPrice)>MAX_PLAUSIBLE_PRICE ? `<p class="hint" style="color:var(--red)">⚠️ No Shahd pack costs this much — check for a missing decimal point</p>` : (it.actualPrice && parseFloat(it.actualPrice)>0 && parseFloat(it.actualPrice)<MIN_PLAUSIBLE_PRICE) ? `<p class="hint" style="color:var(--red)">⚠️ We don't sell anything under ${MIN_PLAUSIBLE_PRICE} EGP — check for a missing digit</p>` : (sku.rsp && it.actualPrice && (parseFloat(it.actualPrice) > sku.rsp*5 || parseFloat(it.actualPrice) < sku.rsp*0.2)) ? `<p class="hint" style="color:var(--red)">⚠️ Looks like a typo vs RSP (${sku.rsp} EGP)</p>` : ''}</div>
       </div>
     </div>` : ''}
   </div>`;
@@ -6338,7 +6398,7 @@ function screenManageBackend(){
   ];
   const bodies = {
     skus: manageBackendSkusHtml,
-    prices: manageBackendPricesHtml,
+    prices: () => manageBackendPricesHtml() + manageBackendLowPricesHtml(),
     facings: manageBackendFacingsHtml,
     uploads: manageBackendUploadsHtml,
     merging: manageBackendMergingHtml,
@@ -6581,6 +6641,20 @@ function manageBackendPricesHtml(){
       `; })()}
     </div>
   `;
+}
+
+function manageBackendLowPricesHtml(){
+  const cands = findLowPrices();
+  return `
+    <div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Impossible prices (under ${MIN_PLAUSIBLE_PRICE} EGP)</h3>
+      ${cands.length===0 ? `<p class="hint">No prices below ${MIN_PLAUSIBLE_PRICE} EGP detected right now.</p>` : `
+      <p class="hint" style="margin-bottom:10px">${cands.length} price${cands.length===1?'':'s'} found below ${MIN_PLAUSIBLE_PRICE} EGP — nothing is sold that cheap, so these are data-entry errors (usually a missing digit). They can't be auto-corrected safely, so each one needs a manual fix in the visit editor.</p>
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>Account</th><th>SKU</th><th>Was</th><th>RSP</th><th></th></tr>
+      ${cands.slice(0,40).map(c=>`<tr><td>${c.account}<br><span class="hint">${c.branch} · ${c.date}</span></td><td>${c.skuName}</td><td style="color:var(--red);font-weight:700">${c.original}</td><td>${c.rsp||'—'}</td><td><button class="btn btn-ghost btn-sm" onclick="openVisitEditor('${c.visitId}')">Open &amp; edit</button></td></tr>`).join('')}
+      </table></div>
+      ${cands.length>40 ? `<p class="hint">Showing first 40 of ${cands.length}.</p>` : ''}`}
+    </div>`;
 }
 
 function manageBackendFacingsHtml(){
@@ -7209,7 +7283,7 @@ function render(){
 Object.assign(window, {
   go, setNavContext, logout, selectLoginRole, backToLoginMenu, attemptMerchandiserLogin, attemptMerchEmpidLogin, cancelMerchLogin, attemptPasswordLogin, setLoginPassword,
   d, setDashSub, toggleCategory, toggleBranchRow, onAccountSearch, pickAccount, clearAccount,
-  toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, setSkuNpd, addSku, removeSku,
+  toggleLine, lineField, lineFieldBlur, rejectPrompt, openVisit, skuField, setSkuNpd, priceBlur, editPriceBlur, approveVisit, addSku, removeSku,
   submitVisit, setVisitStatus, capturePhoto, removePhotoAt, exportPpt, exportPptExecutive, exportPptAccount, exportExcel, resetVisits,
   exportPptTeamPerformance, setPptTeamMonth, openPptExportMenu, closePptExportMenu, choosePptAccountMode, setPptAccountSearch, runPptAccountExport,
   rejectBadPhoto, forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
