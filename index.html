@@ -1554,7 +1554,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
 const KPI_TARGET = { OSA:60, SOS:15, SUC:80 };
 function kpiOk(kind, v){ return v!=null && isFinite(v) && v >= KPI_TARGET[kind]; }
 function kpiChip(kind, v, label){ return v==null ? statusChip('neutral', label) : statusChip(kpiOk(kind,v)?'on':'off', label); }
-const APP_BUILD = '2026-11-02 · NPD tracking';
+const APP_BUILD = '2026-11-03 · coverage = latest visit';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -3946,17 +3946,18 @@ function computeCategoryAnalysis(approved){
     agg.items.forEach(it=>{
       const sku = SKU_MAP[it.skuId]; if(!sku) return;
       byCat[sku.category] = byCat[sku.category] || { sfrSum:0, sfrN:0, sosSum:0, sosN:0 };
-      bySku[sku.id] = bySku[sku.id] || { name:sku.name, category:sku.category, sfrSum:0, sfrN:0, sosSum:0, sosN:0, sosVsShahdSum:0, sosVsShahdN:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set() };
+      bySku[sku.id] = bySku[sku.id] || { id:sku.id, name:sku.name, category:sku.category, sfrSum:0, sfrN:0, sosSum:0, sosN:0, sosVsShahdSum:0, sosVsShahdN:0, velSum:0, velN:0, priceOk:0, priceAbove:0, priceN:0, n:0, storesCarrying:new Set(), storesEver:new Set() };
       const b = bySku[sku.id];
       b.n++;
-      if(it.calc.osa==='Y') b.storesCarrying.add(storeKey);
+      if(it.calc.osa==='Y') b.storesEver.add(storeKey); // ever in stock at some visit — only used to spot LOST distribution below
       if(it.calc.velocity>0){ b.velSum += it.calc.velocity; b.velN++; }
       if(it.calc.priceStatus!=='neutral'){ b.priceN++; if(it.calc.priceStatus==='on') b.priceOk++; if(it.calc.priceStatus==='watch') b.priceAbove++; }
-      latestReading[storeKey+'|'+sku.id] = { sfr: it.calc.sfr, sos: it.calc.sos, sosVsShahd: it.calc.sosVsShahd, category: sku.category, skuId: sku.id };
+      latestReading[storeKey+'|'+sku.id] = { storeKey, osa: it.calc.osa, sfr: it.calc.sfr, sos: it.calc.sos, sosVsShahd: it.calc.sosVsShahd, category: sku.category, skuId: sku.id };
     });
    }catch(e){ console.error('Skipping malformed visit in category analysis:', v && v.id, e); }
   });
   Object.values(latestReading).forEach(r=>{
+    if(r.osa==='Y') bySku[r.skuId].storesCarrying.add(r.storeKey); // coverage = in stock at the store's LATEST visit
     if(r.sfr!=null){ byCat[r.category].sfrSum += r.sfr; byCat[r.category].sfrN++; bySku[r.skuId].sfrSum += r.sfr; bySku[r.skuId].sfrN++; }
     if(r.sos!=null){ byCat[r.category].sosSum += r.sos; byCat[r.category].sosN++; bySku[r.skuId].sosSum += r.sos; bySku[r.skuId].sosN++; }
     if(r.sosVsShahd!=null){ bySku[r.skuId].sosVsShahdSum += r.sosVsShahd; bySku[r.skuId].sosVsShahdN++; }
@@ -3970,6 +3971,7 @@ function computeCategoryAnalysis(approved){
     avgSfr: s.sfrN?s.sfrSum/s.sfrN:0, avgSos: s.sosN?s.sosSum/s.sosN:0, avgSosVsShahd: s.sosVsShahdN?s.sosVsShahdSum/s.sosVsShahdN:0, priceOkPct: s.priceN?s.priceOk/s.priceN*100:0,
     aboveRspPct: s.priceN?s.priceAbove/s.priceN*100:0,
     coveragePct: totalStores ? s.storesCarrying.size/totalStores*100 : 0, coverageCount: s.storesCarrying.size,
+    lostCount: [...s.storesEver].filter(k=>!s.storesCarrying.has(k)).length, // stocked at an earlier visit, out of stock at the latest = opportunity
   })).sort((a,b)=>b.avgVelPerStore-a.avgVelPerStore);
   return { catRows, skuRows, totalStores };
 }
@@ -3985,9 +3987,9 @@ function dashCategories(approved){
   </div>
   <div class="card">
     <h3>SKU performance across all ${totalStores} stores / أداء المنتجات في كل الفروع</h3>
-    <p class="hint" style="margin-top:-4px;margin-bottom:8px">"Vel/store" = average units sold per day at a single store. "Network total" = summed across every store carrying it. "Coverage" = % of visited stores where it's in stock right now. "Util vs total" and "SOS vs Shahd" are each SKU's average share of the dedicated Shahd space and of total Shahd facings, across every store — the grand-total/average view.</p>
+    <p class="hint" style="margin-top:-4px;margin-bottom:8px">"Vel/store" = average units sold per day at a single store. "Network total" = summed across every store carrying it. "Coverage" = % of visited stores where it's in stock at the latest visit. "Util vs total" and "SOS vs Shahd" are each SKU's average share of the dedicated Shahd space and of total Shahd facings, across every store — the grand-total/average view.</p>
     <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px"><table class="mini"><tr><th>SKU</th><th>Vel/store/d</th><th>Network total/d</th><th>Coverage</th><th>Util vs total%</th><th>SOS vs Shahd%</th><th>Price OK</th></tr>
-    ${skuRows.map(r=>{ const excl = r.category==='Marinated Fresh'; return `<tr><td>${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})</td><td>${excl?'—':fmt(r.avgSfr)+'%'}</td><td>${excl?'—':fmt(r.avgSosVsShahd)+'%'}</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`; }).join('')}
+    ${skuRows.map(r=>{ const excl = r.category==='Marinated Fresh'; return `<tr><td>${npdIconHtml(r.id)}${r.name}<br><span class="hint">${r.category}</span></td><td>${r.avgVelPerStore>0?fmt(r.avgVelPerStore,1):'—'}</td><td>${r.totalVelNetwork>0?fmt(r.totalVelNetwork,1):'—'}</td><td>${fmt(r.coveragePct)}% (${r.coverageCount}/${totalStores})${r.lostCount>0?`<br><span class="hint" style="color:var(--red)">${r.lostCount} lost (was in stock, now OOS)</span>`:''}</td><td>${excl?'—':fmt(r.avgSfr)+'%'}</td><td>${excl?'—':fmt(r.avgSosVsShahd)+'%'}</td><td>${r.priceN?fmt(r.priceOkPct)+'%':'—'}</td></tr>`; }).join('')}
     </table></div>
   </div>`;
 }
@@ -4434,6 +4436,50 @@ function addBestWorstCategorySkuSlide(pptx, catRows, skuRows){
   mk(worst5, PPT_RED, 6.8, 'Worst 5 SKUs');
   pptFooter(s, 'Best & Worst — Category & SKU');
 }
+
+// ---------- NPDs / Innovations slide(s): one row per flagged SKU; skipped entirely when nothing is flagged ----------
+function addNpdSlides(pptx, approved){
+  if(!npdSkuList().length) return;
+  const { items, benchmark } = computeNpdAnalysis(approved);
+  if(!items.length) return;
+  const PER = 6;
+  for(let off=0; off<items.length; off+=PER){
+    const chunk = items.slice(off, off+PER);
+    const s = pptx.addSlide();
+    s.addText("NPD's / Innovations" + (items.length>PER ? ` (${Math.floor(off/PER)+1}/${Math.ceil(items.length/PER)})` : ''), { x:0.5, y:0.35, w:12, h:0.5, fontSize:26, bold:true, color:PPT_DARK });
+    s.addText(`New SKUs and innovations tracked from each branch's latest visit.${benchmark?` Coverage benchmark: ${benchmark.name} at ${fmt(benchmark.cov)}% (${benchmark.outlets}/${benchmark.eligible} outlets).`:''}`, { x:0.5, y:0.9, w:12.3, h:0.35, fontSize:10.5, italic:true, color:PPT_SOFT });
+    const header = ['NPD','Type','Vel/outlet/d','Coverage','vs top SKU','Stock days','Cust.','Outlets','SOS%','SUC%','Best customer','Weakest customer'].map(h=>({text:h, options:{bold:true, color:'FFFFFF', fill:{color:PPT_RED}}}));
+    const table = [header];
+    chunk.forEach((n,i)=>{
+      const fillC = i%2?'F6F2EF':'FFFFFF';
+      const lowStock = n.stockDays!=null && n.stockDays<OPP_LOW_STOCK_DAYS;
+      const cells = [
+        n.sku.name, n.type==='innovation'?'Innovation':'New SKU', fmt(n.velPerOutlet,1),
+        `${fmt(n.cov)}% (${n.outlets}/${n.eligible})`, n.vsTop!=null?fmt(n.vsTop)+'%':'—',
+        n.stockDays!=null?fmt(n.stockDays,1)+'d':'—', `${n.customers}/${n.customersEligible}`, String(n.outlets),
+        n.sos!=null?fmt(n.sos):'—', n.sfr!=null?fmt(n.sfr):'—',
+        n.bestCust?`${n.bestCust.name} (${fmt(n.bestCust.vel,1)})`:'—',
+        (n.weakCust && n.bestCust && n.weakCust.name!==n.bestCust.name)?`${n.weakCust.name} (${fmt(n.weakCust.vel,1)})`:'—',
+      ];
+      table.push(cells.map((v,ci)=>({ text:v, options:{ fill:{color:fillC}, bold:ci===0,
+        color: (ci===5 && lowStock) || (ci===8 && n.sos!=null && !kpiOk('SOS',n.sos)) || (ci===9 && n.sfr!=null && n.sfr<OPP_LOW_SUC_PCT) ? PPT_RED : PPT_DARK } })));
+    });
+    s.addTable(table, { x:0.5, y:1.4, w:12.3, colW:[1.7,0.85,0.85,1.2,0.8,0.75,0.55,0.65,0.5,0.5,1.95,2.0], fontSize:9.5, border:{color:PPT_LINE, pt:0.5}, autoPage:false, rowH:0.5 });
+    const notes = [];
+    chunk.forEach(n=>{
+      const bits = [];
+      if(n.bestBranch) bits.push(`best branch ${n.bestBranch.customer} · ${n.bestBranch.branch} (${fmt(n.bestBranch.vel,1)}/day)`);
+      if(n.weakBranch && n.bestBranch && n.weakBranch!==n.bestBranch) bits.push(`weakest ${n.weakBranch.customer} · ${n.weakBranch.branch} (${fmt(n.weakBranch.vel,1)}/day)`);
+      if(n.lostOutlets) bits.push(`${n.lostOutlets} outlet${n.lostOutlets===1?'':'s'} stocked before but out of stock now (opportunity)`);
+      else if(n.oosOutlets) bits.push(`out of stock at ${n.oosOutlets} outlet${n.oosOutlets===1?'':'s'}`);
+      if(n.notListed.length) bits.push(`not yet on shelf at ${n.notListed.slice(0,6).join(', ')}${n.notListed.length>6?` +${n.notListed.length-6} more`:''}`);
+      if(bits.length) notes.push(`${n.sku.name}: ${bits.join(' · ')}`);
+    });
+    if(notes.length) s.addText(notes.join('\n'), { x:0.5, y:Math.min(5.1, 1.4+0.5*(chunk.length+1)+0.25), w:12.3, h:1.7, fontSize:10, color:PPT_DARK, valign:'top', paraSpaceAfter:3 });
+    s.addText('Coverage = outlets with the NPD on shelf ÷ outlets of customers it is sold at · vs top SKU = its coverage as % of the best-covered regular SKU · Stock days = network stock ÷ daily velocity (red under ' + OPP_LOW_STOCK_DAYS + ' days) · Vel in brackets = units/outlet/day.', { x:0.5, y:6.75, w:12.3, h:0.35, fontSize:8.5, italic:true, color:PPT_SOFT });
+    pptFooter(s, "NPD's / Innovations");
+  }
+}
 // Adds the three slides, each guarded so one failure can't take the rest of the deck down.
 function addExecutiveRankingSlides(pptx, customers, catRows, skuRows){
   try{ addBestWorstCategorySkuSlide(pptx, catRows, skuRows); }catch(e){ console.error('Best & Worst Category & SKU slide failed', e); }
@@ -4593,6 +4639,7 @@ async function exportPpt(){
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
     addExecutiveRankingSlides(pptx, customers, catRows, skuRows);
+    try{ addNpdSlides(pptx, approved); }catch(e){ console.error("NPD's slide failed", e); }
 // ---------- Customer Analysis ----------
     try {
 
@@ -4905,6 +4952,7 @@ async function exportPptExecutive(){
 
         } catch(e) { console.error('Best & Worst Performers slide failed', e); }
     addExecutiveRankingSlides(pptx, customers, catRows, skuRows);
+    try{ addNpdSlides(pptx, approved); }catch(e){ console.error("NPD's slide failed", e); }
 
     await pptx.writeFile({ compression:true, fileName: `Shelf-Pulse-Executive-Summary-${todayStr()}.pptx` });
     showToast('PowerPoint downloaded ✓');
@@ -6919,11 +6967,14 @@ function npdBadgeHtml(s){
   const inn = s.npdType==='innovation';
   return `<span style="display:inline-block;margin-left:5px;padding:1px 7px;border-radius:10px;font-size:9.5px;font-weight:800;letter-spacing:.3px;vertical-align:middle;background:${inn?'#EDE7F6':'#FFF3E0'};color:${inn?'#5E35B1':'#E65100'}">${inn?'💡 INNOVATION':'🆕 NEW'}</span>`;
 }
+function npdIconHtml(id){ const k = SKU_MAP[id]; if(!k || !k.npdType) return ''; return `<span title="${npdTypeLabel(k.npdType)}" style="margin-right:4px">${k.npdType==='innovation'?'💡':'🆕'}</span>`; }
 function npdBadgeById(id){ return npdBadgeHtml(SKU_MAP[id]); }
 function computeNpdAnalysis(approved){
   const npds = npdSkuList();
   if(!npds.length) return { items:[], benchmark:null };
   const customers = computeCustomerAnalysis(approved);
+  const catSku = {}; // same velocity the Category dashboard shows (average of every visit reading), so one SKU never has two different velocities
+  try{ computeCategoryAnalysis(approved).skuRows.forEach(r=>{ catSku[r.id] = r; }); }catch(e){ console.error('NPD category velocity failed', e); }
   const stat = {};
   State.skus.forEach(s=>{ stat[s.id] = { eligible:0, carrying:0, custEligible:new Set(), custCarry:new Set(), rows:[] }; });
   customers.forEach(c=>{
@@ -6980,9 +7031,9 @@ function computeNpdAnalysis(approved){
       sku:s, type:s.npdType, launch:s.npdLaunch||'', daysSince: (daysSince!=null && daysSince>=0) ? daysSince : null,
       outlets:st.carrying, eligible:st.eligible, cov, vsTop: benchmark && benchmark.cov>0 ? cov/benchmark.cov*100 : null,
       customers:st.custCarry.size, customersEligible:st.custEligible.size,
-      velPerOutlet: velRows.length ? velTotal/velRows.length : 0, velTotal,
+      velPerOutlet: catSku[s.id] ? catSku[s.id].avgVelPerStore : (velRows.length ? velTotal/velRows.length : 0), velTotal,
       stockTotal, stockDays: velTotal>0 ? stockTotal/velTotal : null,
-      oosOutlets: st.rows.filter(r=>!r.carrying).length,
+      oosOutlets: st.rows.filter(r=>!r.carrying).length, lostOutlets: catSku[s.id] ? catSku[s.id].lostCount : 0,
       sfr: avgOf(sfrVals), sos: avgOf(sosVals), sosVsShahd: avgOf(sosShVals),
       priceOkPct: priced.length ? priced.filter(r=>r.priceStatus==='on').length/priced.length*100 : null,
       custRows, notListed, bestCust, weakCust, bestBranch, weakBranch,
@@ -6999,7 +7050,7 @@ function npdCardHtml(n, benchmark){
     <div class="visit-main">${s.name}${npdBadgeHtml(s)}</div>
     <div class="visit-sub">${s.category||''}${s.rsp?` · RSP ${fmt(s.rsp)} EGP`:''}${n.launch?` · launched ${n.launch}${n.daysSince!=null?` (${n.daysSince} days ago)`:''}`:''}</div>
     <div class="kpi-grid" style="margin-top:10px">
-      ${npdKpiTile(fmt(n.velPerOutlet,1), 'Velocity / outlet / day / السرعة', true)}
+      ${npdKpiTile(fmt(n.velPerOutlet,1), 'Velocity / store / day (as in Categories) / السرعة', true)}
       ${npdKpiTile(fmt(n.cov)+'%', `Coverage · ${n.outlets}/${n.eligible} outlets / التغطية`)}
       ${npdKpiTile(n.vsTop!=null?fmt(n.vsTop)+'%':'—', benchmark?`vs top SKU coverage (${benchmark.name}: ${fmt(benchmark.cov)}%)`:'vs top SKU coverage')}
       ${npdKpiTile(n.stockDays!=null?fmt(n.stockDays,1)+'d':'—', `Stock level in days (${fmt(n.stockTotal)} units) ${stockChip}`)}
@@ -7013,7 +7064,8 @@ function npdCardHtml(n, benchmark){
       ${n.weakCust&&n.bestCust&&n.weakCust.name!==n.bestCust.name?`⚠️ <b>Weakest customer:</b> ${n.weakCust.name} — ${fmt(n.weakCust.vel,1)}/outlet/day<br>`:''}
       ${n.bestBranch?`🏆 <b>Best branch:</b> ${n.bestBranch.customer} · ${n.bestBranch.branch} — ${fmt(n.bestBranch.vel,1)}/day<br>`:''}
       ${n.weakBranch&&n.bestBranch&&n.weakBranch!==n.bestBranch?`⚠️ <b>Weakest branch:</b> ${n.weakBranch.customer} · ${n.weakBranch.branch} — ${fmt(n.weakBranch.vel,1)}/day<br>`:''}
-      ${n.oosOutlets?`🔴 <b>Out of stock / not on shelf:</b> ${n.oosOutlets} audited outlet${n.oosOutlets===1?'':'s'}<br>`:''}
+      ${n.lostOutlets?`🔴 <b>Opportunity — stocked before, out of stock now:</b> ${n.lostOutlets} outlet${n.lostOutlets===1?'':'s'}<br>`:''}
+      ${n.oosOutlets?`⚠️ <b>Out of stock / not on shelf at latest visit:</b> ${n.oosOutlets} audited outlet${n.oosOutlets===1?'':'s'}<br>`:''}
       ${n.priceOkPct!=null?`💲 <b>Price matching RSP:</b> ${fmt(n.priceOkPct)}%<br>`:''}
       ${n.notListed.length?`🚫 <b>Not yet on shelf at:</b> ${n.notListed.join('، ')}`:''}
     </div>
