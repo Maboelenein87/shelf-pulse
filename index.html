@@ -1568,7 +1568,7 @@ function firstManageTab(conf){ return (conf.manageTabs && conf.manageTabs[0]) ||
 const KPI_TARGET = { OSA:60, SOS:15, SUC:80 };
 function kpiOk(kind, v){ return v!=null && isFinite(v) && v >= KPI_TARGET[kind]; }
 function kpiChip(kind, v, label){ return v==null ? statusChip('neutral', label) : statusChip(kpiOk(kind,v)?'on':'off', label); }
-const APP_BUILD = '2026-11-03 · price alerts';
+const APP_BUILD = '2026-11-04 · delegation period';
 // Clears this app's cached files and reloads. Logins and unsent visit drafts live in localStorage, which
 // this never touches, so it's safe to tap mid-shift.
 async function forceAppUpdate(){
@@ -1606,7 +1606,7 @@ const State = {
   expandedCategory: null, expandedBranch: null,
   loginRole: null, loginPassword: '', loginError: '', pendingMerchName: null, submitting: false,
   editingVisitId: null, editDraft: null, visitSearch: '',
-  delegateSearch: '', delegateSelected: new Set(), delegateTarget: '', delegateDate: todayStr(), delegations: [],
+  delegateSearch: '', delegateSelected: new Set(), delegateTarget: '', delegateDate: todayStr(), delegateDateTo: '', delegations: [],
   calendarDate: todayStr(),
   cleanupMonth: '', cleanupDate: '', cleanupSelected: new Set(),
 };
@@ -3008,7 +3008,7 @@ function myAccounts(){
       )
     );
     const ownIds = new Set(own.map(a=>a.id));
-    const delegatedIds = new Set(State.delegations.filter(x => x.date===State.draft.date && (
+    const delegatedIds = new Set(State.delegations.filter(x => delegationCovers(x, State.draft.date) && (
       (x.toMerchCode && State.merchCode && x.toMerchCode===State.merchCode) ||
       sameName(x.toMerch, State.name)
     )).map(x=>x.accountId));
@@ -6084,14 +6084,23 @@ function delegateToggle(id){
   render();
 }
 function delegateSetTarget(v){ State.delegateTarget = v; }
-function delegateSetDate(v){ State.delegateDate = v; render(); }
-function delegationsForAccountDate(accountId, date){
-  return State.delegations.filter(x=>x.accountId===accountId && x.date===date);
+function delegateSetDate(v){ State.delegateDate = v; if(State.delegateDateTo && State.delegateDateTo < v) State.delegateDateTo = v; render(); }
+function delegateSetDateTo(v){ State.delegateDateTo = v; render(); }
+// A delegation covers every date from x.date (start) to x.dateTo (end, inclusive). Older single-day records have no dateTo.
+function delegationEnd(x){ return x.dateTo || x.date; }
+function delegationCovers(x, date){ return !!date && x.date <= date && date <= delegationEnd(x); }
+function delegationRangeLabel(x){ return delegationEnd(x)===x.date ? x.date : `${x.date} → ${delegationEnd(x)}`; }
+function delegateRange(){ const from = State.delegateDate; const to = State.delegateDateTo || from; return { from, to }; }
+// Existing delegations of this store that overlap the given range
+function delegationsForAccountRange(accountId, from, to){
+  return State.delegations.filter(x=>x.accountId===accountId && x.date <= to && from <= delegationEnd(x));
 }
 async function delegateApply(){
   if(!['supervisor','merch_head','trade_marketing'].includes(State.role)){ showToast('Not authorized'); return; }
   if(!State.delegateTarget){ showToast('Choose a merchandiser to delegate to first'); return; }
-  if(!State.delegateDate){ showToast('Choose a date first'); return; }
+  if(!State.delegateDate){ showToast('Choose a start date first'); return; }
+  const { from: dFrom, to: dTo } = delegateRange();
+  if(dTo < dFrom){ showToast('The end date must be on or after the start date'); return; }
   const ids = [...State.delegateSelected];
   if(!ids.length){ showToast('Select at least one store to delegate'); return; }
   const accounts = ids.map(id=>State.accounts.find(a=>a.id===id)).filter(Boolean);
@@ -6103,15 +6112,15 @@ async function delegateApply(){
   const toMerchName = isCode
     ? ((State.merchDirectory && State.merchDirectory[toMerchCode] && State.merchDirectory[toMerchCode].name) || toMerchCode)
     : State.delegateTarget.slice(5);
-  if(!confirm(`Delegate ${accounts.length} store(s) to ${toMerchName} for ${State.delegateDate} only? The store${accounts.length>1?'s':''} stay${accounts.length>1?'':'s'} on the original merchandiser's route afterwards, and credit goes to whoever actually submits the visit.`)) return;
+  if(!confirm(`Delegate ${accounts.length} store(s) to ${toMerchName} ${dFrom===dTo?`for ${dFrom} only`:`from ${dFrom} to ${dTo} (inclusive)`}? The store${accounts.length>1?'s':''} stay${accounts.length>1?'':'s'} on the original merchandiser's route afterwards, and credit goes to whoever actually submits the visit.`)) return;
   showToast('Delegating…');
   try{
     for(const a of accounts){
-      // Replace any existing delegation for this store+date rather than stacking duplicates.
-      for(const existing of delegationsForAccountDate(a.id, State.delegateDate)){ await delegationDelete(existing.id); }
+      // Replace any existing delegation of this store that overlaps the new period rather than stacking duplicates.
+      for(const existing of delegationsForAccountRange(a.id, dFrom, dTo)){ await delegationDelete(existing.id); }
       await delegationCreate({
         id: uid(), accountId: a.id, accountName: a.name, branch: a.branch,
-        date: State.delegateDate, toMerch: toMerchName, toMerchCode, fromMerch: (a.merch||'').trim(), fromMerchCode: a.merchCode||null,
+        date: dFrom, dateTo: dTo, toMerch: toMerchName, toMerchCode, fromMerch: (a.merch||'').trim(), fromMerchCode: a.merchCode||null,
         createdBy: identityLabel(), createdAt: Date.now(),
       });
     }
@@ -6130,12 +6139,13 @@ function delegateListHtml(){
   const pool = supervisorTeamAccounts();
   const list = pool.filter(a => !q || (a.name+' '+a.branch+' '+(a.merch||'')).toLowerCase().includes(q));
   return `${list.slice(0,80).map(a=>{
-      const existing = delegationsForAccountDate(a.id, State.delegateDate);
+      const { from: rFrom, to: rTo } = delegateRange();
+      const existing = delegationsForAccountRange(a.id, rFrom, rTo);
       return `<div class="card" style="padding:12px 14px;display:flex;align-items:center;gap:10px">
       <input type="checkbox" ${State.delegateSelected.has(a.id)?'checked':''} onchange="delegateToggle('${a.id}')" style="width:18px;height:18px;flex-shrink:0"/>
       <div style="flex:1">
         <div class="visit-main">${a.name} · ${a.branch}</div>
-        <div class="hint">Regular merchandiser: ${a.merch||'—'}${a.sup?' · Sup: '+a.sup:''}${existing.length?` · already delegated to ${existing.map(x=>x.toMerch).join(', ')} on ${State.delegateDate}`:''}</div>
+        <div class="hint">Regular merchandiser: ${a.merch||'—'}${a.sup?' · Sup: '+a.sup:''}${existing.length?` · already delegated to ${existing.map(x=>`${x.toMerch} (${delegationRangeLabel(x)})`).join(', ')}`:''}</div>
       </div>
     </div>`;
     }).join('') || emptyState('📭','No stores found','')}
@@ -6145,7 +6155,7 @@ function activeDelegationsHtml(){
   const mySet = State.role==='supervisor' ? makeTeamSet(myMerchandisers()) : null;
   const today = todayStr();
   const list = State.delegations
-    .filter(x => x.date >= today) // hide ones that have already passed
+    .filter(x => delegationEnd(x) >= today) // hide ones that have already ended
     .filter(x => !mySet || mySet.has(x.fromMerch) || mySet.has(x.toMerch))
     .sort((a,b)=> a.date.localeCompare(b.date));
   if(!list.length) return `<p class="hint">No upcoming or active one-off delegations.</p>`;
@@ -6153,7 +6163,7 @@ function activeDelegationsHtml(){
     <div class="card" style="padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px">
       <div>
         <div class="visit-main">${x.accountName} · ${x.branch}</div>
-        <div class="hint">${x.date} · ${x.fromMerch||'—'} → ${x.toMerch}</div>
+        <div class="hint">${delegationRangeLabel(x)} · ${x.fromMerch||'—'} → ${x.toMerch}</div>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="cancelDelegation('${x.id}')">✕ Cancel</button>
     </div>`).join('');
@@ -6176,10 +6186,13 @@ function screenDelegate(){
   ].sort((a,b)=>a.label.localeCompare(b.label));
   return `<div class="screen">
     <h1>${bi('Delegate visits','نقل الزيارة لمنسق اخر')}</h1>
-    <p class="lede">One-off only — hand a specific store to another merchandiser for a single date, e.g. coverage gaps or when someone's unavailable. The store stays on its regular merchandiser's route and target afterwards; whoever actually submits the visit gets the credit.</p>
+    <p class="lede">Temporary only — hand a specific store to another merchandiser for a single date or a period (from date → to date), e.g. coverage gaps, leave or when someone's unavailable. The store stays on its regular merchandiser's route and target afterwards; whoever actually submits the visit gets the credit.</p>
     <div class="card" style="position:sticky;top:8px;z-index:1">
-      <label>Date / التاريخ</label>
-      <input type="date" value="${State.delegateDate}" oninput="delegateSetDate(this.value)"/>
+      <div style="display:flex;gap:10px">
+        <div style="flex:1"><label>From date / من تاريخ</label><input type="date" value="${State.delegateDate}" onchange="delegateSetDate(this.value)"/></div>
+        <div style="flex:1"><label>To date / إلى تاريخ</label><input type="date" value="${State.delegateDateTo||''}" min="${State.delegateDate||''}" onchange="delegateSetDateTo(this.value)"/></div>
+      </div>
+      <p class="hint" style="margin:6px 0 0">Leave "To date" empty for a single day.</p>
       <label style="margin-top:10px">${bi('Delegate selected stores to','نقل الزيارات المحددة الى')}</label>
       <select onchange="delegateSetTarget(this.value)">
         <option value="">— ${bi('Choose merchandiser','اختر المندوب')} —</option>
@@ -7289,7 +7302,7 @@ Object.assign(window, {
   rejectBadPhoto, forceAppUpdate, setSkuScopeMode, toggleSkuScopePanel, setSkuScopeSearch, toggleSkuScopeCustomer, setScopeByCustomer, toggleSkuSoldAtSelected,
   selectRouteCycleSheet, setScorecardView, setScorecardMonth, selectScorecardSupervisor, backToScorecardSupervisors, selectScorecardMerch, backToScorecardTeam,
   applyAllPriceFixes, applyOnePriceFix, openVisitEditor, editLineField, editLineFieldBlur, toggleEditLine, saveVisitEdit, cancelVisitEdit, onVisitSearch, setCatFacingsTotal, catFacingsBlur, setShahdSpaceTotal, shahdSpaceBlur, setExtraDisplay, editDraftSetCatFacingsTotal, editDraftSetShahdSpaceTotal, editDraftSetExtraDisplay, editDraftTotalsBlur, openBranchDetail, applyAllCapacityFixes, applyOneCapacityFix, closeArrival, closeStaleArrivals, markGalleryTarget, removeGalleryPhotoPrompt, handleRouteCycleFile, cancelRouteCycleUpload, applyRouteCycleUpload, setNewMerchName, setNewMerchCode, addMerchandiserManually, deleteVisitPhotoPrompt, mergeAccountGroup, setDupKeep, toggleDupExclude, startMergeConfirm, cancelMergeConfirm, confirmMergeGroup, dismissDuplicateGroup, setManualMergeSearch, manualMergeAdd, manualMergeRemove, setManualMergeKeep, startManualMergeConfirm, cancelManualMergeConfirm, confirmManualMerge,
-  delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateApply, cancelDelegation,
+  delegateSearchInput, delegateToggle, delegateSetTarget, delegateSetDate, delegateSetDateTo, delegateApply, cancelDelegation,
   closeCamera, snapPhoto, retakePhoto, confirmCameraPhoto, migrateLegacyPhotos, captureGeo, markArrival, cancelArrivalPending, setCalendarDate,
   setCleanupMonth, setCleanupDate, toggleCleanupVisit, deleteVisitsByMonth, deleteVisitsByDay, deleteSelectedCleanupVisits, setManageBackendSub, setMergeBrowseIdx, deleteOneVisit,
   pickEcommAccount, clearEcommAccount, setEcommAvailable, setEcommPrice, ecommPriceBlur, setEcommPlatform, backToEcommPlatforms, submitEcommVisit, toggleEcommPlatform, openEcommStoreFromDashboard,
